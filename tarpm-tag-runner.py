@@ -126,7 +126,7 @@ def _progress(progress) -> str:
     if not progress:
         return ""
     n, total = progress
-    return f" ({n:>{len(str(total))}d}/{total})"
+    return f" ({n}/{total})"
 
 
 def _test_tail(progress, elapsed: float) -> str:
@@ -134,7 +134,7 @@ def _test_tail(progress, elapsed: float) -> str:
     parts = []
     if progress:
         n, total = progress
-        parts.append(f"{n:>{len(str(total))}d}/{total}")
+        parts.append(f"{n}/{total}")
     parts.append(fmt_duration(elapsed))
     return " (" + ", ".join(parts) + ")"
 
