@@ -194,7 +194,7 @@ Two consequences for a full-tag run:
   logged every N seconds so a slow command does not look stuck:
 
       [ts] tarpm-tag-runner: still fetching 0ad-data-0.28.0-2.fc44 (12/20) (10m 02s, 2.2 GiB so far)
-      [ts] tarpm-tag-runner: still testing 0ad-data-0.28.0-2.fc44.noarch (unpack) (10m 02s)
+      [ts] tarpm-tag-runner: still testing 0ad-data-0.28.0-2.fc44.noarch (unpack) (1/2) (10m 02s)
 
   Completion lines carry the same facts, so a finished run shows what was
   slow:

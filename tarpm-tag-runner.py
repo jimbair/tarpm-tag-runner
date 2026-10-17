@@ -442,8 +442,9 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         nonlocal failed_stage, failed_rc
         if args.verbose:
             log("+ " + " ".join(str(c) for c in cmd))
-        rc, out = run(cmd, label=f"testing {nvr}.{arch} ({name})",
-                      heartbeat=args.heartbeat, start=test_t0)
+        rc, out = run(cmd, label=f"testing {base} ({name})",
+                      heartbeat=args.heartbeat, start=test_t0,
+                      counter_suffix=_progress(progress))
         buf.append("$ " + " ".join(str(c) for c in cmd))
         if out.strip():
             buf.append(out.rstrip("\n"))
@@ -467,7 +468,10 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     if ok:
         if args.verbose:
             log("+ tarpm -t -f " + str(rpm))
-        rc, list_orig = run(["tarpm", "-t", "-f", str(rpm)])
+        rc, list_orig = run(["tarpm", "-t", "-f", str(rpm)],
+                            label=f"testing {base} (list-original)",
+                            heartbeat=args.heartbeat, start=test_t0,
+                            counter_suffix=_progress(progress))
         (work / "list-orig.txt").write_text(list_orig)
         if rc != 0:
             ok = False
@@ -478,7 +482,10 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     if ok:
         if args.verbose:
             log("+ tarpm -t -f " + str(repacked))
-        rc, list_repacked = run(["tarpm", "-t", "-f", str(repacked)])
+        rc, list_repacked = run(["tarpm", "-t", "-f", str(repacked)],
+                                label=f"testing {base} (list-repacked)",
+                                heartbeat=args.heartbeat, start=test_t0,
+                                counter_suffix=_progress(progress))
         (work / "list-repacked.txt").write_text(list_repacked)
         if rc != 0:
             ok = False
