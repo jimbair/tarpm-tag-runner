@@ -67,6 +67,10 @@ Test (tarpm round-trip: unpack -> repack -> unpack repacked; runs by
 Common:
   -r FILE           report file (default: ./report.txt)
   -j N              number of parallel fetches/tests (default: 1)
+      --heartbeat N
+                    while a command runs longer than this many seconds,
+                    log a progress line every N seconds so a slow command
+                    does not look stuck (0 disables; default: 60)
       --json FILE   also write machine-readable results to FILE (JSON)
   -v                verbose: echo each external command
   -h, --help        show this help and exit
@@ -177,6 +181,33 @@ and `TEST WARNINGS`.
 With `--json FILE`, the same results are written as machine-readable JSON:
 per-build fetch results, and per-RPM test results (stage, exit code,
 warning, log path, and `error` text when a runner exception was caught).
+
+## Slow commands, disk, and the full run
+
+A few builds are huge. `0ad-data-0.28.0-2.fc44`, for instance, ships a
+~1.5 GiB `.noarch.rpm` and a ~1.4 GiB `.src.rpm`; fetching them took over
+10 minutes and the tarpm round-trip of the 1.5 GiB RPM ran for 10+ minutes.
+Two consequences for a full-tag run:
+
+- **Heartbeats.** When a `koji` or `tarpm` command runs longer than
+  `--heartbeat N` seconds (default 60; `0` disables), a progress line is
+  logged every N seconds so a slow command does not look stuck:
+
+      [ts] tarpm-tag-runner: still fetching 0ad-data-0.28.0-2.fc44 (12/20) (10m 02s, 2.2 GiB so far)
+      [ts] tarpm-tag-runner: still testing 0ad-data-0.28.0-2.fc44.noarch (unpack) (10m 02s)
+
+  Completion lines carry the same facts, so a finished run shows what was
+  slow:
+
+      [ts] [fetch]  0ad-data-0.28.0-2.fc44 ok (2 RPMs, 2.9 GiB, 10m 22s)
+      [ts] [test]   0ad-data-0.28.0-2.fc44.noarch ok (1/2, 15m 05s)
+
+  (`[ts]` is the UTC timestamp; the lines above are the exact formats.)
+- **Disk.** A round-trip keeps the original RPM, the unpacked tree, the
+  repacked RPM, and the second unpack on disk at once. A 1.5 GiB RPM can
+  need well over 10 GiB in flight, and `-j N` multiplies that by N. Run the
+  full ~23,000-build tag with a low `-j` (1–2) on a disk large enough for
+  its biggest builds.
 
 ## Exit status
 

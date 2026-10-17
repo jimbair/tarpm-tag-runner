@@ -86,6 +86,34 @@ def fmt_duration(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+def human(n: int) -> str:
+    """Binary (1024) human size: '950 KiB', '838 MiB', '2.9 GiB'."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    v = float(n)
+    i = 0
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024
+        i += 1
+    if i == 0:
+        return f"{int(n)} B"
+    txt = f"{v:.1f}"
+    if txt.endswith(".0"):
+        txt = txt[:-2]
+    return f"{txt} {units[i]}"
+
+
+def _dir_bytes(pdir: Path) -> int:
+    """Sum of top-level file sizes in a dir (a fetch's 'size so far')."""
+    total = 0
+    try:
+        for p in pdir.iterdir():
+            if p.is_file():
+                total += p.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
 def log(msg: str, err: bool = False) -> None:
     """Emit a UTC-timestamped log line; err=True routes it to stderr."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -99,6 +127,16 @@ def _progress(progress) -> str:
         return ""
     n, total = progress
     return f" ({n:>{len(str(total))}d}/{total})"
+
+
+def _test_tail(progress, elapsed: float) -> str:
+    """'(n/total, DURATION)' or '(DURATION)' suffix for a test line."""
+    parts = []
+    if progress:
+        n, total = progress
+        parts.append(f"{n:>{len(str(total))}d}/{total}")
+    parts.append(fmt_duration(elapsed))
+    return " (" + ", ".join(parts) + ")"
 
 
 class Counter:
@@ -118,15 +156,28 @@ class Counter:
             return self.n
 
 
-def run(cmd: list, cwd: Path | None = None) -> tuple:
+def run(cmd: list, cwd: Path | None = None, label: str | None = None,
+        heartbeat: int = 0, counter_suffix: str = "", suffix_fn=None,
+        start: float | None = None) -> tuple:
     """Run an external command; return (exit_code, combined stdout+stderr).
 
-    The child runs in a new session so a Ctrl+C (SIGINT to the
-    terminal's foreground process group) reaches only this process and
-    in-flight work can finish; a force-quit may orphan the child.
+    The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
+    foreground process group) reaches only this process; a force-quit may
+    orphan the child. A KeyboardInterrupt while waiting kills and reaps the
+    child before re-raising (so an interrupted main-thread command does not
+    leave the child running).
+
+    If `heartbeat` > 0 and `label` is set, a line is logged every
+    `heartbeat` seconds while the command is still running, so a slow
+    command does not look stuck:
+        still <label><counter_suffix> (<fmt_duration>)<suffix_fn()>
+    `counter_suffix` is the '(n/total)' fetch progress; `suffix_fn()` may
+    return a ', <size> so far' suffix. `start` (a monotonic timestamp) is
+    the reference for the elapsed time (e.g. the start of a multi-stage test);
+    it defaults to now.
     """
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
             stdout=subprocess.PIPE,
@@ -134,9 +185,30 @@ def run(cmd: list, cwd: Path | None = None) -> tuple:
             text=True,
             start_new_session=True,
         )
-        return proc.returncode, proc.stdout or ""
     except FileNotFoundError:
         return 127, f"command not found: {cmd[0]}"
+    t0 = start if start is not None else time.monotonic()
+    try:
+        while True:
+            try:
+                # communicate(timeout) has a hard deadline, so the heartbeat
+                # fires even for a silent command; on TimeoutExpired it does
+                # not kill the child, and the retry continues where it left
+                # off. Only the final call's output is used: each
+                # TimeoutExpired carries the cumulative partial output, so
+                # accumulating would duplicate lines.
+                out, _ = (proc.communicate(timeout=heartbeat)
+                          if heartbeat > 0 else proc.communicate())
+                break
+            except subprocess.TimeoutExpired:
+                suffix = suffix_fn() if suffix_fn else ""
+                log(f"{PROG}: still {label}{counter_suffix} "
+                    f"({fmt_duration(time.monotonic() - t0)}{suffix})")
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    return proc.returncode, out or ""
 
 
 @dataclasses.dataclass
@@ -198,7 +270,9 @@ def read_nvrs(args) -> tuple:
                 raise UsageError("koji client not found in PATH")
             log(f"{PROG}: fetching koji tag {args.tag}")
             t0 = time.monotonic()
-            rc, out = run(["koji", "latest-pkg", "--all", args.tag])
+            rc, out = run(["koji", "latest-pkg", "--all", args.tag],
+                          label=f"fetching koji tag {args.tag}",
+                          heartbeat=args.heartbeat)
             elapsed = time.monotonic() - t0
             if rc != 0:
                 log(f"{PROG}: tag {args.tag}: failed (after {elapsed:.1f}s)",
@@ -262,17 +336,25 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
     if args.verbose:
         log(f"+ (cd {pdir} && {' '.join(cmd)})")
     if counter is not None:
-        log(f"{PROG}: fetching {nvr}{_progress((counter.next(), counter.total))}")
+        idx = counter.next()
+        counter_suffix = _progress((idx, counter.total))
+        log(f"{PROG}: fetching {nvr}{counter_suffix}")
     else:
+        counter_suffix = ""
         log(f"{PROG}: fetching {nvr}")
     t0 = time.monotonic()
-    rc, out = run(cmd, cwd=pdir)
+    rc, out = run(cmd, cwd=pdir,
+                  label=f"fetching {nvr}",
+                  heartbeat=args.heartbeat,
+                  counter_suffix=counter_suffix,
+                  suffix_fn=lambda: f", {human(_dir_bytes(pdir))} so far")
     elapsed = time.monotonic() - t0
     logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
     logfile.write_text(out)
     if rc == 0:
         n_rpms = sum(1 for p in pdir.glob("*.rpm") if p.is_file())
-        log(f"[fetch]  {nvr} ok ({n_rpms} RPMs, {elapsed:.1f}s)")
+        log(f"[fetch]  {nvr} ok ({n_rpms} RPMs, {human(_dir_bytes(pdir))}, "
+            f"{fmt_duration(elapsed)})")
         if not args.keep:
             logfile.unlink(missing_ok=True)
     else:
@@ -341,6 +423,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     if work.exists():
         shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
+    test_t0 = time.monotonic()
 
     # Key the log name on the RPM basename so subpackages of one build
     # (7zip, 7zip-reduced, ...) get separate logs.
@@ -359,7 +442,8 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         nonlocal failed_stage, failed_rc
         if args.verbose:
             log("+ " + " ".join(str(c) for c in cmd))
-        rc, out = run(cmd)
+        rc, out = run(cmd, label=f"testing {nvr}.{arch} ({name})",
+                      heartbeat=args.heartbeat, start=test_t0)
         buf.append("$ " + " ".join(str(c) for c in cmd))
         if out.strip():
             buf.append(out.rstrip("\n"))
@@ -414,14 +498,14 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     res = TestResult(rpm=str(rpm), nvr=nvr, arch=arch, ok=ok,
                      stage=failed_stage, exit_code=failed_rc,
                      warning=warning, log=logfile)
+    tail = _test_tail(progress, time.monotonic() - test_t0)
     if not ok:
         log(f"[test]   {base} FAIL (stage: {failed_stage}, exit {failed_rc}; "
-              f"log: {logfile}){_progress(progress)}")
+              f"log: {logfile}){tail}")
     elif warning:
-        log(f"[test]   {base} ok (warning: {warning}; log: {logfile})"
-              f"{_progress(progress)}")
+        log(f"[test]   {base} ok (warning: {warning}; log: {logfile}){tail}")
     else:
-        log(f"[test]   {base} ok{_progress(progress)}")
+        log(f"[test]   {base} ok{tail}")
 
     # On success drop the work dir and the original RPM unless --keep was
     # requested. The test log goes with them on a clean pass; it is kept
@@ -706,6 +790,10 @@ def parse_args(argv) -> argparse.Namespace:
                     help="report file (default: ./report.txt)")
     ap.add_argument("-j", "--jobs", type=int, default=1,
                     help="number of parallel fetches/tests (default: 1)")
+    ap.add_argument("--heartbeat", type=int, default=60,
+                    help="while a command runs longer than this, log a "
+                         "progress line every N seconds (0 disables; "
+                         "default: 60)")
     ap.add_argument("--json", metavar="FILE",
                     help="also write the results as JSON to FILE")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -717,6 +805,8 @@ def parse_args(argv) -> argparse.Namespace:
         ap.error("-j/--jobs expects a positive integer")
     if args.limit < 0:
         ap.error("-n/--limit expects a non-negative integer")
+    if args.heartbeat < 0:
+        ap.error("--heartbeat expects a non-negative integer")
     if args.no_test and args.test_only:
         ap.error("--no-test is incompatible with --test-only")
     if args.refresh and args.from_file:
