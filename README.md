@@ -56,9 +56,10 @@ Test (tarpm round-trip: unpack -> repack -> unpack repacked; runs by
       --no-test     fetch only; skip the tarpm test phase
       --no-src      skip .src.rpm files (tested by default)
       --test-only   skip fetching; test the RPMs already in DIR
-      --keep        keep per-RPM test work dirs (ext/, ext2/, repacked rpm)
-                    and the original RPMs even for passing RPMs (default:
-                    kept only on failure)
+      --keep        keep per-RPM test work dirs (ext/, ext2/, repacked rpm),
+                    logs, and the original RPMs even for passing RPMs
+                    (default: removed on a clean pass; kept on failure
+                    or warning)
 
 Common:
   -r FILE           report file (default: ./report.txt)
@@ -116,13 +117,14 @@ For each fetched RPM (the test is the default; `--no-test` skips it;
    reported as a **warning** (non-fatal) if the file lists differ
 
 A stage failure stops that RPM's cycle at that stage; the failing stage and
-exit code are recorded. Work dirs and original RPMs are kept for failures
-(and for passes with `--keep`), so you can inspect what tarpm saw and
-re-run the test. Passing RPMs are removed from `DIR/<NVR>/` after a
-successful test, so a full-tag run leaves only the failures (plus the
-per-RPM test logs and the cached tag list). Each RPM gets its own test log
-(`<rpm-basename>.test.log` under `logs/`), so subpackages of the same
-build never clobber each other's logs.
+exit code are recorded. On a clean pass the work dir, the original RPM, and
+the test log are all removed, so a full-tag run leaves only the failures —
+each with its RPM, work dir, and log to inspect and re-run (`--keep`
+retains everything for passes too). A pass *with a warning* keeps its test
+log: it holds the content diff, the only surviving copy. Each RPM gets its
+own log under `logs/` (`<rpm-basename>.test.log`), so subpackages of the
+same build never clobber each other. Fetch logs are `<NVR>.fetch.log`;
+they are removed when the fetch succeeds and kept on failure.
 
 ## Layout
 
@@ -140,8 +142,8 @@ rpms/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
 ├── logs/
-│   ├── 7zip-25.01-5.fc44.log           # stdout+stderr of the fetch
-│   └── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log
+│   ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
+│   └── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
 └── report.txt                           # single summary + per-failure detail
 ```
 

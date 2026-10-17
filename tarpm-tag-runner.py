@@ -27,9 +27,10 @@ Test cycle per RPM (.src.rpm included by default; --no-src to skip):
   3. tarpm -x -f <repacked.rpm> -O <work>/ext2       unpack the repacked RPM
   4. tarpm -t on both + compare                      content check (warning)
 
-After a passing test the work dir and the original RPM are removed (the
-per-RPM test log is kept); on failure both are kept for inspection.
---keep keeps them for passing RPMs too.
+After a clean pass the work dir, the original RPM, and the test log are
+removed. A failure keeps the RPM, work dir, and log for inspection; a pass
+with a warning keeps the log (the only copy of the content diff). --keep
+retains everything for passing RPMs as well.
 
 Ctrl+C stops gracefully: queued work is dropped, in-flight work
 finishes, the partial results are written to the report, and the exit
@@ -208,11 +209,13 @@ def fetch_one(nvr: str, args) -> FetchResult:
     t0 = time.monotonic()
     rc, out = run(cmd, cwd=pdir)
     elapsed = time.monotonic() - t0
-    logfile = Path(args.dir) / "logs" / f"{nvr}.log"
+    logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
     logfile.write_text(out)
     if rc == 0:
         n_rpms = sum(1 for p in pdir.glob("*.rpm") if p.is_file())
         log(f"[fetch]  {nvr} ok ({n_rpms} RPMs, {elapsed:.1f}s)")
+        if not args.keep:
+            logfile.unlink(missing_ok=True)
     else:
         log(f"[fetch]  {nvr} FAIL (exit {rc}; log: {logfile})")
     return FetchResult(nvr=nvr, ok=(rc == 0), exit_code=rc, log=logfile)
@@ -332,9 +335,12 @@ def test_one(rpm: Path, args) -> TestResult:
         log(f"[test]   {base} ok")
 
     # On success drop the work dir and the original RPM unless --keep was
-    # requested; on failure keep both for inspection. The per-RPM test log
-    # is kept either way.
+    # requested. The test log goes with them on a clean pass; it is kept
+    # when it records something to investigate — a failure (commands and
+    # output) or a warning (the only copy of the content diff).
     if ok and not args.keep:
+        if not warning:
+            logfile.unlink(missing_ok=True)
         shutil.rmtree(work, ignore_errors=True)
         rpm.unlink(missing_ok=True)
     return res
@@ -538,9 +544,9 @@ def parse_args(argv) -> argparse.Namespace:
                     help="skip .src.rpm files in the test (they are "
                          "tested by default)")
     ap.add_argument("--keep", action="store_true",
-                    help="keep per-RPM test work dirs and original RPMs "
-                         "even for passing RPMs (default: kept only on "
-                         "failure)")
+                    help="keep per-RPM work dirs, logs, and original RPMs "
+                         "even for passing RPMs (default: removed on a "
+                         "clean pass; kept on failure or warning)")
     # common
     ap.add_argument("-d", "--dir", default="rpms",
                     help="download directory (default: ./rpms)")
