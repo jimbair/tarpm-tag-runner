@@ -25,7 +25,8 @@ Test cycle per RPM (.src.rpm included by default; --no-src to skip):
   1. tarpm -x -f in.rpm -O <work>/ext                unpack
   2. tarpm -c -f <work>/<base>-repacked.rpm <work>/ext   repack
   3. tarpm -x -f <repacked.rpm> -O <work>/ext2       unpack the repacked RPM
-  4. tarpm -t on both + compare                      content check (warning)
+  4. tarpm -t on both + compare                      content check (warning;
+     a listing that fails to generate is a failed stage)
 
 After a clean pass the work dir, the original RPM, and the test log are
 removed. A failure keeps the RPM, work dir, and log for inspection; a pass
@@ -34,10 +35,14 @@ retains everything for passing RPMs as well.
 
 Ctrl+C stops gracefully: queued work is dropped, in-flight work
 finishes, the partial results are written to the report, and the exit
-status is 130. A second Ctrl+C while waiting force-quits.
+status is 130 (which takes precedence over 1). External commands run in
+their own session, so they survive Ctrl+C and finish; a second Ctrl+C
+while waiting force-quits and may orphan in-flight child processes
+(they keep running to completion).
 
 Exit status: 0 all ok, 1 some fetches/tests failed, 2 usage/environment,
-130 interrupted by Ctrl+C (partial results reported).
+130 interrupted by Ctrl+C (partial results reported; takes precedence
+over 1).
 
 Python 3.9+ (standard library only).
 """
@@ -48,7 +53,9 @@ import concurrent.futures
 import dataclasses
 import difflib
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -86,7 +93,12 @@ def log(msg: str, err: bool = False) -> None:
 
 
 def run(cmd: list, cwd: Path | None = None) -> tuple:
-    """Run an external command; return (exit_code, combined stdout+stderr)."""
+    """Run an external command; return (exit_code, combined stdout+stderr).
+
+    The child runs in a new session so a Ctrl+C (SIGINT to the
+    terminal's foreground process group) reaches only this process and
+    in-flight work can finish; a force-quit may orphan the child.
+    """
     try:
         proc = subprocess.run(
             cmd,
@@ -94,6 +106,7 @@ def run(cmd: list, cwd: Path | None = None) -> tuple:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
         return proc.returncode, proc.stdout or ""
     except FileNotFoundError:
@@ -106,6 +119,7 @@ class FetchResult:
     ok: bool
     exit_code: int | None = None
     log: Path | None = None
+    error: str | None = None         # worker exception text, if any
 
 
 @dataclasses.dataclass
@@ -118,6 +132,7 @@ class TestResult:
     exit_code: int | None = None
     warning: str | None = None        # e.g. "content-diff" (non-fatal)
     log: Path | None = None
+    error: str | None = None          # worker exception text, if any
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +146,7 @@ def read_nvrs(args) -> tuple:
     --all' output) and reused on later runs; --refresh forces a re-fetch.
     """
     cache = None
+    saved = None
     if args.from_file:
         try:
             text = Path(args.from_file).read_text()
@@ -144,7 +160,13 @@ def read_nvrs(args) -> tuple:
                 text = cache.read_text()
             except OSError as exc:
                 raise UsageError(f"cannot read cached tag list: {exc}")
-            source = f"cached ({cache})"
+            try:
+                saved = datetime.fromtimestamp(
+                    cache.stat().st_mtime, timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S UTC")
+            except OSError:
+                saved = "date unknown"
+            source = f"cached ({cache}, saved {saved})"
         else:
             if shutil.which("koji") is None:
                 raise UsageError("koji client not found in PATH")
@@ -172,7 +194,8 @@ def read_nvrs(args) -> tuple:
             continue
         nvrs.append(nvr)
     if source.startswith("cached"):
-        log(f"{PROG}: tag {args.tag}: using cached list ({len(nvrs)} packages)")
+        log(f"{PROG}: tag {args.tag}: using cached list ({len(nvrs)} packages, "
+            f"saved {saved})")
     elif source.startswith("fetched"):
         log(f"{PROG}: tag {args.tag}: success ({len(nvrs)} packages "
             f"in {elapsed:.1f}s)")
@@ -200,8 +223,15 @@ def fetch_one(nvr: str, args) -> FetchResult:
     pdir = Path(args.dir) / nvr
     pdir.mkdir(parents=True, exist_ok=True)
     cmd = ["koji", "download-build"]
-    for arch in args.arch:
-        cmd += ["--arch", arch]
+    if args.arch:
+        # koji matches the requested arch exactly, which would drop the
+        # noarch and src RPMs; add them back (src unless --no-src) so the
+        # fetch matches what the test phase covers.
+        wanted = list(args.arch) + ["noarch"]
+        if not args.no_src:
+            wanted.append("src")
+        for arch in dict.fromkeys(wanted):
+            cmd += ["--arch", arch]
     cmd.append(nvr)
     if args.verbose:
         log(f"+ (cd {pdir} && {' '.join(cmd)})")
@@ -251,14 +281,25 @@ def build_units(bdir: Path, args) -> list:
 
 
 def collect_test_units(args) -> list:
-    """All RPMs under the download directory, per the arch/src filters."""
+    """Build RPMs under the download dir, per the pkg/limit/arch/src filters.
+
+    The -p and -n filters apply to the build dirs (NVRs) already under
+    DIR, the same way they apply to the tag list in a fetch run.
+    """
     root = Path(args.dir)
     units = []
     if not root.is_dir():
         return units
+    builds = 0
     for d in sorted(root.iterdir(), key=lambda p: p.name):
         if not d.is_dir() or d.name == "logs":
             continue
+        if args.pkg and not any(d.name == p or d.name.startswith(p + "-")
+                                for p in args.pkg):
+            continue
+        builds += 1
+        if args.limit and builds > args.limit:
+            break
         units.extend(build_units(d, args))
     return units
 
@@ -307,19 +348,37 @@ def test_one(rpm: Path, args) -> TestResult:
                    ["tarpm", "-x", "-f", str(repacked), "-O", str(work / "ext2")])
 
     # Extra check: file list of original vs repacked (warning only, in case
-    # tarpm -t output is noisy).
+    # tarpm -t output is noisy). A listing that fails to generate is a
+    # failed stage, not a diff to compare.
     warning = None
     if ok:
-        _, list_orig = run(["tarpm", "-t", "-f", str(rpm)])
-        _, list_repacked = run(["tarpm", "-t", "-f", str(repacked)])
+        if args.verbose:
+            log("+ tarpm -t -f " + str(rpm))
+        rc, list_orig = run(["tarpm", "-t", "-f", str(rpm)])
         (work / "list-orig.txt").write_text(list_orig)
+        if rc != 0:
+            ok = False
+            failed_stage = "list-original"
+            failed_rc = rc
+            buf.append("$ tarpm -t -f " + str(rpm))
+            buf.append(list_orig.strip() or "(no output)")
+    if ok:
+        if args.verbose:
+            log("+ tarpm -t -f " + str(repacked))
+        rc, list_repacked = run(["tarpm", "-t", "-f", str(repacked)])
         (work / "list-repacked.txt").write_text(list_repacked)
-        if list_orig != list_repacked:
-            warning = "content-diff"
-            buf.append("content check: file lists differ (warning only)")
-            buf.append("\n".join(difflib.unified_diff(
-                list_orig.splitlines(), list_repacked.splitlines(),
-                fromfile="original", tofile="repacked", lineterm="")))
+        if rc != 0:
+            ok = False
+            failed_stage = "list-repacked"
+            failed_rc = rc
+            buf.append("$ tarpm -t -f " + str(repacked))
+            buf.append(list_repacked.strip() or "(no output)")
+    if ok and list_orig != list_repacked:
+        warning = "content-diff"
+        buf.append("content check: file lists differ (warning only)")
+        buf.append("\n".join(difflib.unified_diff(
+            list_orig.splitlines(), list_repacked.splitlines(),
+            fromfile="original", tofile="repacked", lineterm="")))
 
     logfile.write_text("\n".join(buf) + "\n")
 
@@ -355,24 +414,69 @@ def process_build(nvr: str, args) -> tuple:
     keep their RPMs and work dirs.
     """
     fetch = fetch_one(nvr, args)
+    if not fetch.ok:
+        # A failed or partial download is not valid test input; the RPMs
+        # and the fetch log are kept for inspection and can be tested
+        # later with --test-only.
+        return fetch, []
     bdir = Path(args.dir) / nvr
-    tests = [test_one(rpm, args) for rpm in build_units(bdir, args)]
+    tests = []
+    for rpm in build_units(bdir, args):
+        try:
+            tests.append(test_one(rpm, args))
+        except Exception as exc:
+            # A runner-side exception (e.g. disk full) is a failure for
+            # this RPM only: the fetch itself succeeded, so record it as
+            # a test failure and keep testing the rest.
+            base = rpm.name[:-4] if rpm.name.endswith(".rpm") else rpm.name
+            log(f"{PROG}: error testing {rpm}: {exc}", err=True)
+            tests.append(TestResult(
+                rpm=str(rpm), nvr=nvr,
+                arch=base.rsplit(".", 1)[-1],
+                ok=False, stage="exception", error=repr(exc)))
     if not args.keep and bdir.is_dir() and not any(bdir.iterdir()):
         bdir.rmdir()
     return fetch, tests
 
 
-def run_pool(worker, items, jobs: int) -> tuple:
+def _force_quit(signum, frame) -> None:
+    """Second Ctrl+C: die immediately, no cleanup (os._exit).
+
+    In-flight external commands (koji/tarpm) run in their own sessions
+    and keep running to completion, orphaned (findable with pgrep).
+    """
+    sys.stderr.write(
+        f"{PROG}: force-quit; in-flight koji/tarpm keep running "
+        f"(orphaned)\n")
+    sys.stderr.flush()
+    os._exit(130)
+
+
+def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
     """Run worker(item) on a pool of `jobs` workers, collecting results.
 
     Returns (results, interrupted). Ctrl+C drops the queued items and
     lets the in-flight one(s) finish; a second Ctrl+C while waiting
-    exits immediately (no report).
+    force-quits immediately (no report; in-flight children are orphaned
+    and keep running).
+
+    If worker(item) raises and on_error is given, on_error(item, exc)
+    is called and its return value is used as that item's result, so a
+    single bad item cannot abort the whole run.
     """
+    def call(item):
+        try:
+            return worker(item)
+        except Exception as exc:
+            if on_error is None:
+                raise
+            log(f"{PROG}: error processing {item}: {exc}", err=True)
+            return on_error(item, exc)
+
     results = []
     interrupted = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = [pool.submit(worker, item) for item in items]
+        futures = [pool.submit(call, item) for item in items]
         collected = set()
         try:
             for fut in concurrent.futures.as_completed(futures):
@@ -380,6 +484,10 @@ def run_pool(worker, items, jobs: int) -> tuple:
                 collected.add(fut)
         except KeyboardInterrupt:
             interrupted = True
+            # Any further Ctrl+C now force-quits immediately (os._exit)
+            # instead of unwinding into the executor's shutdown, which
+            # would wait for the in-flight children to finish.
+            signal.signal(signal.SIGINT, _force_quit)
             log(f"{PROG}: interrupted: finishing in-flight work, then "
                   f"stopping (Ctrl+C again to force-quit)", err=True)
             for f in futures:
@@ -451,7 +559,12 @@ def write_report(args, fetch: list | None, test: list | None,
         A("")
         A("=== FETCH FAILURES ===")
         for r in fetch_failed:
-            A(f"--- {r.nvr} (exit {r.exit_code}) ---")
+            if r.exit_code is not None:
+                A(f"--- {r.nvr} (exit {r.exit_code}) ---")
+            else:
+                A(f"--- {r.nvr} ---")
+            if r.error:
+                A(f"    error: {r.error}")
             if r.log is not None and r.log.is_file():
                 A(f"log: {r.log}")
                 A(tail(r.log.read_text(), 15))
@@ -463,7 +576,13 @@ def write_report(args, fetch: list | None, test: list | None,
         A("")
         A("=== TEST FAILURES ===")
         for r in test_failed:
-            A(f"--- {rpm_label(r.rpm)} (stage: {r.stage}, exit {r.exit_code}) ---")
+            if r.exit_code is not None:
+                A(f"--- {rpm_label(r.rpm)} (stage: {r.stage}, "
+                  f"exit {r.exit_code}) ---")
+            else:
+                A(f"--- {rpm_label(r.rpm)} (stage: {r.stage}) ---")
+            if r.error:
+                A(f"    error: {r.error}")
             if r.log is not None and r.log.is_file():
                 A(f"log: {r.log}")
                 A(tail(r.log.read_text(), 20))
@@ -520,9 +639,9 @@ def parse_args(argv) -> argparse.Namespace:
                     help="include builds whose NVR equals PKG or starts with "
                          "PKG- (repeatable; default: every package)")
     ap.add_argument("-a", "--arch", action="append", metavar="ARCH",
-                    help="fetch: restrict koji download-build to ARCH; test: "
-                         "only test RPMs for ARCH (plus noarch and src; "
-                         "repeatable)")
+                    help="fetch: download ARCH plus noarch and the source "
+                         "RPM (src unless --no-src); test: only test RPMs "
+                         "for ARCH (plus noarch and src). Repeatable.")
     ap.add_argument("-n", "--limit", type=int, default=0,
                     help="only process the first N builds (smoke test)")
     ap.add_argument("--list", action="store_true",
@@ -584,9 +703,9 @@ def main(argv=None) -> int:
               f"{args.dir}", err=True)
         return 2
 
-    if do_test and shutil.which("tarpm") is None:
+    if do_test and not args.list and shutil.which("tarpm") is None:
         log(f"{PROG}: error: tarpm not found in PATH (needed for the "
-              f"test phase; use --no-test to fetch only", err=True)
+              f"test phase; use --no-test to fetch only)", err=True)
         return 2
 
     tag_source = None
@@ -602,7 +721,7 @@ def main(argv=None) -> int:
             return 2
         if not nvrs:
             log(f"{PROG}: error: no builds found (empty package list for "
-                  f"tag {args.tag}", err=True)
+                  f"tag {args.tag})", err=True)
             return 2
         selected = select_nvrs(nvrs, args.pkg)
         if not selected:
@@ -628,7 +747,9 @@ def main(argv=None) -> int:
             log(f"{PROG}: fetching and testing {len(selected)} build(s) "
                   f"from tag {args.tag} (parallelism: {args.jobs})")
             results, interrupted = run_pool(
-                lambda nvr: process_build(nvr, args), selected, args.jobs)
+                lambda nvr: process_build(nvr, args), selected, args.jobs,
+                on_error=lambda nvr, exc: (
+                    FetchResult(nvr=nvr, ok=False, error=repr(exc)), []))
             for fetch, tests in results:
                 fetch_results.append(fetch)
                 test_results.extend(tests)
@@ -636,7 +757,9 @@ def main(argv=None) -> int:
             log(f"{PROG}: fetching {len(selected)} build(s) from tag "
                   f"{args.tag} (parallelism: {args.jobs})")
             results, interrupted = run_pool(
-                lambda nvr: fetch_one(nvr, args), selected, args.jobs)
+                lambda nvr: fetch_one(nvr, args), selected, args.jobs,
+                on_error=lambda nvr, exc: FetchResult(nvr=nvr, ok=False,
+                                                     error=repr(exc)))
             fetch_results.extend(results)
     elif do_test:
         # --test-only: test the RPMs already under DIR.
@@ -649,7 +772,12 @@ def main(argv=None) -> int:
         log(f"{PROG}: testing {len(units)} RPM(s) with tarpm "
               f"(parallelism: {args.jobs})")
         results, interrupted = run_pool(
-            lambda rpm: test_one(rpm, args), units, args.jobs)
+            lambda rpm: test_one(rpm, args), units, args.jobs,
+            on_error=lambda rpm, exc: TestResult(
+                rpm=str(rpm), nvr=rpm.parent.name,
+                arch=(rpm.name[:-4] if rpm.name.endswith(".rpm")
+                      else rpm.name).rsplit(".", 1)[-1],
+                ok=False, stage="exception", error=repr(exc)))
         test_results.extend(results)
 
         # Remove build dirs whose RPMs all passed and were removed above.
@@ -697,9 +825,11 @@ def main(argv=None) -> int:
         for r in test_for_report or []:
             if not r.ok:
                 log(f"{PROG}: test failure:  {r.rpm}")
-        return 1
     if interrupted:
+        # An interrupted run exits 130 even if it also had failures.
         return 130
+    if any_failed:
+        return 1
     return 0
 
 

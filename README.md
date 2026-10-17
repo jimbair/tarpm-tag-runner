@@ -36,9 +36,11 @@ Fetch:
   -t TAG            Koji tag to query (default: f44)
   -p PKG            include builds whose NVR equals PKG or starts with PKG-
                     (repeatable; default: every package in the tag)
-  -a ARCH           fetch: restrict "koji download-build" to ARCH;
-                    test: only test RPMs for ARCH (plus noarch and src).
-                    Repeatable. Default: all arches plus the source RPM.
+  -a ARCH           fetch: download ARCH plus noarch and the source RPM
+                    (src unless --no-src; koji matches the arch exactly,
+                    so those are added back); test: only test RPMs for
+                    ARCH (plus noarch and src). Repeatable. Default: all
+                    arches plus the source RPM.
   -d DIR            download directory (default: ./rpms); each build goes
                     to DIR/<NVR>/
   -n NUM            only process the first NUM builds (smoke test)
@@ -55,7 +57,8 @@ Test (tarpm round-trip: unpack -> repack -> unpack repacked; runs by
      default on every fetched RPM, including the source RPM):
       --no-test     fetch only; skip the tarpm test phase
       --no-src      skip .src.rpm files (tested by default)
-      --test-only   skip fetching; test the RPMs already in DIR
+      --test-only   skip fetching; test the RPMs already in DIR (the -p
+                    and -n filters apply to the downloaded builds)
       --keep        keep per-RPM test work dirs (ext/, ext2/, repacked rpm),
                     logs, and the original RPMs even for passing RPMs
                     (default: removed on a clean pass; kept on failure
@@ -95,9 +98,13 @@ python3 tarpm-tag-runner.py -t f44 -a x86_64 -n 3
 python3 tarpm-tag-runner.py --test-only -a x86_64 -j 8
 ```
 
-A `-p` filter is a package-name prefix: `-p 7zip` selects `7zip`,
-`7zip-reduced`, `7zip-standalone`, `7zip-standalone-all`, but not
-`7zipfoo`. Passing a full NVR (e.g. `7zip-25.01-5.fc44`) matches exactly.
+A `-p` filter matches source-package names in the tag list: `-p 7zip`
+selects the `7zip` build (`7zip-25.01-5.fc44`) — and any other source
+package whose name starts with `7zip-`. The `7zip-reduced`,
+`7zip-standalone`, and `7zip-standalone-all` entries you see in a build
+are subpackages of that one build, not separate selections; they are
+fetched and tested along with it. A full NVR (e.g.
+`7zip-25.01-5.fc44`) matches exactly.
 
 The tag list is cached as `DIR/tag-<TAG>.txt` (raw `koji latest-pkg
 --all` output). Later runs for the same tag reuse it instead of
@@ -113,11 +120,16 @@ For each fetched RPM (the test is the default; `--no-test` skips it;
 1. `tarpm -x -f in.rpm -O <work>/ext` — unpack
 2. `tarpm -c -f <work>/<base>-repacked.rpm <work>/ext` — repack
 3. `tarpm -x -f <repacked.rpm> -O <work>/ext2` — unpack the repacked RPM
-4. `tarpm -t` on both original and repacked + `diff` — content check,
-   reported as a **warning** (non-fatal) if the file lists differ
+4. `tarpm -t` on both original and repacked, compared in Python
+   (`difflib`) — content check, reported as a **warning** (non-fatal) if
+   the file lists differ; a listing that fails to generate is a stage
+   failure, not a diff
 
-A stage failure stops that RPM's cycle at that stage; the failing stage and
-exit code are recorded. On a clean pass the work dir, the original RPM, and
+A stage failure stops that RPM's cycle at that stage; the failing stage
+(`unpack`, `repack`, `unpack-repacked`, `list-original`, `list-repacked`)
+and exit code are recorded. A runner-side exception (e.g. disk full) is
+recorded as a test failure with stage `exception` and the exception text.
+On a clean pass the work dir, the original RPM, and
 the test log are all removed, so a full-tag run leaves only the failures —
 each with its RPM, work dir, and log to inspect and re-run (`--keep`
 retains everything for passes too). A pass *with a warning* keeps its test
@@ -141,11 +153,13 @@ rpms/
 │       ├── ext2/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
-├── logs/
-│   ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
-│   └── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
-└── report.txt                           # single summary + per-failure detail
+└── logs/
+    ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
+    └── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
 ```
+
+The report is written to `./report.txt` by default (the current
+directory; `-r` changes it) — it is not inside DIR.
 
 Passed RPMs are removed from their build dir after a successful test
 (kept on failure, or with `--keep`); a build dir left empty by that
@@ -156,18 +170,22 @@ cleanup is removed as well.
 `report.txt` (path configurable with `-r`) has a summary — per phase
 (fetch: selected/ok/failed; test: rpms/ok/failed/warnings, plus how many
 passed RPMs were removed) — followed by `FETCH FAILURES` (exit code + last
-15 lines of the log), `TEST FAILURES` (stage + exit code + last 20 lines of
-the log), and `TEST WARNINGS`.
+15 lines of the log), `TEST FAILURES` (stage + exit code — or the
+exception text when there is no exit code — + last 20 lines of the log),
+and `TEST WARNINGS`.
 
 With `--json FILE`, the same results are written as machine-readable JSON:
 per-build fetch results, and per-RPM test results (stage, exit code,
-warning, log path).
+warning, log path, and `error` text when a runner exception was caught).
 
 ## Exit status
 
 Ctrl+C (first press) stops gracefully: queued work is dropped, in-flight
 work finishes, the partial results are reported, and the exit status is
-130. A second Ctrl+C while waiting force-quits (no report).
+130 (even if that run also had failures). External commands (koji,
+tarpm) run in their own session, so they survive Ctrl+C and finish.
+A second Ctrl+C while waiting force-quits (no report) and may orphan
+in-flight child processes — they keep running to completion.
 
 | code | meaning                                    |
 |------|--------------------------------------------|
