@@ -58,6 +58,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,6 +91,31 @@ def log(msg: str, err: bool = False) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts} UTC] {msg}", file=sys.stderr if err else sys.stdout,
           flush=True)
+
+
+def _progress(progress) -> str:
+    """' ( 7/20)' suffix; numerator right-aligned to the total's width."""
+    if not progress:
+        return ""
+    n, total = progress
+    return f" ({n:>{len(str(total))}d}/{total})"
+
+
+class Counter:
+    """Thread-safe monotonic counter shared across worker threads.
+
+    next() returns 1, 2, ... as it is called; the lock keeps it correct
+    when -j runs items on several threads.
+    """
+    def __init__(self, total: int):
+        self.total = total
+        self.n = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> int:
+        with self._lock:
+            self.n += 1
+            return self.n
 
 
 def run(cmd: list, cwd: Path | None = None) -> tuple:
@@ -219,7 +245,7 @@ def select_nvrs(nvrs: list, pkgs: list) -> list:
     return out
 
 
-def fetch_one(nvr: str, args) -> FetchResult:
+def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
     pdir = Path(args.dir) / nvr
     pdir.mkdir(parents=True, exist_ok=True)
     cmd = ["koji", "download-build"]
@@ -235,7 +261,10 @@ def fetch_one(nvr: str, args) -> FetchResult:
     cmd.append(nvr)
     if args.verbose:
         log(f"+ (cd {pdir} && {' '.join(cmd)})")
-    log(f"{PROG}: fetching {nvr}")
+    if counter is not None:
+        log(f"{PROG}: fetching {nvr}{_progress((counter.next(), counter.total))}")
+    else:
+        log(f"{PROG}: fetching {nvr}")
     t0 = time.monotonic()
     rc, out = run(cmd, cwd=pdir)
     elapsed = time.monotonic() - t0
@@ -304,7 +333,7 @@ def collect_test_units(args) -> list:
     return units
 
 
-def test_one(rpm: Path, args) -> TestResult:
+def test_one(rpm: Path, args, progress=None) -> TestResult:
     base = rpm.name[:-4] if rpm.name.endswith(".rpm") else rpm.name
     nvr = rpm.parent.name
     arch = base.rsplit(".", 1)[-1]
@@ -387,11 +416,12 @@ def test_one(rpm: Path, args) -> TestResult:
                      warning=warning, log=logfile)
     if not ok:
         log(f"[test]   {base} FAIL (stage: {failed_stage}, exit {failed_rc}; "
-              f"log: {logfile})")
+              f"log: {logfile}){_progress(progress)}")
     elif warning:
-        log(f"[test]   {base} ok (warning: {warning}; log: {logfile})")
+        log(f"[test]   {base} ok (warning: {warning}; log: {logfile})"
+              f"{_progress(progress)}")
     else:
-        log(f"[test]   {base} ok")
+        log(f"[test]   {base} ok{_progress(progress)}")
 
     # On success drop the work dir and the original RPM unless --keep was
     # requested. The test log goes with them on a clean pass; it is kept
@@ -405,7 +435,7 @@ def test_one(rpm: Path, args) -> TestResult:
     return res
 
 
-def process_build(nvr: str, args) -> tuple:
+def process_build(nvr: str, args, fetch_counter=None) -> tuple:
     """One build, start to finish: fetch, tarpm-test its RPMs, clean up.
 
     Keeps disk use bounded: each build's RPMs are present only from the
@@ -413,23 +443,26 @@ def process_build(nvr: str, args) -> tuple:
     --keep); a build whose RPMs all passed is removed entirely. Failures
     keep their RPMs and work dirs.
     """
-    fetch = fetch_one(nvr, args)
+    fetch = fetch_one(nvr, args, fetch_counter)
     if not fetch.ok:
         # A failed or partial download is not valid test input; the RPMs
         # and the fetch log are kept for inspection and can be tested
         # later with --test-only.
         return fetch, []
     bdir = Path(args.dir) / nvr
+    units = build_units(bdir, args)
+    total = len(units)
     tests = []
-    for rpm in build_units(bdir, args):
+    for i, rpm in enumerate(units, start=1):
         try:
-            tests.append(test_one(rpm, args))
+            tests.append(test_one(rpm, args, progress=(i, total)))
         except Exception as exc:
             # A runner-side exception (e.g. disk full) is a failure for
             # this RPM only: the fetch itself succeeded, so record it as
             # a test failure and keep testing the rest.
             base = rpm.name[:-4] if rpm.name.endswith(".rpm") else rpm.name
-            log(f"{PROG}: error testing {rpm}: {exc}", err=True)
+            log(f"{PROG}: error testing {rpm}: {exc}{_progress((i, total))}",
+                err=True)
             tests.append(TestResult(
                 rpm=str(rpm), nvr=nvr,
                 arch=base.rsplit(".", 1)[-1],
@@ -746,8 +779,10 @@ def main(argv=None) -> int:
             # in flight plus the failures.
             log(f"{PROG}: fetching and testing {len(selected)} build(s) "
                   f"from tag {args.tag} (parallelism: {args.jobs})")
+            fetch_counter = Counter(len(selected))
             results, interrupted = run_pool(
-                lambda nvr: process_build(nvr, args), selected, args.jobs,
+                lambda nvr: process_build(nvr, args, fetch_counter),
+                selected, args.jobs,
                 on_error=lambda nvr, exc: (
                     FetchResult(nvr=nvr, ok=False, error=repr(exc)), []))
             for fetch, tests in results:
@@ -756,8 +791,10 @@ def main(argv=None) -> int:
         else:
             log(f"{PROG}: fetching {len(selected)} build(s) from tag "
                   f"{args.tag} (parallelism: {args.jobs})")
+            fetch_counter = Counter(len(selected))
             results, interrupted = run_pool(
-                lambda nvr: fetch_one(nvr, args), selected, args.jobs,
+                lambda nvr: fetch_one(nvr, args, fetch_counter),
+                selected, args.jobs,
                 on_error=lambda nvr, exc: FetchResult(nvr=nvr, ok=False,
                                                      error=repr(exc)))
             fetch_results.extend(results)
@@ -771,8 +808,12 @@ def main(argv=None) -> int:
             return 2
         log(f"{PROG}: testing {len(units)} RPM(s) with tarpm "
               f"(parallelism: {args.jobs})")
+        test_counter = Counter(len(units))
         results, interrupted = run_pool(
-            lambda rpm: test_one(rpm, args), units, args.jobs,
+            lambda rpm: test_one(rpm, args,
+                                 progress=(test_counter.next(),
+                                           test_counter.total)),
+            units, args.jobs,
             on_error=lambda rpm, exc: TestResult(
                 rpm=str(rpm), nvr=rpm.parent.name,
                 arch=(rpm.name[:-4] if rpm.name.endswith(".rpm")
