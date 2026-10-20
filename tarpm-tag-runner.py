@@ -52,6 +52,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -373,8 +374,8 @@ def read_nvrs(args) -> tuple:
         if not parts:
             continue
         nvr = parts[0]
-        # skip the table header lines (title row + dashes)
-        if nvr.startswith("-") or nvr == "Build":
+        # skip comment lines, and the table header lines (title row + dashes)
+        if nvr.startswith("#") or nvr.startswith("-") or nvr == "Build":
             continue
         nvrs.append(nvr)
     if source.startswith("cached"):
@@ -980,6 +981,108 @@ def journal_record(nvr: str, fetch: "FetchResult | None", tests: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# failure lists (plain NVR files under DIR/logs, feedable to --from-file)
+# ---------------------------------------------------------------------------
+
+def _sig_slug(signature: str) -> str:
+    """Filename slug for a signature: sanitized lowercase alnum/hyphens
+    (capped at 32 chars) plus 6 hex chars of its SHA-256, so distinct
+    signatures never map to the same file."""
+    base = re.sub(r"[^a-z0-9]+", "-", signature.lower()).strip("-")
+    base = base[:32].rstrip("-") or "sig"
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:6]
+    return f"{base}-{digest}"
+
+
+def failure_rows(fetch: list | None, test: list | None) -> list:
+    """One row per failure in the run: (stage, signature, nvr, rpm, exit).
+
+    `rpm` is the failing RPM's basename for test failures and "" for
+    fetch failures (a fetch has no single RPM).
+    """
+    rows = []
+    for r in fetch or []:
+        if not r.ok:
+            rows.append(("fetch", r.signature, r.nvr, "", r.exit_code))
+    for r in test or []:
+        if not r.ok:
+            rows.append((r.stage or "unknown", r.signature, r.nvr,
+                         rpm_label(r.rpm), r.exit_code))
+    return rows
+
+
+def write_failure_lists(args, fetch: list | None, test: list | None) -> None:
+    """Write the run's failure lists to DIR/logs (or remove stale ones).
+
+    Called whenever the report is written. Each list is one build NVR
+    per line — sorted, deduplicated, no header lines, each optionally
+    followed by '  # detail' — so a list can be fed straight back to
+    --from-file. Files:
+      failed-all.txt           every build with a fetch or test failure
+      failed-fetch.txt         the fetch failures
+      failed-<stage>.txt       one per failing stage (e.g. failed-repack.txt)
+      failed-sig-<slug>.txt    one per signature, top 20 by failure count
+      failed-index.tsv         stage<TAB>signature<TAB>nvr<TAB>rpm per failure
+                               (fetch rows leave the rpm column empty)
+    A run without failures removes any lists left by an earlier run, so
+    the files never describe a stale run.
+    """
+    logdir = Path(args.dir) / "logs"
+    try:
+        if logdir.is_dir():
+            for p in logdir.glob("failed-*"):
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+        rows = failure_rows(fetch, test)
+        if not rows:
+            return
+        logdir.mkdir(parents=True, exist_ok=True)
+
+        def detail(stage, exit_code, signature):
+            d = f"stage {stage}, exit {exit_code}"
+            if signature:
+                d += f": {signature}"
+            return d
+
+        def nvr_text(nvr_map: dict) -> str:
+            lines = [nvr if not nvr_map[nvr]
+                     else f"{nvr}  # {nvr_map[nvr]}"
+                     for nvr in sorted(nvr_map)]
+            return "\n".join(lines) + "\n"
+
+        all_map = {}
+        for stage, sig, nvr, rpm, rc in rows:
+            all_map.setdefault(nvr, detail(stage, rc, sig))
+        (logdir / "failed-all.txt").write_text(nvr_text(all_map))
+
+        by_stage = {}
+        for stage, sig, nvr, rpm, rc in rows:
+            by_stage.setdefault(stage, {}).setdefault(nvr, detail(stage, rc, sig))
+        for stage in sorted(by_stage):
+            (logdir / f"failed-{stage}.txt").write_text(nvr_text(by_stage[stage]))
+
+        sig_count = {}
+        by_sig = {}
+        for stage, sig, nvr, rpm, rc in rows:
+            if not sig:
+                continue
+            sig_count[sig] = sig_count.get(sig, 0) + 1
+            by_sig.setdefault(sig, {}).setdefault(nvr, detail(stage, rc, sig))
+        top = sorted(sig_count.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
+        for sig, _ in top:
+            (logdir / f"failed-sig-{_sig_slug(sig)}.txt").write_text(
+                nvr_text(by_sig[sig]))
+
+        (logdir / "failed-index.tsv").write_text(
+            "".join("\t".join((stage, sig, nvr, rpm)) + "\n"
+                    for stage, sig, nvr, rpm, rc in
+                    sorted(rows, key=lambda r: (r[0], r[2], r[3]))))
+    except OSError as exc:
+        log(f"{PROG}: warning: could not write failure lists to "
+            f"{logdir}: {exc}", err=True)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1014,8 +1117,9 @@ def parse_args(argv) -> argparse.Namespace:
                          "without downloading")
     ap.add_argument("--from-file", metavar="FILE",
                     help="read the NVR list from FILE (same format as "
-                         "'koji latest-pkg --all TAG') instead of the "
-                         "cached list or Koji")
+                         "'koji latest-pkg --all TAG'; blank lines and "
+                         "'#' comments ignored) instead of the cached "
+                         "list or Koji")
     ap.add_argument("--refresh", action="store_true",
                     help="re-fetch the tag list from Koji, even if a "
                          "cached copy (DIR/tag-<TAG>.txt) exists")
@@ -1255,6 +1359,7 @@ def main(argv=None) -> int:
                           time.monotonic() - t0, tag_source,
                           interrupted=interrupted,
                           total_selected=total_selected)
+    write_failure_lists(args, fetch_for_report, test_for_report)
     if args.json:
         write_json(Path(args.json), args, fetch_for_report, test_for_report)
 

@@ -48,7 +48,8 @@ Fetch:
                     without downloading
       --from-file FILE
                     read the NVR list from FILE (same format as
-                    'koji latest-pkg --all TAG') instead of the cached
+                    'koji latest-pkg --all TAG'; blank lines and
+                    '#' comments ignored) instead of the cached
                     list or Koji
       --refresh     re-fetch the tag list from Koji, even if a cached
                     copy (DIR/tag-<TAG>.txt) exists
@@ -111,6 +112,10 @@ python3 tarpm-tag-runner.py -t f44 -a x86_64 -n 3
 # Re-run the tests only, on RPMs already downloaded (e.g. after a tarpm
 # update), x86_64 + noarch, 8 in parallel:
 python3 tarpm-tag-runner.py --test-only -a x86_64 -j 8
+
+# Re-run exactly the builds that failed in the last run (the failure
+# list is plain NVRs, so this works even without the local journal):
+python3 tarpm-tag-runner.py --from-file rpms/logs/failed-all.txt -j 4
 ```
 
 A `-p` filter matches source-package names in the tag list: `-p 7zip`
@@ -173,7 +178,12 @@ rpms/
 ├── run.log                       # run log: tee of every log line (default)
 └── logs/
     ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
-    └── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
+    ├── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
+    ├── failed-all.txt                  # this run's failing build NVRs
+    ├── failed-fetch.txt                # fetch failures
+    ├── failed-repack.txt               # one per failing stage
+    ├── failed-sig-<slug>-<hash>.txt    # top 20 error signatures by count
+    └── failed-index.tsv                # stage, signature, nvr, rpm per failure
 ```
 
 The report is written to `./report.txt` by default (the current
@@ -213,6 +223,37 @@ record for builds that did not finish.
 
 `--resume` and `--retry-failed` are mutually exclusive, and neither may
 be combined with `--test-only`, `--refresh`, or `--no-test` (exit 2).
+
+## Failure lists
+
+Whenever a report is written, the run's failures are also written as
+plain NVR lists under `DIR/logs/`. The files always describe the most
+recent run that wrote a report: they are overwritten when that run had
+failures, and removed when it did not, so they never describe a stale
+run. Each list has no header lines: one build NVR per line, sorted and
+deduplicated, each optionally followed by `  # detail` (the failing
+stage, exit code, and signature):
+
+- `failed-all.txt` — every build with a fetch or test failure
+- `failed-fetch.txt` — the fetch failures
+- `failed-<stage>.txt` — one per failing stage (e.g.
+  `failed-repack.txt`, `failed-unpack-repacked.txt`,
+  `failed-list-original.txt`)
+- `failed-sig-<slug>-<hash>.txt` — one per error signature, top 20 by
+  failure count (the 6-hex-char hash keeps distinct signatures from
+  colliding)
+- `failed-index.tsv` — one row per failure:
+  `stage<TAB>signature<TAB>nvr<TAB>rpm` (fetch failures leave the rpm
+  column empty)
+
+The lists feed straight back to `--from-file` (it takes the first
+token of each line and ignores blank lines and `#` comments), so a set
+of failures can be re-run on demand — even on a machine without the
+local journal:
+
+```bash
+python3 tarpm-tag-runner.py --from-file rpms/logs/failed-all.txt -j 4
+```
 
 Passed RPMs are removed from their build dir after a successful test
 (kept on failure, or with `--keep`); a build dir left empty by that
