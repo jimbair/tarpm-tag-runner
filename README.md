@@ -66,6 +66,10 @@ Test (tarpm round-trip: unpack -> repack -> unpack repacked; runs by
 
 Common:
   -r FILE           report file (default: ./report.txt)
+      --run-log FILE
+                    append the run log (every log line, plus one header
+                    line per invocation) to FILE (default: DIR/run.log)
+      --no-run-log  do not write a run log
   -j N              number of parallel fetches/tests (default: 1)
       --heartbeat N
                     while a command runs longer than this many seconds,
@@ -158,13 +162,26 @@ rpms/
 │       ├── ext2/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
+├── run.log                       # run log: tee of every log line (default)
 └── logs/
     ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
     └── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
 ```
 
 The report is written to `./report.txt` by default (the current
-directory; `-r` changes it) — it is not inside DIR.
+directory; `-r` changes it) — it is not inside DIR. Its header also
+records the run log path (`run log:`, or `- (disabled)`).
+
+## Run log
+
+By default every log line is tee'd to `DIR/run.log` in append mode: each
+invocation adds one header line — `=== <PROG> start <UTC>: <argv> ===` —
+followed by that run's log lines, so several runs stack in one file. Each
+line is one locked write+flush, so `-j` runs never interleave lines.
+`--run-log FILE` chooses a different file, `--no-run-log` disables it
+entirely. Force-quit messages and uncaught tracebacks are written to it
+as well. An unopenable or unwritable run log never aborts the run — it
+simply proceeds without one.
 
 Passed RPMs are removed from their build dir after a successful test
 (kept on failure, or with `--keep`); a build dir left empty by that

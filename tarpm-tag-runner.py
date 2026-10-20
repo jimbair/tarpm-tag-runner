@@ -61,6 +61,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -143,11 +144,63 @@ def error_signature(text: str) -> str:
     return msg[:120]
 
 
+class RunLog:
+    """Tee every log line to a file, appended across invocations.
+
+    Each line is one write() + flush() under a lock, so lines from
+    concurrent worker threads never interleave. An open or write failure
+    must never abort the run: if the file cannot be used, the run simply
+    proceeds without it.
+    """
+
+    def __init__(self) -> None:
+        self.path: str | None = None
+        self.enabled = False
+        self._fh = None
+        self._lock = threading.Lock()
+
+    def open(self, path: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            self._fh = open(path, "a", encoding="utf-8")
+            self.path = path
+            self.enabled = True
+        except OSError:
+            self._fh = None
+            self.enabled = False
+
+    def write(self, line: str) -> None:
+        if self._fh is None:
+            return
+        with self._lock:
+            try:
+                self._fh.write(line + "\n")
+                self._fh.flush()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+
+
+RUNLOG = RunLog()
+
+
 def log(msg: str, err: bool = False) -> None:
-    """Emit a UTC-timestamped log line; err=True routes it to stderr."""
+    """Emit a UTC-timestamped log line; err=True routes it to stderr.
+
+    The line is also tee'd to the run log (RUNLOG) when one is enabled.
+    """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts} UTC] {msg}", file=sys.stderr if err else sys.stdout,
-          flush=True)
+    line = f"[{ts} UTC] {msg}"
+    print(line, file=sys.stderr if err else sys.stdout, flush=True)
+    RUNLOG.write(line)
 
 
 def _progress(progress) -> str:
@@ -606,9 +659,10 @@ def _force_quit(signum, frame) -> None:
     In-flight external commands (koji/tarpm) run in their own sessions
     and keep running to completion, orphaned (findable with pgrep).
     """
-    sys.stderr.write(
-        f"{PROG}: force-quit; in-flight koji/tarpm keep running "
-        f"(orphaned)\n")
+    msg = (f"{PROG}: force-quit; in-flight koji/tarpm keep running "
+           f"(orphaned)")
+    RUNLOG.write(msg)
+    sys.stderr.write(f"{msg}\n")
     sys.stderr.flush()
     os._exit(130)
 
@@ -747,6 +801,7 @@ def write_report(args, fetch: list | None, test: list | None,
             A(f"removed:  {len(test) - len(test_failed)} passed RPM(s) "
               f"(failures kept)")
     A(f"downloads: {args.dir}")
+    A(f"run log:   {args.run_log if args.run_log else '- (disabled)'}")
 
     if fetch is not None and fetch_failed:
         A("")
@@ -880,6 +935,12 @@ def parse_args(argv) -> argparse.Namespace:
                     help="download directory (default: ./rpms)")
     ap.add_argument("-r", "--report", default="report.txt",
                     help="report file (default: ./report.txt)")
+    ap.add_argument("--run-log", metavar="FILE",
+                    help="append the run log (every log line, plus one "
+                         "header line per invocation) to FILE (default: "
+                         "DIR/run.log)")
+    ap.add_argument("--no-run-log", action="store_true",
+                    help="do not write a run log")
     ap.add_argument("-j", "--jobs", type=int, default=1,
                     help="number of parallel fetches/tests (default: 1)")
     ap.add_argument("--heartbeat", type=int, default=60,
@@ -903,12 +964,21 @@ def parse_args(argv) -> argparse.Namespace:
         ap.error("--no-test is incompatible with --test-only")
     if args.refresh and args.from_file:
         ap.error("--refresh is incompatible with --from-file")
+    if args.no_run_log:
+        args.run_log = None
+    elif args.run_log is None:
+        args.run_log = str(Path(args.dir) / "run.log")
     return args
 
 
 def main(argv=None) -> int:
     t0 = time.monotonic()
     args = parse_args(argv)
+    if args.run_log:
+        RUNLOG.open(args.run_log)
+    # One header per invocation (a no-op when the run log is disabled);
+    # argv identifies exactly which command produced the following lines.
+    RUNLOG.write(f"=== {PROG} start {now_utc()}: {' '.join(sys.argv)} ===")
     do_fetch = not args.test_only
     # The tarpm test is the default; opt out with --no-test.
     do_test = args.test_only or (not args.no_test)
@@ -1067,3 +1137,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log(f"{PROG}: interrupted (Ctrl+C)", err=True)
         sys.exit(130)
+    except Exception:
+        # Uncaught: record the traceback in the run log, then re-raise.
+        for line in traceback.format_exc().splitlines():
+            RUNLOG.write(line)
+        raise
