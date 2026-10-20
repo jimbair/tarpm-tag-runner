@@ -76,6 +76,13 @@ Common:
                     log a progress line every N seconds so a slow command
                     does not look stuck (0 disables; default: 60)
       --json FILE   also write machine-readable results to FILE (JSON)
+      --resume      skip builds whose latest journal record
+                    (DIR/journal.jsonl) is pass or warn
+      --retry-failed
+                    re-run only the builds whose latest journal record is
+                    fetch-fail or test-fail; each starts from a clean
+                    DIR/<NVR>/. Default report:
+                    report-retry-YYYYmmdd-HHMMSS.txt
   -v                verbose: echo each external command
   -h, --help        show this help and exit
 ```
@@ -162,6 +169,7 @@ rpms/
 │       ├── ext2/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
+├── journal.jsonl                 # one JSON line per finished build
 ├── run.log                       # run log: tee of every log line (default)
 └── logs/
     ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
@@ -182,6 +190,29 @@ line is one locked write+flush, so `-j` runs never interleave lines.
 entirely. Force-quit messages and uncaught tracebacks are written to it
 as well. An unopenable or unwritable run log never aborts the run — it
 simply proceeds without one.
+
+## Journal, resume, and retry
+
+Every finished build appends one JSON line to `DIR/journal.jsonl` (one
+`os.write()` under a lock per line; the reader skips a torn or invalid
+last line, and the latest record per NVR wins). Fields: `nvr`, `status`
+(`pass`, `warn`, `fetch-fail`, `test-fail`), `stage`, `exit_code`,
+`signature` (see Error signatures), `rpms` (failing RPM basenames; for
+`warn`, the warned ones), and `ts` (UTC). A graceful Ctrl+C writes no
+record for builds that did not finish.
+
+- `--resume` skips builds whose latest record is `pass` or `warn`, so an
+  interrupted run can be continued without re-testing what already
+  passed.
+- `--retry-failed` re-runs only the builds whose latest record is
+  `fetch-fail` or `test-fail`, each from a clean `DIR/<NVR>/`, through
+  the normal fetch-and-test pipeline (`-j`, `-a`, `--no-src`, `-n`, and
+  `-p` all still apply). Its report goes to
+  `report-retry-YYYYmmdd-HHMMSS.txt` unless `-r` is given.
+- If nothing is left to do, the run exits 0 with a message.
+
+`--resume` and `--retry-failed` are mutually exclusive, and neither may
+be combined with `--test-only`, `--refresh`, or `--no-test` (exit 2).
 
 Passed RPMs are removed from their build dir after a successful test
 (kept on failure, or with `--keep`); a build dir left empty by that

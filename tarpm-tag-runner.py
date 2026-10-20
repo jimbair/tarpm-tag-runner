@@ -879,6 +879,107 @@ def write_json(path: Path, args, fetch: list | None, test: list | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# journal (one JSON line per finished build; basis for --resume and
+# --retry-failed)
+# ---------------------------------------------------------------------------
+
+class Journal:
+    """Append-only journal of finished builds (one JSON line each).
+
+    Each line is one os.write() under a lock, so concurrent worker
+    threads never interleave lines and a crash cannot corrupt an earlier
+    line. A line that cannot be written is dropped (the run continues).
+    """
+
+    def __init__(self) -> None:
+        self.path: str | None = None
+        self._fh = None
+        self._lock = threading.Lock()
+
+    def open(self, path: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            self._fh = open(path, "ab")
+            self.path = path
+        except OSError:
+            self._fh = None
+            self.path = None
+
+    def append(self, record: dict) -> None:
+        if self._fh is None:
+            return
+        data = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        with self._lock:
+            try:
+                os.write(self._fh.fileno(), data)
+            except OSError:
+                pass
+
+
+JOURNAL = Journal()
+
+
+def read_journal(path: str) -> dict:
+    """Latest journal record per NVR.
+
+    Lines are processed in file order, so the last valid record for an
+    NVR wins; torn or invalid lines (e.g. a truncated final line) are
+    skipped.
+    """
+    latest = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or not isinstance(rec.get("nvr"), str):
+                    continue
+                latest[rec["nvr"]] = rec
+    except OSError:
+        pass
+    return latest
+
+
+def journal_record(nvr: str, fetch: "FetchResult | None", tests: list) -> dict:
+    """One journal line for a finished build.
+
+    status is pass, warn, fetch-fail, or test-fail; stage/exit_code/
+    signature come from the failing fetch or the first failing test;
+    rpms lists the failing (or, for warn, warning) RPM basenames.
+    """
+    rec = {
+        "nvr": nvr,
+        "status": "pass",
+        "stage": "",
+        "exit_code": None,
+        "signature": "",
+        "rpms": [],
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if fetch is not None and not fetch.ok:
+        rec.update(status="fetch-fail", stage="fetch",
+                   exit_code=fetch.exit_code, signature=fetch.signature)
+        return rec
+    failed = [t for t in tests if not t.ok]
+    if failed:
+        first = failed[0]
+        rec.update(status="test-fail", stage=first.stage or "unknown",
+                   exit_code=first.exit_code, signature=first.signature,
+                   rpms=sorted({rpm_label(t.rpm) for t in failed}))
+        return rec
+    warned = [t for t in tests if t.ok and t.warning]
+    if warned:
+        rec.update(status="warn",
+                   rpms=sorted({rpm_label(t.rpm) for t in warned}))
+    return rec
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -947,6 +1048,14 @@ def parse_args(argv) -> argparse.Namespace:
                     help="while a command runs longer than this, log a "
                          "progress line every N seconds (0 disables; "
                          "default: 60)")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip builds whose latest journal record "
+                         "(DIR/journal.jsonl) is pass or warn")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="re-run only the builds whose latest journal "
+                         "record is fetch-fail or test-fail; each starts "
+                         "from a clean DIR/<NVR>/. Default report: "
+                         "report-retry-YYYYmmdd-HHMMSS.txt")
     ap.add_argument("--json", metavar="FILE",
                     help="also write the results as JSON to FILE")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -964,6 +1073,18 @@ def parse_args(argv) -> argparse.Namespace:
         ap.error("--no-test is incompatible with --test-only")
     if args.refresh and args.from_file:
         ap.error("--refresh is incompatible with --from-file")
+    if args.resume and args.retry_failed:
+        ap.error("--resume and --retry-failed are mutually exclusive")
+    if args.resume or args.retry_failed:
+        if args.test_only:
+            ap.error("--resume/--retry-failed cannot be combined with "
+                     "--test-only")
+        if args.refresh:
+            ap.error("--resume/--retry-failed cannot be combined with "
+                     "--refresh")
+        if args.no_test:
+            ap.error("--resume/--retry-failed cannot be combined with "
+                     "--no-test")
     if args.no_run_log:
         args.run_log = None
     elif args.run_log is None:
@@ -982,6 +1103,12 @@ def main(argv=None) -> int:
     do_fetch = not args.test_only
     # The tarpm test is the default; opt out with --no-test.
     do_test = args.test_only or (not args.no_test)
+    if do_fetch:
+        # One record per finished build; --test-only records nothing.
+        JOURNAL.open(str(Path(args.dir) / "journal.jsonl"))
+    if args.retry_failed and not argv and args.report == "report.txt":
+        args.report = (f"report-retry-"
+                       f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.txt")
 
     if args.test_only and not Path(args.dir).is_dir():
         log(f"{PROG}: error: --test-only: no download directory to test: "
@@ -1016,12 +1143,40 @@ def main(argv=None) -> int:
         if args.limit > 0:
             selected = selected[:args.limit]
 
+        journal_path = str(Path(args.dir) / "journal.jsonl")
+        if args.retry_failed:
+            # Select the builds whose latest journal record is a failure;
+            # -p and -n above have already shaped the candidate list.
+            latest = read_journal(journal_path)
+            failed = {n for n, r in latest.items()
+                      if r.get("status") in ("fetch-fail", "test-fail")}
+            selected = [n for n in selected if n in failed]
+            if not selected:
+                log(f"{PROG}: nothing to do: no failed builds in "
+                      f"{journal_path}")
+                return 0
+
         if args.list:
             for nvr in selected:
                 print(nvr)
             log(f"{PROG}: {len(selected)} build(s) selected from tag "
                   f"{args.tag}", err=True)
             return 0
+
+        if args.resume:
+            # Skip what already passed; continue the rest.
+            latest = read_journal(journal_path)
+            before = len(selected)
+            selected = [n for n in selected
+                        if latest.get(n, {}).get("status")
+                        not in ("pass", "warn")]
+            log(f"{PROG}: resume: skipping {before - len(selected)} of "
+                  f"{before} build(s) already passed (journal: "
+                  f"{journal_path})")
+            if not selected:
+                log(f"{PROG}: nothing to do: all builds already passed "
+                      f"(journal: {journal_path})")
+                return 0
 
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
         total_selected = len(selected)
@@ -1032,14 +1187,26 @@ def main(argv=None) -> int:
             log(f"{PROG}: fetching and testing {len(selected)} build(s) "
                   f"from tag {args.tag} (parallelism: {args.jobs})")
             fetch_counter = Counter(len(selected))
+
+            def work(nvr):
+                # --retry-failed: start from a clean build dir so stale
+                # RPMs from the failed run cannot survive the re-run.
+                if args.retry_failed:
+                    shutil.rmtree(Path(args.dir) / nvr, ignore_errors=True)
+                return process_build(nvr, args, fetch_counter)
+
             results, interrupted = run_pool(
-                lambda nvr: process_build(nvr, args, fetch_counter),
-                selected, args.jobs,
+                work, selected, args.jobs,
                 on_error=lambda nvr, exc: (
                     FetchResult(nvr=nvr, ok=False, error=repr(exc)), []))
             for fetch, tests in results:
                 fetch_results.append(fetch)
                 test_results.extend(tests)
+                # A record is written only for builds that finished; an
+                # interrupted run (Ctrl+C) writes none for its in-flight
+                # build(s).
+                if not interrupted:
+                    JOURNAL.append(journal_record(fetch.nvr, fetch, tests))
         else:
             log(f"{PROG}: fetching {len(selected)} build(s) from tag "
                   f"{args.tag} (parallelism: {args.jobs})")
@@ -1049,7 +1216,10 @@ def main(argv=None) -> int:
                 selected, args.jobs,
                 on_error=lambda nvr, exc: FetchResult(nvr=nvr, ok=False,
                                                      error=repr(exc)))
-            fetch_results.extend(results)
+            for r in results:
+                fetch_results.append(r)
+                if not interrupted:
+                    JOURNAL.append(journal_record(r.nvr, r, []))
     elif do_test:
         # --test-only: test the RPMs already under DIR.
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
