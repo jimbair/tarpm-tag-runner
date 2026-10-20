@@ -145,32 +145,62 @@ For each fetched RPM (the test is the default; `--no-test` skips it;
    the file lists differ; a listing that fails to generate is a stage
    failure, not a diff
 
-A stage failure stops that RPM's cycle at that stage; the failing stage
-(`unpack`, `repack`, `unpack-repacked`, `list-original`, `list-repacked`)
+A stage failure stops that RPM's cycle at that stage. The failing stage
 and exit code are recorded, along with the error signature of the failing
-output (below). A runner-side exception (e.g. disk full) is recorded as a
-test failure with stage `exception` and the exception text.
-On a clean pass the work dir, the original RPM, and
-the test log are all removed, so a full-tag run leaves only the failures —
-each with its RPM, work dir, and log to inspect and re-run (`--keep`
-retains everything for passes too). A pass *with a warning* keeps its test
-log: it holds the content diff, the only surviving copy. Each RPM gets its
-own log under `logs/` (`<rpm-basename>.test.log`), so subpackages of the
-same build never clobber each other. Fetch logs are `<NVR>.fetch.log`;
-they are removed when the fetch succeeds and kept on failure.
+output (see Error signatures). The stage names, as they appear in reports,
+the journal, and the `failed-<stage>.txt` lists:
+
+| stage             | command                         | fails when                                  |
+|-------------------|---------------------------------|---------------------------------------------|
+| `unpack`          | `tarpm -x` on the original RPM  | the original cannot be unpacked             |
+| `repack`          | `tarpm -c` on the unpacked tree | the tree cannot be repacked into an RPM     |
+| `unpack-repacked` | `tarpm -x` on the repacked RPM  | the repacked RPM cannot be unpacked         |
+| `list-original`   | `tarpm -t` on the original RPM  | the listing exits non-zero                  |
+| `list-repacked`   | `tarpm -t` on the repacked RPM  | the listing exits non-zero                  |
+
+A runner-side exception (e.g. disk full) is recorded as a test failure
+with stage `exception` and the exception text; a fetch failure has stage
+`fetch`.
+
+### What is left on disk
+
+On a clean pass the work dir, the original RPM, and the test log are all
+removed, so a full-tag run leaves only the failures (`--keep` retains
+everything for passes too). For a failed RPM, two different things remain
+and it matters which is which:
+
+- `DIR/<NVR>/<base>.rpm` is the **original** koji download. The runner
+  never modifies it; it is deleted only after a clean pass.
+- `DIR/<NVR>/.tarpm-<base>/` holds the **test artifacts** of the last
+  attempt: `ext/`, the repacked RPM, `ext2/`, and the two listings. Which
+  of them exist depends on how far the cycle got. Each new test of that
+  RPM wipes and rebuilds this directory.
+
+The original is not guaranteed to be complete if the run was killed
+mid-fetch (see Exit status), so a re-run does not trust files left on
+disk: `--retry-failed` and `--resume` start each build from a fresh
+download (see Journal, resume, and retry). Use `--test-only` only when you
+deliberately want to re-test the RPMs already on disk, for example right
+after a tarpm update on a run that finished cleanly.
+
+A pass *with a warning* keeps its test log: it holds the content diff, the
+only surviving copy. Each RPM gets its own log under `logs/`
+(`<rpm-basename>.test.log`), so subpackages of the same build never
+clobber each other. Fetch logs are `<NVR>.fetch.log`; they are removed
+when the fetch succeeds and kept on failure.
 
 ## Layout
 
 ```
 rpms/
 ├── 7zip-25.01-5.fc44/
-│   ├── 7zip-25.01-5.fc44.src.rpm        # koji download-build output
-│   ├── 7zip-25.01-5.fc44.x86_64.rpm
-│   ├── 7zip-reduced-25.01-5.fc44.x86_64.rpm   # subpackages of the build
-│   ├── ...
-│   └── .tarpm-<base>/                   # test work dir (kept on failure
-│       ├── ext/                         #   or with --keep)
-│       ├── <base>-repacked.rpm
+│   ├── 7zip-25.01-5.fc44.src.rpm        # original koji download-build
+│   ├── 7zip-25.01-5.fc44.x86_64.rpm     #   output (never modified; removed
+│   ├── 7zip-reduced-25.01-5.fc44.x86_64.rpm   # after a clean pass)
+│   ├── ...                              # (subpackages of the build)
+│   └── .tarpm-<base>/                   # test artifacts of the last attempt
+│       ├── ext/                         #   (kept on failure or with --keep;
+│       ├── <base>-repacked.rpm          #   rebuilt by each new test)
 │       ├── ext2/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
@@ -179,9 +209,11 @@ rpms/
 └── logs/
     ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
     ├── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
-    ├── failed-all.txt                  # this run's failing build NVRs
+    ├── failed-all.txt                  # failing build NVRs of the last report
     ├── failed-fetch.txt                # fetch failures
-    ├── failed-repack.txt               # one per failing stage
+    ├── failed-<stage>.txt              # one per failing stage (unpack,
+    │                                   #   repack, unpack-repacked,
+    │                                   #   list-original, list-repacked)
     ├── failed-sig-<slug>-<hash>.txt    # top 20 error signatures by count
     └── failed-index.tsv                # stage, signature, nvr, rpm per failure
 ```
@@ -225,6 +257,36 @@ record.
 
 `--resume` and `--retry-failed` are mutually exclusive, and neither may
 be combined with `--test-only`, `--refresh`, or `--no-test` (exit 2).
+
+Typical uses:
+
+```bash
+# A run was killed, crashed, or stopped with Ctrl+C: run the same command
+# again with --resume. Builds that finished as pass/warn are skipped;
+# builds that never ran, were in flight, or failed are (re)done.
+python3 tarpm-tag-runner.py -t f44 -j 2 --resume
+
+# After installing a newer tarpm: re-run only what failed before, each
+# build from a fresh download.
+python3 tarpm-tag-runner.py -t f44 -j 2 --retry-failed
+```
+
+Things to know:
+
+- `--resume` also re-runs earlier failures (it skips only `pass` and
+  `warn`), so after a crash the failures from the part that finished
+  before the crash are tested again, and the report and `failed-*` lists
+  of the resumed run still cover every outstanding failure.
+- The report and failure lists describe only the invocation that wrote
+  them. A build that warned before the crash is skipped on `--resume`, so
+  it does not appear in the resumed run's `TEST WARNINGS`; its record in
+  `journal.jsonl` and its test log are still there.
+- Both options select from the same build list as a normal run (the tag
+  list, `--from-file`, `-p`, `-n`), so a journal NVR that is not in that
+  list is not retried. To retry a set of NVRs on another machine, use a
+  failure list with `--from-file` (see Failure lists).
+- Records are per build, so a retry re-downloads and re-tests every RPM of
+  a failed build, not just the one that failed.
 
 ## Failure lists
 
@@ -328,12 +390,21 @@ Ctrl+C (first press) stops gracefully: queued work is dropped, in-flight
 work finishes, the partial results are reported, and the exit status is
 130 (even if that run also had failures). External commands (koji,
 tarpm) run in their own session, so they survive Ctrl+C and finish.
-A second Ctrl+C while waiting force-quits (no report) and may orphan
-in-flight child processes — they keep running to completion.
+Builds that finished before the interrupt are in the journal, so
+`--resume` continues from there.
+
+A second Ctrl+C while waiting force-quits immediately (no report, no
+cleanup). The in-flight koji/tarpm processes are orphaned, and their
+output pipe is gone: observed behavior is that they die on their next
+write to it (a `BrokenPipeError`, exit 120) rather than finishing. That
+can leave a truncated RPM (`rpm -K` reports `DIGESTS NOT OK`) or a partial
+work dir. Do not trust files from a force-quit run: re-run those builds
+with `--retry-failed` or `--resume` (which re-download), or delete their
+`DIR/<NVR>/` directories.
 
 | code | meaning                                    |
 |------|--------------------------------------------|
-| 0    | all fetches and tests succeeded            |
+| 0    | all fetches and tests succeeded, or nothing to do (`--resume` / `--retry-failed`) |
 | 1    | one or more fetches/tests failed (report)  |
 | 2    | usage / environment error (koji/tarpm not found, bad args, nothing to test) |
 | 130  | interrupted by Ctrl+C (partial report)     |
@@ -342,4 +413,3 @@ in-flight child processes — they keep running to completion.
 
 - stricter checks (e.g. treat content-diff as a failure, header
   comparison), CentOS Stream / AlmaLinux sources (non-Koji backends)
-
