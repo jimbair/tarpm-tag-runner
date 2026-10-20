@@ -37,8 +37,11 @@ Ctrl+C stops gracefully: queued work is dropped, in-flight work
 finishes, the partial results are written to the report, and the exit
 status is 130 (which takes precedence over 1). External commands run in
 their own session, so they survive Ctrl+C and finish; a second Ctrl+C
-while waiting force-quits and may orphan in-flight child processes
-(they keep running to completion).
+while waiting force-quits immediately and orphans the in-flight
+koji/tarpm — observed behavior is that they die on their next write to
+the now-closed output pipe, possibly leaving a truncated RPM, so do not
+trust files from a force-quit run (re-run those builds with
+--retry-failed or --resume, or delete their DIR/<NVR>/ directories).
 
 Exit status: 0 all ok, 1 some fetches/tests failed, 2 usage/environment,
 130 interrupted by Ctrl+C (partial results reported; takes precedence
@@ -205,7 +208,7 @@ def log(msg: str, err: bool = False) -> None:
 
 
 def _progress(progress) -> str:
-    """' ( 7/20)' suffix; numerator right-aligned to the total's width."""
+    """' (7/20)' suffix for the fetch/heartbeat progress lines."""
     if not progress:
         return ""
     n, total = progress
@@ -657,11 +660,17 @@ def process_build(nvr: str, args, fetch_counter=None) -> tuple:
 def _force_quit(signum, frame) -> None:
     """Second Ctrl+C: die immediately, no cleanup (os._exit).
 
-    In-flight external commands (koji/tarpm) run in their own sessions
-    and keep running to completion, orphaned (findable with pgrep).
+    In-flight external commands (koji/tarpm) run in their own sessions,
+    so they are orphaned: observed behavior is that they die on their
+    next write to the now-closed output pipe (BrokenPipeError), which
+    can leave a truncated RPM — do not trust files from a force-quit.
     """
-    msg = (f"{PROG}: force-quit; in-flight koji/tarpm keep running "
-           f"(orphaned)")
+    msg = (f"{PROG}: force-quit; in-flight koji/tarpm are orphaned and "
+           f"typically die on their next write to the closed pipe, "
+           f"possibly leaving a truncated RPM. Do not trust files from "
+           f"a force-quit run: re-run those builds with --retry-failed "
+           f"or --resume (which re-download), or delete their "
+           f"DIR/<NVR>/ directories")
     RUNLOG.write(msg)
     sys.stderr.write(f"{msg}\n")
     sys.stderr.flush()
@@ -673,8 +682,9 @@ def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
 
     Returns (results, interrupted). Ctrl+C drops the queued items and
     lets the in-flight one(s) finish; a second Ctrl+C while waiting
-    force-quits immediately (no report; in-flight children are orphaned
-    and keep running).
+    force-quits immediately (no report; in-flight children are
+    orphaned and typically die on their next write to the closed pipe,
+    possibly leaving partial files).
 
     If worker(item) raises and on_error is given, on_error(item, exc)
     is called and its return value is used as that item's result, so a
