@@ -131,8 +131,9 @@ For each fetched RPM (the test is the default; `--no-test` skips it;
 
 A stage failure stops that RPM's cycle at that stage; the failing stage
 (`unpack`, `repack`, `unpack-repacked`, `list-original`, `list-repacked`)
-and exit code are recorded. A runner-side exception (e.g. disk full) is
-recorded as a test failure with stage `exception` and the exception text.
+and exit code are recorded, along with the error signature of the failing
+output (below). A runner-side exception (e.g. disk full) is recorded as a
+test failure with stage `exception` and the exception text.
 On a clean pass the work dir, the original RPM, and
 the test log are all removed, so a full-tag run leaves only the failures —
 each with its RPM, work dir, and log to inspect and re-run (`--keep`
@@ -176,11 +177,32 @@ cleanup is removed as well.
 passed RPMs were removed) — followed by `FETCH FAILURES` (exit code + last
 15 lines of the log), `TEST FAILURES` (stage + exit code — or the
 exception text when there is no exit code — + last 20 lines of the log),
-and `TEST WARNINGS`.
+`TEST WARNINGS`, and failure-type rollups: `FETCH FAILURES BY TYPE` and
+`TEST FAILURES BY TYPE` group the failures by (stage, exit code, error
+signature), most common first, with up to 3 example NVRs per group. The
+same rollup, limited to the top 5 types, is printed to the console at
+the end of the run.
 
 With `--json FILE`, the same results are written as machine-readable JSON:
 per-build fetch results, and per-RPM test results (stage, exit code,
-warning, log path, and `error` text when a runner exception was caught).
+warning, log path, `error` text when a runner exception was caught, and
+the `signature` of the failing output).
+
+## Error signatures
+
+Each failed fetch or test records a `signature`: the last `tarpm: ` line
+of the failing command's output (prefix stripped), or the last non-empty
+line when there is no such line — with absolute paths replaced by
+`<path>`, hex addresses and 4+ digit runs replaced by `N`, truncated to
+120 characters. The same failure therefore gets the same signature
+regardless of which RPM, path, or address it hit; that is what the
+`... BY TYPE` report sections and the console top-5 summary group by.
+
+The pure `error_signature()` helper is covered by unit tests:
+
+    python3 test-tarpm-tag-runner.py
+
+(stdlib `unittest`; no koji, tarpm, or network needed).
 
 ## Slow commands, disk, and the full run
 
@@ -229,3 +251,4 @@ in-flight child processes — they keep running to completion.
 
 - stricter checks (e.g. treat content-diff as a failure, header
   comparison), CentOS Stream / AlmaLinux sources (non-Koji backends)
+

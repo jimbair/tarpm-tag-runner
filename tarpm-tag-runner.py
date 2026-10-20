@@ -54,6 +54,7 @@ import dataclasses
 import difflib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -112,6 +113,34 @@ def _dir_bytes(pdir: Path) -> int:
     except OSError:
         pass
     return total
+
+
+def error_signature(text: str) -> str:
+    """A short, stable key identifying a failure, for grouping.
+
+    Takes the last line starting with "tarpm: " from the failing
+    command's output (the prefix stripped); if there is no such line,
+    the last non-empty line. Absolute paths are replaced with <path>,
+    hex addresses and 4+ digit runs with N, and the result is truncated
+    to 120 characters, so the same failure groups together across
+    RPMs, paths, and runs.
+    """
+    lines = text.splitlines()
+    msg = None
+    for line in lines:
+        if line.startswith("tarpm: "):
+            msg = line[len("tarpm: "):]
+    if msg is None:
+        msg = ""
+        for line in lines:
+            if line.strip():
+                msg = line
+    msg = msg.strip()
+    msg = re.sub(r"((?:^|\s))/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+/?",
+                 r"\1<path>", msg)
+    msg = re.sub(r"0[xX][0-9A-Fa-f]+", "N", msg)
+    msg = re.sub(r"\d{4,}", "N", msg)
+    return msg[:120]
 
 
 def log(msg: str, err: bool = False) -> None:
@@ -218,6 +247,7 @@ class FetchResult:
     exit_code: int | None = None
     log: Path | None = None
     error: str | None = None         # worker exception text, if any
+    signature: str = ""             # error_signature of the failing output
 
 
 @dataclasses.dataclass
@@ -231,6 +261,7 @@ class TestResult:
     warning: str | None = None        # e.g. "content-diff" (non-fatal)
     log: Path | None = None
     error: str | None = None          # worker exception text, if any
+    signature: str = ""             # error_signature of the failing output
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +390,8 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
             logfile.unlink(missing_ok=True)
     else:
         log(f"[fetch]  {nvr} FAIL (exit {rc}; log: {logfile})")
-    return FetchResult(nvr=nvr, ok=(rc == 0), exit_code=rc, log=logfile)
+    return FetchResult(nvr=nvr, ok=(rc == 0), exit_code=rc, log=logfile,
+                       signature="" if rc == 0 else error_signature(out))
 
 
 # ---------------------------------------------------------------------------
@@ -436,10 +468,11 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     ]
     failed_stage = None
     failed_rc = None
+    failed_out = ""
     repacked = work / f"{base}-repacked.rpm"
 
     def stage(name: str, cmd: list) -> bool:
-        nonlocal failed_stage, failed_rc
+        nonlocal failed_stage, failed_rc, failed_out
         if args.verbose:
             log("+ " + " ".join(str(c) for c in cmd))
         rc, out = run(cmd, label=f"testing {base} ({name})",
@@ -451,6 +484,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         if rc != 0:
             failed_stage = name
             failed_rc = rc
+            failed_out = out
             return False
         return True
 
@@ -477,6 +511,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             ok = False
             failed_stage = "list-original"
             failed_rc = rc
+            failed_out = list_orig
             buf.append("$ tarpm -t -f " + str(rpm))
             buf.append(list_orig.strip() or "(no output)")
     if ok:
@@ -491,6 +526,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             ok = False
             failed_stage = "list-repacked"
             failed_rc = rc
+            failed_out = list_repacked
             buf.append("$ tarpm -t -f " + str(repacked))
             buf.append(list_repacked.strip() or "(no output)")
     if ok and list_orig != list_repacked:
@@ -504,7 +540,8 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
 
     res = TestResult(rpm=str(rpm), nvr=nvr, arch=arch, ok=ok,
                      stage=failed_stage, exit_code=failed_rc,
-                     warning=warning, log=logfile)
+                     warning=warning, log=logfile,
+                     signature="" if ok else error_signature(failed_out))
     tail = _test_tail(progress, time.monotonic() - test_t0)
     if not ok:
         log(f"[test]   {base} FAIL (stage: {failed_stage}, exit {failed_rc}; "
@@ -643,6 +680,38 @@ def rpm_label(rpm: str) -> str:
     return name[:-4] if name.endswith(".rpm") else name
 
 
+def failure_types(fetch: list | None, test: list | None,
+                  phase: str | None = None) -> list:
+    """Group the failures of a run into (stage, exit code, signature) rows.
+
+    Each row is (stage, exit_code, signature, count, examples) with up
+    to 3 example NVRs (fetch) or RPM basenames (test). Rows are sorted
+    by count descending, then stage, exit code, and signature, so the
+    order is stable. `phase` restricts the grouping to "fetch" or
+    "test"; None covers both.
+    """
+    groups: dict = {}
+
+    def add(stage, exit_code, signature, name):
+        groups.setdefault((stage, exit_code, signature), []).append(name)
+
+    if phase in (None, "fetch"):
+        for r in fetch or []:
+            if not r.ok:
+                add("fetch", r.exit_code, r.signature, r.nvr)
+    if phase in (None, "test"):
+        for r in test or []:
+            if not r.ok:
+                add(r.stage or "unknown", r.exit_code, r.signature,
+                    rpm_label(r.rpm))
+    rows = []
+    for (stage, exit_code, signature), names in groups.items():
+        rows.append((stage, exit_code, signature, len(names),
+                     sorted(set(names))[:3]))
+    rows.sort(key=lambda row: (-row[3], str(row[0]), str(row[1]), row[2]))
+    return rows
+
+
 def write_report(args, fetch: list | None, test: list | None,
                  runtime: float, tag_source: str | None = None,
                  interrupted: bool = False, total_selected: int = 0) -> Path:
@@ -719,6 +788,22 @@ def write_report(args, fetch: list | None, test: list | None,
         A("=== TEST WARNINGS (non-fatal) ===")
         for r in test_warn:
             A(f"- {rpm_label(r.rpm)}: {r.warning} (see {r.log})")
+
+    if fetch is not None and fetch_failed:
+        A("")
+        A("=== FETCH FAILURES BY TYPE ===")
+        for stage, rc, sig, count, examples in failure_types(fetch, None,
+                                                             "fetch"):
+            A(f"- {count}x stage {stage}, exit {rc}: {sig}")
+            A(f"    e.g. {', '.join(examples)}")
+
+    if test is not None and test_failed:
+        A("")
+        A("=== TEST FAILURES BY TYPE ===")
+        for stage, rc, sig, count, examples in failure_types(None, test,
+                                                             "test"):
+            A(f"- {count}x stage {stage}, exit {rc}: {sig}")
+            A(f"    e.g. {', '.join(examples)}")
 
     report.write_text("\n".join(L) + "\n")
     return report
@@ -963,6 +1048,11 @@ def main(argv=None) -> int:
         for r in test_for_report or []:
             if not r.ok:
                 log(f"{PROG}: test failure:  {r.rpm}")
+        top = failure_types(fetch_for_report, test_for_report)[:5]
+        if top:
+            log(f"{PROG}: failure types (top {len(top)}):")
+            for stage, rc, sig, count, _ in top:
+                log(f"{PROG}:   {count}x stage {stage}, exit {rc}: {sig}")
     if interrupted:
         # An interrupted run exits 130 even if it also had failures.
         return 130
