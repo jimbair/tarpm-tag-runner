@@ -208,8 +208,10 @@ Every finished build appends one JSON line to `DIR/journal.jsonl` (one
 last line, and the latest record per NVR wins). Fields: `nvr`, `status`
 (`pass`, `warn`, `fetch-fail`, `test-fail`), `stage`, `exit_code`,
 `signature` (see Error signatures), `rpms` (failing RPM basenames; for
-`warn`, the warned ones), and `ts` (UTC). A graceful Ctrl+C writes no
-record for builds that did not finish.
+`warn`, the warned ones), and `ts` (UTC). Records are written as each
+build finishes, so an interrupted or crashed run still keeps the records
+of the builds that completed; a build that did not finish gets no
+record.
 
 - `--resume` skips builds whose latest record is `pass` or `warn`, so an
   interrupted run can be continued without re-testing what already

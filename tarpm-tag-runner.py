@@ -1284,6 +1284,15 @@ def main(argv=None) -> int:
 
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
         total_selected = len(selected)
+
+        def fail(nvr, exc):
+            # A worker exception is journaled like a fetch failure so
+            # --retry-failed can pick the build up again.
+            fetch = FetchResult(nvr=nvr, ok=False, error=repr(exc),
+                                signature="exception")
+            JOURNAL.append(journal_record(nvr, fetch, []))
+            return fetch
+
         if do_test:
             # Default: pipeline per build — fetch, test, clean up — with
             # -j builds in flight, so disk use stays bounded to the builds
@@ -1297,33 +1306,32 @@ def main(argv=None) -> int:
                 # RPMs from the failed run cannot survive the re-run.
                 if args.retry_failed:
                     shutil.rmtree(Path(args.dir) / nvr, ignore_errors=True)
-                return process_build(nvr, args, fetch_counter)
+                fetch, tests = process_build(nvr, args, fetch_counter)
+                # Journal the build as it finishes, so a run that is
+                # interrupted or crashes still records what completed.
+                JOURNAL.append(journal_record(fetch.nvr, fetch, tests))
+                return fetch, tests
 
             results, interrupted = run_pool(
                 work, selected, args.jobs,
-                on_error=lambda nvr, exc: (
-                    FetchResult(nvr=nvr, ok=False, error=repr(exc)), []))
+                on_error=lambda nvr, exc: (fail(nvr, exc), []))
             for fetch, tests in results:
                 fetch_results.append(fetch)
                 test_results.extend(tests)
-                # A record is written only for builds that finished; an
-                # interrupted run (Ctrl+C) writes none for its in-flight
-                # build(s).
-                if not interrupted:
-                    JOURNAL.append(journal_record(fetch.nvr, fetch, tests))
         else:
             log(f"{PROG}: fetching {len(selected)} build(s) from tag "
                   f"{args.tag} (parallelism: {args.jobs})")
             fetch_counter = Counter(len(selected))
+
+            def fetch_worker(nvr):
+                result = fetch_one(nvr, args, fetch_counter)
+                JOURNAL.append(journal_record(nvr, result, []))
+                return result
+
             results, interrupted = run_pool(
-                lambda nvr: fetch_one(nvr, args, fetch_counter),
-                selected, args.jobs,
-                on_error=lambda nvr, exc: FetchResult(nvr=nvr, ok=False,
-                                                     error=repr(exc)))
+                fetch_worker, selected, args.jobs, on_error=fail)
             for r in results:
                 fetch_results.append(r)
-                if not interrupted:
-                    JOURNAL.append(journal_record(r.nvr, r, []))
     elif do_test:
         # --test-only: test the RPMs already under DIR.
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
