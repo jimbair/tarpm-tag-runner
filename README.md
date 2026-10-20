@@ -194,29 +194,31 @@ when the fetch succeeds and kept on failure.
 ```
 rpms/
 ├── 7zip-25.01-5.fc44/
-│   ├── 7zip-25.01-5.fc44.src.rpm        # original koji download-build
-│   ├── 7zip-25.01-5.fc44.x86_64.rpm     #   output (never modified; removed
-│   ├── 7zip-reduced-25.01-5.fc44.x86_64.rpm   # after a clean pass)
-│   ├── ...                              # (subpackages of the build)
-│   └── .tarpm-<base>/                   # test artifacts of the last attempt
-│       ├── ext/                         #   (kept on failure or with --keep;
-│       ├── <base>-repacked.rpm          #   rebuilt by each new test)
+│   ├── 7zip-25.01-5.fc44.src.rpm           # original koji download
+│   ├── 7zip-25.01-5.fc44.x86_64.rpm        # (removed after a clean pass)
+│   ├── ...                                 # more RPMs of the build
+│   └── .tarpm-<base>/                      # test artifacts, last attempt
+│       ├── ext/
+│       ├── <base>-repacked.rpm
 │       ├── ext2/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
-├── journal.jsonl                 # one JSON line per finished build
-├── run.log                       # run log: tee of every log line (default)
+├── journal.jsonl                           # one JSON line per build
+├── run.log                                 # tee of every log line
 └── logs/
-    ├── 7zip-25.01-5.fc44.fetch.log     # fetch output (kept on failure)
-    ├── 7zip-reduced-25.01-5.fc44.x86_64.test.log   # per-RPM test log (kept on failure/warning)
-    ├── failed-all.txt                  # failing build NVRs of the last report
-    ├── failed-fetch.txt                # fetch failures
-    ├── failed-<stage>.txt              # one per failing stage (unpack,
-    │                                   #   repack, unpack-repacked,
-    │                                   #   list-original, list-repacked)
-    ├── failed-sig-<slug>-<hash>.txt    # top 20 error signatures by count
-    └── failed-index.tsv                # stage, signature, nvr, rpm per failure
+    ├── 7zip-25.01-5.fc44.fetch.log         # kept on fetch failure
+    ├── 7zip-25.01-5.fc44.x86_64.test.log   # kept on failure or warning
+    ├── failed-all.txt                      # failing build NVRs
+    ├── failed-fetch.txt                    # fetch failures
+    ├── failed-<stage>.txt                  # one per failing stage
+    ├── failed-sig-<slug>-<hash>.txt        # top 20 error signatures
+    └── failed-index.tsv                    # stage, signature, nvr, rpm
 ```
+
+The `.rpm` files are the unmodified originals; `.tarpm-<base>/` holds the
+test artifacts, kept on failure or with `--keep` and rebuilt by each new
+test (see "What is left on disk"). The `failed-*` lists describe the most
+recent report (see "Failure lists").
 
 The report is written to `./report.txt` by default (the current
 directory; `-r` changes it) — it is not inside DIR. Its header also
