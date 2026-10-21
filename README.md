@@ -234,5 +234,19 @@ Run the unit and regression suite without external tools or network access:
 python3 test-tarpm-tag-runner.py
 ```
 
+GitHub Actions installs Koji and tarpm in Fedora 44, runs that suite, and
+uses Fedora's `hello` build for real download/round-trip smoke tests. It
+checks fetch-only → resume, source and binary RPMs, `--keep`, test-only
+cleanup, and `--no-src` without an architecture filter. Reports, logs, and
+artifacts are uploaded as `hello-smoke` for seven days, including on failure.
+To run the same smoke tests locally after installing the tools:
+
+```bash
+python3 .github/scripts/smoke-test.py --output /tmp/hello-smoke
+```
+
+The output directory must be new. Smoke tests require network access;
+listing-difference warnings remain non-fatal, as in normal runs.
+
 Future checks may make content differences fatal or compare headers;
 CentOS Stream/AlmaLinux backends are also planned.
