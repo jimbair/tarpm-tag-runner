@@ -510,7 +510,11 @@ class FetchProgressTests(RunnerTestCase):
         for snapshot in (output, output.encode(), output.replace("\r", "\n"),
                          output.encode().replace(b"demo", b"\xffdemo")):
             with self.subTest(snapshot=snapshot):
-                self.assertEqual(mod.koji_download_percent(snapshot), 61)
+                progress = mod.koji_download_progress(snapshot)
+                self.assertEqual(progress.percent, 61)
+                self.assertEqual(progress.position, (1, 2))
+                self.assertTrue(progress.filename.endswith("demo.rpm"))
+                self.assertEqual(progress.size_text, "913.00 MiB / 1.46 GiB")
 
     def test_new_rpm_does_not_inherit_completed_percentage(self):
         completed = "Downloading [1/2]: first.rpm\n" + self.bar("100%")
@@ -518,19 +522,52 @@ class FetchProgressTests(RunnerTestCase):
                         "Downloading [2/"):
             with self.subTest(heading=heading):
                 output = completed + heading
-                self.assertIsNone(mod.koji_download_percent(output))
-                self.assertEqual(mod.koji_download_percent(output + "\n"
-                                                          + self.bar("3%")), 3)
+                progress = mod.koji_download_progress(output)
+                if heading.endswith("\n"):
+                    self.assertEqual(progress.filename, "next.rpm")
+                    self.assertIsNone(progress.percent)
+                    self.assertIsNone(progress.size_text)
+                    self.assertEqual(mod.koji_download_progress(
+                        output + self.bar("3%")).percent, 3)
+                else:
+                    self.assertIsNone(progress)
 
     def test_missing_unknown_or_invalid_progress_has_no_percentage(self):
-        for output in (None, b"", "Downloading: demo.rpm\n", "retry 61% complete",
-                       self.bar("101%"), self.bar("61%") + self.bar("???%")):
+        for output in (None, b"", "retry 61% complete", self.bar("61%"),
+                       "Downloading [2/1]: demo.rpm\n" + self.bar("61%"),
+                       "Downloading: ../demo.rpm\n" + self.bar("61%")):
             with self.subTest(output=output):
-                self.assertIsNone(mod.koji_download_percent(output))
+                self.assertIsNone(mod.koji_download_progress(output))
+        for bar in ("", self.bar("101%"), self.bar("61%") + self.bar("???%")):
+            with self.subTest(bar=bar):
+                progress = mod.koji_download_progress("Downloading: demo.rpm\n" + bar)
+                self.assertIsNone(progress.percent)
 
     def test_partial_bar_preserves_last_complete_current_rpm_bar(self):
         output = "Downloading: demo.rpm\n" + self.bar("61%") + "[======"
-        self.assertEqual(mod.koji_download_percent(output), 61)
+        self.assertEqual(mod.koji_download_progress(output).percent, 61)
+
+    def test_sizes_fall_back_to_current_rpm_or_explicit_build_total(self):
+        self.downloads.mkdir()
+        (self.downloads / "first.rpm").write_bytes(b"x" * 2048)
+        (self.downloads / "next.rpm").write_bytes(b"x" * 1024)
+        output = "Downloading [2/2]: next.rpm\n"
+        self.assertEqual(mod.fetch_progress_label("demo-1-1", output),
+                         "fetching next.rpm (RPM 2/2)")
+        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
+                         ", 1 KiB so far")
+        self.assertEqual(mod.fetch_progress_label("demo-1-1", None), "fetching demo-1-1")
+        self.assertEqual(mod.fetch_progress_suffix(self.downloads, None),
+                         ", 3 KiB build total so far")
+
+    def test_unknown_percentage_retains_native_rpm_size(self):
+        output = "Downloading: demo.rpm\n" + self.bar("???%")
+        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
+                         ", 913.00 MiB / 1.46 GiB so far")
+        # Clients may emit only downloaded bytes, without the expected total.
+        output = output.replace(" / 1.46 GiB", "")
+        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
+                         ", 913.00 MiB so far")
 
     def test_fetch_heartbeat_uses_native_progress_and_keeps_full_output(self):
         args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
@@ -548,7 +585,7 @@ class FetchProgressTests(RunnerTestCase):
             (final, None),
         ]
         with patch.object(mod.subprocess, "Popen", return_value=proc) as popen, \
-                patch.object(mod, "_dir_bytes", return_value=913 * 1024**2), \
+                patch.object(mod, "_file_bytes", return_value=1024), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
             result = mod.fetch_one("demo-1-1", args, mod.Counter(2))
         self.assertTrue(result.ok)
@@ -556,11 +593,13 @@ class FetchProgressTests(RunnerTestCase):
         self.assertEqual(popen.call_args.args[0], cmd)
         beats = [line for line in stdout.getvalue().splitlines() if "still fetching" in line]
         self.assertEqual(len(beats), 3)
-        self.assertIn("fetching demo-1-1 (1/2)", beats[0])
-        self.assertIn(", 913 MiB, 61% of current RPM so far)", beats[0])
-        self.assertIn(", 913 MiB so far)", beats[1])
+        self.assertIn("fetching first.rpm (RPM 1/2) (build 1/2)", beats[0])
+        self.assertIn(", 913.00 MiB / 1.46 GiB, 61% so far)", beats[0])
+        self.assertIn("fetching next.rpm (RPM 2/2) (build 1/2)", beats[1])
+        self.assertIn(", 1 KiB so far)", beats[1])
         self.assertNotIn("%", beats[1])
-        self.assertIn(", 913 MiB, 21% of current RPM so far)", beats[2])
+        self.assertIn("fetching next.rpm (RPM 2/2) (build 1/2)", beats[2])
+        self.assertIn(", 913.00 MiB / 1.46 GiB, 21% so far)", beats[2])
         self.assertEqual(result.log.read_bytes().decode(), final)
 
 
@@ -696,7 +735,7 @@ class TestProgressTests(RunnerTestCase):
             self.assertEqual(mod.repack_progress_suffix(repacked, 321, None, 4096),
                              ", 1 KiB RPM written, 4 KiB unpacked input")
 
-    def test_stage_starts_and_heartbeats_show_sizes(self):
+    def test_only_heartbeats_show_stage_sizes(self):
         args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)
@@ -709,23 +748,26 @@ class TestProgressTests(RunnerTestCase):
             directory.mkdir(parents=True)
             (directory / "data").write_bytes(b"x" * 4096)
 
-        def child(output="", write=None):
+        def child(output="", write=None, heartbeats=1):
             proc = Mock(pid=321, returncode=0)
             pending = write
+            remaining = heartbeats if write else 0
 
             def communicate(**kwargs):
-                nonlocal pending
+                nonlocal pending, remaining
                 if pending:
                     pending()
                     pending = None
+                if remaining:
+                    remaining -= 1
                     raise subprocess.TimeoutExpired(["tarpm"], 1)
                 return output, None
 
             proc.communicate.side_effect = communicate
             return proc
 
-        children = [child(write=lambda: extract(work / "ext/payload")),
-                    child(write=lambda: repacked.write_bytes(b"x" * 1536)),
+        repack = child(write=lambda: repacked.write_bytes(b"x" * 1536), heartbeats=2)
+        children = [child(write=lambda: extract(work / "ext/payload")), repack,
                     child(write=lambda: extract(work / "ext2/payload")),
                     child("same listing\n"), child("same listing\n")]
         with patch.object(mod.subprocess, "Popen", side_effect=children) as popen, \
@@ -738,22 +780,37 @@ class TestProgressTests(RunnerTestCase):
         self.assertIsNone(result.warning)
         self.assertEqual(popen.call_count, 5)
         starts = [line for line in stdout.getvalue().splitlines() if ": testing " in line]
-        self.assertEqual(len(starts), 5)
-        for line, stage in zip(starts, ("unpack", "repack", "unpack-repacked",
-                                       "list-original", "list-repacked")):
-            self.assertIn(f"({stage}) (1/2)", line)
-        self.assertIn("RPM pending, 4 KiB unpacked input, 2 KiB original RPM", starts[1])
+        self.assertEqual(starts, [])
         beats = [line for line in stdout.getvalue().splitlines() if "still testing" in line]
-        self.assertEqual(len(beats), 3)
+        self.assertEqual(len(beats), 4)
         self.assertIn("4 KiB unpacked, 2 KiB input RPM", beats[0])
-        self.assertIn("1 KiB compressed payload, 1.5 KiB RPM written", beats[1])
-        self.assertIn("4 KiB unpacked input, 2 KiB original RPM", beats[1])
-        self.assertNotIn("%", beats[1])
-        self.assertIn("4 KiB unpacked, 1.5 KiB input RPM", beats[2])
+        for beat in beats[1:3]:
+            self.assertIn("1 KiB compressed payload, 1.5 KiB RPM written", beat)
+            self.assertIn("4 KiB unpacked input, 2 KiB original RPM", beat)
+            self.assertNotIn("%", beat)
+        self.assertIn("4 KiB unpacked, 1.5 KiB input RPM", beats[3])
         # The completed input is measured once after unpacking, not repeatedly
-        # during the repack stage (two earlier scans are unpack start/heartbeat).
+        # during repack (the earlier scan is the unpack heartbeat).
         self.assertEqual(sum(call.args == (work / "ext",)
-                             for call in tree_bytes.call_args_list), 3)
+                             for call in tree_bytes.call_args_list), 2)
+
+    def test_fast_tests_only_log_completion_and_do_not_scan_tree(self):
+        args = mod.parse_args(self.argv)
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("rpm")
+        (self.downloads / "logs").mkdir()
+        with patch.object(mod, "run", side_effect=[(0, "")] * 5), \
+                patch.object(mod, "_tree_bytes") as tree_bytes, \
+                patch.object(mod, "_tarpm_payload_bytes") as payload_bytes, \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            result = mod.test_one(rpm, args)
+        self.assertTrue(result.ok)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("[test]   demo-1-1.noarch ok", lines[0])
+        tree_bytes.assert_not_called()
+        payload_bytes.assert_not_called()
 
     def test_failed_stage_does_not_announce_later_stages(self):
         args = mod.parse_args(self.argv + ["--heartbeat", "0"])
@@ -767,8 +824,7 @@ class TestProgressTests(RunnerTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.stage, "unpack")
         starts = [line for line in stdout.getvalue().splitlines() if ": testing " in line]
-        self.assertEqual(len(starts), 1)
-        self.assertIn("(unpack)", starts[0])
+        self.assertEqual(starts, [])
 
 
 class ArtifactRetentionTests(RunnerTestCase):

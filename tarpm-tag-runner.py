@@ -308,7 +308,7 @@ class Counter:
 
 def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         heartbeat: int = 0, counter_suffix: str = "", suffix_fn=None,
-        start: float | None = None, log_err: bool = False) -> tuple:
+        start: float | None = None, log_err: bool = False, label_fn=None) -> tuple:
     """Run an external command; return (exit_code, combined stdout+stderr).
 
     The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
@@ -327,7 +327,8 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     timestamp) is the reference for the elapsed time (e.g. the start of a
     multi-stage test); it defaults to now.
     `log_err` routes heartbeat diagnostics to stderr for machine-readable
-    stdout, such as --list output.
+    stdout, such as --list output. `label_fn(output)` can replace `label`
+    using cumulative partial output, such as the current RPM being fetched.
     """
     try:
         proc = subprocess.Popen(
@@ -354,8 +355,9 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
                           if heartbeat > 0 else proc.communicate())
                 break
             except subprocess.TimeoutExpired as exc:
+                heartbeat_label = label_fn(exc.output) if label_fn else label
                 suffix = suffix_fn(exc.output, proc.pid) if suffix_fn else ""
-                log(f"{PROG}: still {label}{counter_suffix} "
+                log(f"{PROG}: still {heartbeat_label}{counter_suffix} "
                     f"({fmt_duration(time.monotonic() - t0)}{suffix})",
                     err=log_err)
     except BaseException:
@@ -499,34 +501,81 @@ def select_nvrs(nvrs: list, pkgs: list) -> list:
     return out
 
 
-def koji_download_percent(output: bytes | str | None) -> int | None:
-    """Read Koji's latest native progress bar for the current RPM, if any."""
+@dataclasses.dataclass(frozen=True)
+class KojiDownloadProgress:
+    filename: str
+    position: tuple[int, int] | None
+    percent: int | None
+    size_text: str | None
+
+
+def koji_download_progress(output: bytes | str | None) -> KojiDownloadProgress | None:
+    """Read the current RPM heading and its latest native progress bar."""
     if not output:
         return None
     # TimeoutExpired.output can be bytes even when Popen uses text=True.
     if isinstance(output, bytes):
         output = output.decode("utf-8", errors="replace")
-    start = 0
+    start = None
     for heading in re.finditer(r"(?:^|[\r\n])Downloading(?=[: ])", output):
         start = heading.end()
+    if start is None:
+        return None
+    end = re.search(r"[\r\n]", output[start:])
+    if end is None:
+        return None  # Do not display a filename from an incomplete heading.
+    heading = re.fullmatch(r"(?: \[(\d+)/(\d+)\])?: ([^/\\\r\n]+\.rpm)",
+                           output[start:start + end.start()])
+    if heading is None:
+        return None
+    position = None
+    if heading.group(1) is not None:
+        position = (int(heading.group(1)), int(heading.group(2)))
+        if not 1 <= position[0] <= position[1]:
+            return None
     # A new Downloading heading resets progress: the preceding RPM's 100%
     # must not appear while waiting for the next RPM's first progress bar.
     latest = None
-    for bar in re.finditer(r"(?:^|[\r\n])\[[= ]+\]\s*(\d{1,3}|\?{3})%",
+    for bar in re.finditer(r"(?:^|[\r\n])\[[= ]+\][ \t]*(\d{1,3}|\?{3})%([^\r\n]*)",
                            output[start:]):
-        latest = bar.group(1)
-    if latest is None or latest == "???":
-        return None
-    percent = int(latest)
-    return percent if 0 <= percent <= 100 else None
+        latest = bar
+    percent = None
+    size_text = None
+    if latest is not None:
+        if latest.group(1) != "???" and 0 <= int(latest.group(1)) <= 100:
+            percent = int(latest.group(1))
+        amount = r"\d+(?:\.\d+)?[ \t]+(?:B|[KMGT]iB)"
+        size = re.fullmatch(fr"[ \t]*({amount}(?:[ \t]+/[ \t]+{amount})?)[ \t]*",
+                            latest.group(2))
+        if size is not None:
+            size_text = " ".join(size.group(1).split())
+    return KojiDownloadProgress(heading.group(3), position, percent, size_text)
+
+
+def fetch_progress_label(nvr: str, output: bytes | str | None) -> str:
+    progress = koji_download_progress(output)
+    if progress is None:
+        return f"fetching {nvr}"
+    label = f"fetching {progress.filename}"
+    if progress.position:
+        index, total = progress.position
+        label += f" (RPM {index}/{total})"
+    return label
 
 
 def fetch_progress_suffix(pdir: Path, output: bytes | str | None) -> str:
-    size = human(_dir_bytes(pdir))
-    percent = koji_download_percent(output)
-    if percent is None:
-        return f", {size} so far"
-    return f", {size}, {percent}% of current RPM so far"
+    progress = koji_download_progress(output)
+    if progress is None:
+        return f", {human(_dir_bytes(pdir))} build total so far"
+    size = progress.size_text
+    if size is None:
+        size_bytes = _file_bytes(pdir / progress.filename)
+        if size_bytes is not None:
+            size = human(size_bytes)
+    parts = [size] if size is not None else []
+    if progress.percent is not None:
+        parts.append(f"{progress.percent}%")
+    return ", " + ", ".join(parts) + " so far" if parts else ""
 
 
 def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
@@ -556,7 +605,8 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
     rc, out = run(cmd, cwd=pdir,
                   label=f"fetching {nvr}",
                   heartbeat=args.heartbeat,
-                  counter_suffix=counter_suffix,
+                  counter_suffix=(f" (build {idx}/{counter.total})" if counter else ""),
+                  label_fn=lambda output: fetch_progress_label(nvr, output),
                   suffix_fn=lambda output, pid: fetch_progress_suffix(pdir, output))
     elapsed = time.monotonic() - t0
     logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
@@ -657,22 +707,25 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     repacked = work / f"{base}-repacked.rpm"
     original_size = _file_bytes(rpm)
 
-    def stage_start(name: str, cmd: list, suffix_fn=None) -> None:
-        suffix = suffix_fn(None, None) if suffix_fn else ""
-        log(f"{PROG}: testing {base} ({name}){_progress(progress)} "
-            f"({fmt_duration(time.monotonic() - test_t0)}{suffix})")
-        if args.verbose:
-            log("+ " + " ".join(str(c) for c in cmd))
-
     def unpack_suffix(directory: Path, input_size: int | None) -> str:
         suffix = f", {human(_tree_bytes(directory))} unpacked"
         if input_size is not None:
             suffix += f", {human(input_size)} input RPM"
         return suffix
 
+    unpacked_size = None
+
+    def repack_suffix(output, pid) -> str:
+        nonlocal unpacked_size
+        # Only scan completed input if repacking runs long enough to heartbeat.
+        if unpacked_size is None:
+            unpacked_size = _tree_bytes(work / "ext")
+        return repack_progress_suffix(repacked, pid, original_size, unpacked_size)
+
     def stage(name: str, cmd: list, suffix_fn=None) -> bool:
         nonlocal failed_stage, failed_rc, failed_out
-        stage_start(name, cmd, suffix_fn)
+        if args.verbose:
+            log("+ " + " ".join(str(c) for c in cmd))
         rc, out = run(cmd, label=f"testing {base} ({name})",
                       heartbeat=args.heartbeat, start=test_t0,
                       counter_suffix=_progress(progress), suffix_fn=suffix_fn)
@@ -689,11 +742,8 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     ok = stage("unpack", ["tarpm", "-x", "-f", str(rpm), "-O", str(work / "ext")],
                suffix_fn=lambda output, pid: unpack_suffix(work / "ext", original_size))
     if ok:
-        # The input is now fixed. Scan it once, rather than on every repack heartbeat.
-        unpacked_size = _tree_bytes(work / "ext")
         ok = stage("repack", ["tarpm", "-c", "-f", str(repacked), str(work / "ext")],
-                   suffix_fn=lambda output, pid: repack_progress_suffix(
-                       repacked, pid, original_size, unpacked_size))
+                   suffix_fn=repack_suffix)
     if ok:
         repacked_size = _file_bytes(repacked)
         ok = stage("unpack-repacked",
@@ -705,7 +755,8 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     # failed stage, not a diff to compare.
     warning = None
     if ok:
-        stage_start("list-original", ["tarpm", "-t", "-f", str(rpm)])
+        if args.verbose:
+            log("+ tarpm -t -f " + str(rpm))
         rc, list_orig = run(["tarpm", "-t", "-f", str(rpm)],
                             label=f"testing {base} (list-original)",
                             heartbeat=args.heartbeat, start=test_t0,
@@ -719,7 +770,8 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             buf.append("$ tarpm -t -f " + str(rpm))
             buf.append(list_orig.strip() or "(no output)")
     if ok:
-        stage_start("list-repacked", ["tarpm", "-t", "-f", str(repacked)])
+        if args.verbose:
+            log("+ tarpm -t -f " + str(repacked))
         rc, list_repacked = run(["tarpm", "-t", "-f", str(repacked)],
                                 label=f"testing {base} (list-repacked)",
                                 heartbeat=args.heartbeat, start=test_t0,

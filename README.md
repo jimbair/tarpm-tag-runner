@@ -107,7 +107,8 @@ Other RPMs continue. A runner exception is a test failure at stage
 | `list-original` | `tarpm -t -f <original.rpm>` |
 | `list-repacked` | `tarpm -t -f <work>/<base>-repacked.rpm` |
 
-Each stage logs its start, even if it finishes before a heartbeat.
+Stage details and size metrics appear on heartbeats only; fast RPM tests
+log one completion line. `--verbose` also prints each stage's command.
 Unpack heartbeats show extracted bytes and the input RPM size. Repack
 heartbeats show the compressed payload size (via Linux `/proc`, when
 accessible), RPM bytes written, and the unpacked/original input sizes.
@@ -116,7 +117,7 @@ the RPM, so the RPM can remain pending for most of repacking. These are
 sizes, not completion percentages: compression ratios vary, and checksum
 passes can continue while output sizes stay unchanged. Sizes count logical
 file bytes, without following symlinks or counting hardlinks twice; the
-repack input tree is measured once.
+repack input tree is measured once, on its first heartbeat.
 
 The two listing outputs are compared with Python's `difflib`. A difference
 is a `content-diff` warning, not a failure; failure to generate a listing
@@ -252,10 +253,19 @@ delay termination. Threaded log lines are locked and flushed. Fetch
 completion lines include RPM count, size, and duration; test lines include progress and
 duration. An unavailable run log does not stop the run.
 
-Fetch heartbeats reuse Koji's native percentage for the current RPM when
-available, for example `(5m 00s, 913 MiB, 61% of current RPM so far)`.
-The size is the total downloaded for the build; the percentage resets for
-each RPM. Clients without usable progress output show only the size.
+Fetch starts and completions identify the build. Heartbeats identify the
+current RPM, its position within the build, and the build's position in the
+run. Sizes and percentages both describe that RPM, using Koji's native
+output without extra metadata requests. Elapsed time is for the build's
+fetch, for example:
+
+```text
+still fetching demo-1-1.noarch.rpm (RPM 1/2) (build 3/20) (5m 00s, 913.00 MiB / 1.46 GiB, 61% so far)
+```
+
+Each new RPM gets its own label and progress. Without a usable progress
+bar, the heartbeat shows its local file size. If Koji hasn't identified an
+RPM, it falls back to the build label and explicitly labels the build total.
 
 | Exit | Meaning |
 | --- | --- |

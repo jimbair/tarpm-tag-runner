@@ -82,9 +82,10 @@ def main():
     run_log = (downloads / "run.log").read_text()
     for row in resumed["test"]:
         rpm = Path(row["rpm"])
-        for stage in ("unpack", "repack", "unpack-repacked", "list-original", "list-repacked"):
-            require(f"testing {rpm.stem} ({stage})" in run_log,
-                    f"stage start missing from run log: {rpm.stem} ({stage})")
+        require(f": testing {rpm.stem} (" not in run_log,
+                f"unexpected stage-start noise in run log: {rpm.stem}")
+        require(f"[test]   {rpm.stem} ok" in run_log,
+                f"test completion missing from run log: {rpm.stem}")
         work = rpm.parent / f".tarpm-{rpm.stem}"
         for artifact in (rpm, work / "ext", work / "ext2",
                          work / f"{rpm.stem}-repacked.rpm",
