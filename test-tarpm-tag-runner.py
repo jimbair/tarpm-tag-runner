@@ -166,6 +166,36 @@ class FetchRecoveryTests(RunnerTestCase):
         self.assertTrue(source.exists())
 
 
+class ArtifactRetentionTests(RunnerTestCase):
+    def test_warning_retains_only_log_unless_keep(self):
+        for keep in (False, True):
+            with self.subTest(keep=keep):
+                args = mod.parse_args(self.argv + (["--keep"] if keep else []))
+                rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+                rpm.parent.mkdir(parents=True, exist_ok=True)
+                rpm.write_text("original rpm")
+                (self.downloads / "logs").mkdir(exist_ok=True)
+                outputs = [(0, ""), (0, ""), (0, ""),
+                           (0, "original list\n"), (0, "changed list\n")]
+                with patch.object(mod, "run", side_effect=outputs), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = mod.test_one(rpm, args)
+                self.assertTrue(result.ok)
+                self.assertEqual(result.warning, "content-diff")
+                self.assertIn("changed list", result.log.read_text())
+                self.assertEqual(rpm.exists(), keep)
+                self.assertEqual((rpm.parent / ".tarpm-demo-1-1.noarch").exists(), keep)
+
+    def test_retry_failed_does_not_select_unfinished_build(self):
+        bdir = self.downloads / "demo-1-1"
+        bdir.mkdir(parents=True)
+        (bdir / "partial.rpm").write_text("unfinished download")
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build") as process:
+            self.assertEqual(self.run_main("--retry-failed"), 0)
+        process.assert_not_called()
+
+
 class ErrorSignatureTests(unittest.TestCase):
     def test_create_payload_line(self):
         # The "tarpm: " line is used, with the prefix stripped.

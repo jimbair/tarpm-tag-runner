@@ -10,7 +10,7 @@ The tarpm test runs by default on every fetched RPM, including the
 source RPM (maximum coverage by default):
   --no-test    fetch only, skip the test
   --test-only  skip fetching, test the RPMs already downloaded
-  --no-src     skip .src.rpm in the test (they are tested by default)
+  --no-src     skip .src.rpm; discard any sources fetched by Koji
 
 The tag list is cached as <dir>/tag-<TAG>.txt and reused on later runs
 (--refresh re-fetches from Koji; --from-file reads an explicit list).
@@ -40,8 +40,9 @@ their own session, so they survive Ctrl+C and finish; a second Ctrl+C
 while waiting force-quits immediately and orphans the in-flight
 koji/tarpm — observed behavior is that they die on their next write to
 the now-closed output pipe, possibly leaving a truncated RPM, so do not
-trust files from a force-quit run (re-run those builds with
---retry-failed or --resume, or delete their DIR/<NVR>/ directories).
+trust files from a force-quit run (continue with --resume, which also
+re-downloads builds with no journal record, or delete their DIR/<NVR>/
+directories before re-running).
 
 Exit status: 0 all ok, 1 some fetches/tests failed, 2 usage/environment,
 130 interrupted by Ctrl+C (partial results reported; takes precedence
@@ -677,9 +678,9 @@ def _force_quit(signum, frame) -> None:
     msg = (f"{PROG}: force-quit; in-flight koji/tarpm are orphaned and "
            f"typically die on their next write to the closed pipe, "
            f"possibly leaving a truncated RPM. Do not trust files from "
-           f"a force-quit run: re-run those builds with --retry-failed "
-           f"or --resume (which re-download), or delete their "
-           f"DIR/<NVR>/ directories")
+           f"a force-quit run: continue with --resume (which re-downloads "
+           f"unfinished builds too), or delete their DIR/<NVR>/ directories "
+           f"before re-running")
     RUNLOG.write(msg)
     sys.stderr.write(f"{msg}\n")
     sys.stderr.flush()
@@ -1158,12 +1159,12 @@ def parse_args(argv) -> argparse.Namespace:
     ap.add_argument("--test-only", action="store_true",
                     help="skip fetching; test the RPMs already in DIR")
     ap.add_argument("--no-src", dest="no_src", action="store_true",
-                    help="skip .src.rpm files in the test (they are "
-                         "tested by default)")
+                    help="skip testing .src.rpm files and discard sources "
+                         "after a successful fetch (tested by default)")
     ap.add_argument("--keep", action="store_true",
                     help="keep per-RPM work dirs, logs, and original RPMs "
-                         "even for passing RPMs (default: removed on a "
-                         "clean pass; kept on failure or warning)")
+                         "even for passing RPMs (default: passing RPMs and "
+                         "work dirs removed; warning logs retained)")
     # common
     ap.add_argument("-d", "--dir", default="rpms",
                     help="download directory (default: ./rpms)")

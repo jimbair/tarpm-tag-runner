@@ -57,13 +57,14 @@ Fetch:
 Test (tarpm round-trip: unpack -> repack -> unpack repacked; runs by
      default on every fetched RPM, including the source RPM):
       --no-test     fetch only; skip the tarpm test phase
-      --no-src      skip .src.rpm files (tested by default)
+      --no-src      skip testing .src.rpm files; discard any sources
+                    after a successful fetch (tested by default)
       --test-only   skip fetching; test the RPMs already in DIR (the -p
                     and -n filters apply to the downloaded builds)
       --keep        keep per-RPM test work dirs (ext/, ext2/, repacked rpm),
                     logs, and the original RPMs even for passing RPMs
-                    (default: removed on a clean pass; kept on failure
-                    or warning)
+                    (default: passing RPMs and work dirs removed;
+                    warning logs retained)
 
 Common:
   -r FILE           report file (default: ./report.txt)
@@ -170,7 +171,8 @@ everything for passes too). For a failed RPM, two different things remain
 and it matters which is which:
 
 - `DIR/<NVR>/<base>.rpm` is the **original** koji download. The runner
-  never modifies it; it is deleted only after a clean pass.
+  never modifies it; it is deleted after a pass, including warnings,
+  unless --keep is used.
 - `DIR/<NVR>/.tarpm-<base>/` holds the **test artifacts** of the last
   attempt: `ext/`, the repacked RPM, `ext2/`, and the two listings. Which
   of them exist depends on how far the cycle got. Each new test of that
@@ -240,16 +242,21 @@ simply proceeds without one.
 Every finished build appends one JSON line to `DIR/journal.jsonl` (one
 `os.write()` under a lock per line; the reader skips a torn or invalid
 last line, and the latest record per NVR wins). Fields: `nvr`, `status`
-(`pass`, `warn`, `fetch-fail`, `test-fail`), `stage`, `exit_code`,
+(`fetched`, `pass`, `warn`, `fetch-fail`, `test-fail`), `stage`, `exit_code`,
 `signature` (see Error signatures), `rpms` (failing RPM basenames; for
 `warn`, the warned ones), and `ts` (UTC). Records are written as each
 build finishes, so an interrupted or crashed run still keeps the records
 of the builds that completed; a build that did not finish gets no
 record.
 
+`fetched` means download succeeded without any completed tests (including
+`--no-test`); `--resume` still tests these builds. `--test-only` does not
+update the journal. A torn final line is separated before the next append,
+so it does not consume the new record.
+
 - `--resume` skips builds whose latest record is `pass` or `warn`, so an
   interrupted run can be continued without re-testing what already
-  passed.
+  passed. Each selected build starts from a clean download directory.
 - `--retry-failed` re-runs only the builds whose latest record is
   `fetch-fail` or `test-fail`, each from a clean `DIR/<NVR>/`, through
   the normal fetch-and-test pipeline (`-j`, `-a`, `--no-src`, `-n`, and
@@ -400,9 +407,10 @@ cleanup). The in-flight koji/tarpm processes are orphaned, and their
 output pipe is gone: observed behavior is that they die on their next
 write to it (a `BrokenPipeError`, exit 120) rather than finishing. That
 can leave a truncated RPM (`rpm -K` reports `DIGESTS NOT OK`) or a partial
-work dir. Do not trust files from a force-quit run: re-run those builds
-with `--retry-failed` or `--resume` (which re-download), or delete their
-`DIR/<NVR>/` directories.
+work dir. Do not trust files from a force-quit run: continue with
+`--resume`, or delete the unfinished `DIR/<NVR>/` directories before
+re-running. `--retry-failed` covers recorded failures only; it skips
+unfinished builds that have no failure record.
 
 | code | meaning                                    |
 |------|--------------------------------------------|
