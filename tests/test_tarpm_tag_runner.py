@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -442,6 +443,57 @@ class ErrorSignatureTests(unittest.TestCase):
     def test_empty_output(self):
         self.assertEqual(mod.error_signature(""), "")
         self.assertEqual(mod.error_signature("\n  \n\t\n"), "")
+
+
+class ForceQuitTests(unittest.TestCase):
+    def child_command(self, body):
+        script = (
+            "import importlib.util, os, signal, sys\n"
+            f"spec = importlib.util.spec_from_file_location('force_test', "
+            f"{str(_ROOT / 'tarpm-tag-runner.py')!r})\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "sys.modules[spec.name] = mod\n"
+            "spec.loader.exec_module(mod)\n"
+        )
+        return [sys.executable, "-c", script + body]
+
+    def test_second_interrupt_exits_while_log_lock_is_held(self):
+        command = self.child_command(
+            "class InterruptedLog:\n"
+            "    def write(self, text):\n"
+            "        os.kill(os.getpid(), signal.SIGINT)\n"
+            "    def flush(self):\n"
+            "        pass\n"
+            "mod.RUNLOG._fh = InterruptedLog()\n"
+            "signal.signal(signal.SIGINT, mod._force_quit)\n"
+            "mod.RUNLOG.write('interrupted main-thread log write')\n")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 130)
+        self.assertIn("force-quit", result.stderr)
+
+    def test_force_quit_exits_with_closed_stderr(self):
+        result = subprocess.run(self.child_command(
+            "os.close(2)\nmod._force_quit(signal.SIGINT, None)\n"),
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 130)
+
+    def test_force_quit_exits_with_full_stderr_pipe(self):
+        command = self.child_command(
+            "os.set_blocking(2, False)\n"
+            "try:\n"
+            "    while True:\n"
+            "        os.write(2, b'x' * 4096)\n"
+            "except BlockingIOError:\n"
+            "    pass\n"
+            "os.set_blocking(2, True)\n"
+            "mod._force_quit(signal.SIGINT, None)\n")
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(proc.wait(timeout=5), 130)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
 
 
 class PoolInterruptTests(RunnerTestCase):

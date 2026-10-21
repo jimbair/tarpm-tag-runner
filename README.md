@@ -220,8 +220,9 @@ not in the resumed report. Invocations that exit without writing a report
 leave the prior report/lists intact.
 
 The run log appends a UTC start/argv header and timestamped runner lines
-for each invocation, including heartbeats, force-quit messages, and uncaught
-tracebacks. Threaded lines are locked and flushed. Fetch completion lines
+for each invocation, including heartbeats and uncaught tracebacks. A
+force-quit attempts a nonblocking message to stderr only, so logging cannot
+delay termination. Threaded log lines are locked and flushed. Fetch completion lines
 include RPM count, size, and duration; test lines include progress and
 duration. An unavailable run log does not stop the run.
 

@@ -705,10 +705,20 @@ def _force_quit(signum, frame) -> None:
            f"a force-quit run: continue with --resume (which re-downloads "
            f"unfinished builds too), or delete their DIR/<NVR>/ directories "
            f"before re-running")
-    RUNLOG.write(msg)
-    sys.stderr.write(f"{msg}\n")
-    sys.stderr.flush()
-    os._exit(130)
+    # A signal may interrupt a log write while its lock is held. Never use
+    # RUNLOG or buffered stderr here; even a full stderr pipe must not
+    # prevent the second Ctrl+C from terminating the process.
+    try:
+        blocking = os.get_blocking(2)
+        os.set_blocking(2, False)
+        try:
+            os.write(2, (msg + "\n").encode("utf-8", errors="replace"))
+        finally:
+            os.set_blocking(2, blocking)
+    except OSError:
+        pass
+    finally:
+        os._exit(130)
 
 
 def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
