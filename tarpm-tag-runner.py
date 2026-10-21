@@ -955,9 +955,9 @@ def write_json(path: Path, args, fetch: list | None, test: list | None) -> None:
 class Journal:
     """Append-only journal of finished builds (one JSON line each).
 
-    Each line is one os.write() under a lock, so concurrent worker
-    threads never interleave lines and a crash cannot corrupt an earlier
-    line. A line that cannot be written is dropped (the run continues).
+    Each complete line is written under a lock, retrying short writes.
+    A failed append rolls back to its starting offset. If rollback fails,
+    further appends are disabled so they cannot join a partial record.
     """
 
     def __init__(self) -> None:
@@ -966,6 +966,7 @@ class Journal:
         self._lock = threading.Lock()
 
     def open(self, path: str) -> None:
+        self._disable()
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             self._fh = open(path, "a+b", buffering=0)
@@ -976,21 +977,53 @@ class Journal:
             if self._fh.seek(0, os.SEEK_END):
                 self._fh.seek(-1, os.SEEK_END)
                 if self._fh.read(1) != b"\n":
-                    os.write(self._fh.fileno(), b"\n")
+                    self._write_all(b"\n")
             self.path = path
-        except OSError:
-            self._fh = None
+        except OSError as exc:
+            self._disable()
             self.path = None
+            log(f"{PROG}: warning: journal disabled: cannot open {path}: {exc}",
+                err=True)
 
-    def append(self, record: dict) -> None:
-        if self._fh is None:
-            return
-        data = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-        with self._lock:
+    def _disable(self) -> None:
+        if self._fh is not None:
             try:
-                os.write(self._fh.fileno(), data)
+                self._fh.close()
             except OSError:
                 pass
+            self._fh = None
+
+    def _write_all(self, data: bytes) -> None:
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(self._fh.fileno(), remaining)
+            if written <= 0:
+                raise OSError("journal write made no progress")
+            remaining = remaining[written:]
+
+    def append(self, record: dict) -> None:
+        data = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        warning = None
+        with self._lock:
+            if self._fh is None:
+                return
+            offset = None
+            try:
+                offset = os.lseek(self._fh.fileno(), 0, os.SEEK_END)
+                self._write_all(data)
+            except OSError as exc:
+                warning = f"could not append journal record for {record.get('nvr')}: {exc}"
+                if offset is None:
+                    self._disable()
+                    warning += "; journal disabled"
+                else:
+                    try:
+                        os.ftruncate(self._fh.fileno(), offset)
+                    except OSError as repair_exc:
+                        self._disable()
+                        warning += f"; journal disabled: rollback failed: {repair_exc}"
+        if warning:
+            log(f"{PROG}: warning: {warning}", err=True)
 
 
 JOURNAL = Journal()

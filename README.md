@@ -149,6 +149,8 @@ crash preserves completed work. Records contain `nvr`, `status`, `stage`,
 `exit_code`, `signature`, `rpms` (failed or warned RPM basenames), and `ts`
 (UTC). The latest record per NVR wins; invalid lines are ignored, and an
 incomplete tail is separated before new records are appended.
+Short writes are retried; failed appends are rolled back with a warning.
+If rollback fails, further journal writes are disabled to prevent corruption.
 
 Statuses are `fetched` (download succeeded without completed tests), `pass`,
 `warn`, `fetch-fail`, and `test-fail`. `--test-only` does not update the

@@ -100,6 +100,81 @@ class JournalRecoveryTests(RunnerTestCase):
                          {old["nvr"]: old, new["nvr"]: new})
 
 
+class JournalWriteTests(RunnerTestCase):
+    def test_short_writes_complete_each_record(self):
+        path = self.root / "journal.jsonl"
+        mod.JOURNAL.open(str(path))
+        real_write = os.write
+        records = [{"nvr": "first-1-1", "status": "test-fail"},
+                   {"nvr": "second-1-1", "status": "pass"}]
+        with patch.object(mod.os, "write", side_effect=lambda fd, data: real_write(fd, data[:7])):
+            for record in records:
+                mod.JOURNAL.append(record)
+        self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], records)
+
+    def test_failed_append_rolls_back_before_next_record(self):
+        path = self.root / "journal.jsonl"
+        mod.JOURNAL.open(str(path))
+        old = {"nvr": "old-1-1", "status": "pass"}
+        mod.JOURNAL.append(old)
+        before = path.read_bytes()
+        real_write = os.write
+        calls = 0
+
+        def fail_after_partial_write(fd, data):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_write(fd, data[:12])
+            raise OSError("disk full")
+
+        stderr = io.StringIO()
+        with patch.object(mod.os, "write", side_effect=fail_after_partial_write), \
+                contextlib.redirect_stderr(stderr):
+            mod.JOURNAL.append({"nvr": "broken-1-1", "status": "test-fail"})
+        self.assertEqual(path.read_bytes(), before)
+        self.assertIn("could not append journal record", stderr.getvalue())
+        new = {"nvr": "new-1-1", "status": "pass"}
+        mod.JOURNAL.append(new)
+        self.assertEqual(mod.read_journal(str(path)), {old["nvr"]: old, new["nvr"]: new})
+
+    def test_zero_length_write_does_not_loop_or_damage_next_record(self):
+        path = self.root / "journal.jsonl"
+        mod.JOURNAL.open(str(path))
+        with patch.object(mod.os, "write", return_value=0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            mod.JOURNAL.append({"nvr": "broken-1-1", "status": "test-fail"})
+        record = {"nvr": "new-1-1", "status": "pass"}
+        mod.JOURNAL.append(record)
+        self.assertEqual(mod.read_journal(str(path)), {record["nvr"]: record})
+
+    def test_failed_rollback_disables_further_appends(self):
+        path = self.root / "journal.jsonl"
+        mod.JOURNAL.open(str(path))
+        real_write = os.write
+        calls = 0
+
+        def fail_after_partial_write(fd, data):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_write(fd, data[:12])
+            raise OSError("disk full")
+
+        stderr = io.StringIO()
+        with patch.object(mod.os, "write", side_effect=fail_after_partial_write), \
+                patch.object(mod.os, "ftruncate", side_effect=OSError("repair failed")), \
+                contextlib.redirect_stderr(stderr):
+            mod.JOURNAL.append({"nvr": "broken-1-1", "status": "test-fail"})
+        self.assertIsNone(mod.JOURNAL._fh)
+        self.assertIn("journal disabled: rollback failed", stderr.getvalue())
+        before = path.read_bytes()
+        with patch.object(mod.os, "write") as write:
+            mod.JOURNAL.append({"nvr": "new-1-1", "status": "pass"})
+        write.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+
+
 class CliSelectionTests(RunnerTestCase):
     def list_output(self, *options):
         stdout, stderr = io.StringIO(), io.StringIO()
