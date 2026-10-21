@@ -245,7 +245,7 @@ class Counter:
 
 def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         heartbeat: int = 0, counter_suffix: str = "", suffix_fn=None,
-        start: float | None = None) -> tuple:
+        start: float | None = None, log_err: bool = False) -> tuple:
     """Run an external command; return (exit_code, combined stdout+stderr).
 
     The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
@@ -262,6 +262,8 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     return a ', <size> so far' suffix. `start` (a monotonic timestamp) is
     the reference for the elapsed time (e.g. the start of a multi-stage test);
     it defaults to now.
+    `log_err` routes heartbeat diagnostics to stderr for machine-readable
+    stdout, such as --list output.
     """
     try:
         proc = subprocess.Popen(
@@ -290,7 +292,8 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
             except subprocess.TimeoutExpired:
                 suffix = suffix_fn() if suffix_fn else ""
                 log(f"{PROG}: still {label}{counter_suffix} "
-                    f"({fmt_duration(time.monotonic() - t0)}{suffix})")
+                    f"({fmt_duration(time.monotonic() - t0)}{suffix})",
+                    err=log_err)
     except BaseException:
         proc.kill()
         proc.wait()
@@ -377,11 +380,11 @@ def read_nvrs(args) -> tuple:
         else:
             if shutil.which("koji") is None:
                 raise UsageError("koji client not found in PATH")
-            log(f"{PROG}: fetching koji tag {args.tag}")
+            log(f"{PROG}: fetching koji tag {args.tag}", err=args.list)
             t0 = time.monotonic()
             rc, out = run(["koji", "latest-pkg", "--all", args.tag],
                           label=f"fetching koji tag {args.tag}",
-                          heartbeat=args.heartbeat)
+                          heartbeat=args.heartbeat, log_err=args.list)
             elapsed = time.monotonic() - t0
             if rc != 0:
                 log(f"{PROG}: tag {args.tag}: failed (after {elapsed:.1f}s)",
@@ -408,14 +411,14 @@ def read_nvrs(args) -> tuple:
     nvrs = list(dict.fromkeys(nvrs))
     if source.startswith("cached"):
         log(f"{PROG}: tag {args.tag}: using cached list ({len(nvrs)} packages, "
-            f"saved {saved})")
+            f"saved {saved})", err=args.list)
     elif source.startswith("fetched"):
         log(f"{PROG}: tag {args.tag}: success ({len(nvrs)} packages "
-            f"in {elapsed:.1f}s)")
-        log(f"{PROG}: saved tag list to {cache}")
+            f"in {elapsed:.1f}s)", err=args.list)
+        log(f"{PROG}: saved tag list to {cache}", err=args.list)
     else:
         log(f"{PROG}: tag {args.tag}: list from {args.from_file} "
-            f"({len(nvrs)} packages)")
+            f"({len(nvrs)} packages)", err=args.list)
     return nvrs, source
 
 
@@ -1165,7 +1168,7 @@ def parse_args(argv) -> argparse.Namespace:
                     help="only process the first N builds (smoke test)")
     ap.add_argument("--list", action="store_true",
                     help="print the NVRs that would be fetched and exit "
-                         "without downloading")
+                         "without downloading (incompatible with --test-only)")
     ap.add_argument("--from-file", metavar="FILE",
                     help="read the NVR list from FILE (same format as "
                          "'koji latest-pkg --all TAG'; blank lines and "
@@ -1189,7 +1192,7 @@ def parse_args(argv) -> argparse.Namespace:
     # common
     ap.add_argument("-d", "--dir", default="rpms",
                     help="download directory (default: ./rpms)")
-    ap.add_argument("-r", "--report", default="report.txt",
+    ap.add_argument("-r", "--report",
                     help="report file (default: ./report.txt)")
     ap.add_argument("--run-log", metavar="FILE",
                     help="append the run log (every log line, plus one "
@@ -1226,6 +1229,8 @@ def parse_args(argv) -> argparse.Namespace:
         ap.error("--heartbeat expects a non-negative integer")
     if args.no_test and args.test_only:
         ap.error("--no-test is incompatible with --test-only")
+    if args.list and args.test_only:
+        ap.error("--list is incompatible with --test-only")
     if args.refresh and args.from_file:
         ap.error("--refresh is incompatible with --from-file")
     if args.resume and args.retry_failed:
@@ -1240,6 +1245,10 @@ def parse_args(argv) -> argparse.Namespace:
         if args.no_test:
             ap.error("--resume/--retry-failed cannot be combined with "
                      "--no-test")
+    if args.report is None:
+        args.report = (f"report-retry-"
+                       f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.txt"
+                       if args.retry_failed else "report.txt")
     if args.no_run_log:
         args.run_log = None
     elif args.run_log is None:
@@ -1261,9 +1270,6 @@ def main(argv=None) -> int:
     if do_fetch:
         # One record per finished build; --test-only records nothing.
         JOURNAL.open(str(Path(args.dir) / "journal.jsonl"))
-    if args.retry_failed and not argv and args.report == "report.txt":
-        args.report = (f"report-retry-"
-                       f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.txt")
 
     if args.test_only and not Path(args.dir).is_dir():
         log(f"{PROG}: error: --test-only: no download directory to test: "
@@ -1308,15 +1314,8 @@ def main(argv=None) -> int:
             selected = [n for n in selected if n in failed]
             if not selected:
                 log(f"{PROG}: nothing to do: no failed builds in "
-                      f"{journal_path}")
+                      f"{journal_path}", err=args.list)
                 return 0
-
-        if args.list:
-            for nvr in selected:
-                print(nvr)
-            log(f"{PROG}: {len(selected)} build(s) selected from tag "
-                  f"{args.tag}", err=True)
-            return 0
 
         if args.resume:
             # Skip what already passed; continue the rest.
@@ -1327,11 +1326,18 @@ def main(argv=None) -> int:
                         not in ("pass", "warn")]
             log(f"{PROG}: resume: skipping {before - len(selected)} of "
                   f"{before} build(s) already passed (journal: "
-                  f"{journal_path})")
+                  f"{journal_path})", err=args.list)
             if not selected:
                 log(f"{PROG}: nothing to do: all builds already passed "
-                      f"(journal: {journal_path})")
+                      f"(journal: {journal_path})", err=args.list)
                 return 0
+
+        if args.list:
+            for nvr in selected:
+                print(nvr)
+            log(f"{PROG}: {len(selected)} build(s) selected from tag "
+                  f"{args.tag}", err=True)
+            return 0
 
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
         total_selected = len(selected)

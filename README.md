@@ -50,7 +50,7 @@ architectures plus source RPMs. Koji's default debuginfo exclusion applies.
 | `-a ARCH` | Select this arch plus `noarch` and `src` (unless `--no-src`); repeatable. |
 | `-d DIR` | Put each build in `DIR/<NVR>/`. |
 | `-n NUM` | Process the first NUM builds; `0` means no limit. |
-| `--list` | Print selected NVRs and exit without downloading RPMs. |
+| `--list` | Print selected NVRs and exit without downloading RPMs; incompatible with `--test-only`. |
 | `--from-file FILE` | Read a build list instead of querying Koji or using the cache. |
 | `--refresh` | Replace the cached tag list with a fresh Koji query. |
 | `--no-test` | Download only; tarpm is not required. |
@@ -83,6 +83,9 @@ matching build directories in alphabetical order.
 
 Build lists must contain plain `name-version-release` values. Fetch and
 recovery reject paths and symlinked build directories.
+
+`--list` applies resume/retry journal filters before printing and sends
+diagnostics to stderr, so stdout can be saved and reused with `--from-file`.
 
 Koji matches architectures exactly, so the runner adds `noarch` and `src`
 when `-a` is supplied. Without `-a`, `--no-src` may still download source

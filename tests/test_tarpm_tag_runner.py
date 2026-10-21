@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -94,6 +95,111 @@ class JournalRecoveryTests(RunnerTestCase):
         mod.JOURNAL.append(new)
         self.assertEqual(mod.read_journal(str(path)),
                          {old["nvr"]: old, new["nvr"]: new})
+
+
+class CliSelectionTests(RunnerTestCase):
+    def list_output(self, *options):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = mod.main(self.argv + ["--list"] + list(options))
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_test_only_list_is_rejected_without_touching_rpms(self):
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("original rpm")
+        with patch.object(mod, "run") as command, \
+                self.assertRaises(SystemExit) as error:
+            self.run_main("--test-only", "--list")
+        self.assertEqual(error.exception.code, 2)
+        command.assert_not_called()
+        self.assertEqual(rpm.read_text(), "original rpm")
+        self.assertFalse((self.root / "report.txt").exists())
+
+    def test_file_list_stdout_round_trips_without_diagnostics(self):
+        result, stdout, stderr = self.list_output()
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "demo-1-1\n")
+        self.assertIn("list from", stderr)
+        self.listfile.write_text(stdout)
+        with contextlib.redirect_stdout(io.StringIO()):
+            nvrs, _ = mod.read_nvrs(mod.parse_args(self.argv))
+        self.assertEqual(nvrs, ["demo-1-1"])
+
+    def test_cached_list_stdout_contains_only_nvrs(self):
+        self.downloads.mkdir()
+        (self.downloads / "tag-f44.txt").write_text(
+            "Build Tag Built by\n------------------\ndemo-1-1 f44 user\n")
+        self.argv = ["-d", str(self.downloads), "--no-run-log"]
+        with patch.object(mod, "run") as command:
+            result, stdout, stderr = self.list_output()
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "demo-1-1\n")
+        self.assertIn("using cached list", stderr)
+        command.assert_not_called()
+
+    def test_fresh_list_and_heartbeat_diagnostics_use_stderr(self):
+        self.argv = ["-d", str(self.downloads), "--no-run-log"]
+        proc = unittest.mock.Mock()
+        proc.communicate.side_effect = [
+            mod.subprocess.TimeoutExpired(["koji"], 60),
+            ("demo-1-1 f44 user\n", None),
+        ]
+        proc.returncode = 0
+        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                patch.object(mod.subprocess, "Popen", return_value=proc):
+            result, stdout, stderr = self.list_output()
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "demo-1-1\n")
+        self.assertIn("still fetching koji tag", stderr)
+        self.assertIn("saved tag list", stderr)
+
+    def test_resume_list_excludes_passed_and_warned_builds(self):
+        self.listfile.write_text("pass-1-1\nwarn-1-1\nfail-1-1\nnew-1-1\n")
+        self.downloads.mkdir()
+        records = [{"nvr": "pass-1-1", "status": "pass"},
+                   {"nvr": "warn-1-1", "status": "warn"},
+                   {"nvr": "fail-1-1", "status": "test-fail"}]
+        (self.downloads / "journal.jsonl").write_text(
+            "".join(json.dumps(record) + "\n" for record in records))
+        with patch.object(mod, "process_build") as process:
+            result, stdout, stderr = self.list_output("--resume")
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "fail-1-1\nnew-1-1\n")
+        self.assertIn("skipping 2 of 4", stderr)
+        process.assert_not_called()
+
+    def test_empty_recovery_lists_leave_stdout_empty(self):
+        self.downloads.mkdir()
+        (self.downloads / "journal.jsonl").write_text(json.dumps(
+            {"nvr": "demo-1-1", "status": "pass"}) + "\n")
+        for mode in ("--resume", "--retry-failed"):
+            with self.subTest(mode=mode):
+                result, stdout, stderr = self.list_output(mode)
+                self.assertEqual(result, 0)
+                self.assertEqual(stdout, "")
+                self.assertIn("nothing to do", stderr)
+                mod.JOURNAL._fh.close()
+
+
+class ReportPathTests(unittest.TestCase):
+    def test_retry_default_matches_cli_and_explicit_argv(self):
+        fixed = datetime(2026, 10, 21, 12, 30, 45, tzinfo=timezone.utc)
+        with patch.object(mod, "datetime") as clock:
+            clock.now.return_value = fixed
+            explicit = mod.parse_args(["--retry-failed"])
+            with patch.object(sys, "argv", ["tarpm-tag-runner.py", "--retry-failed"]):
+                cli = mod.parse_args(None)
+        self.assertEqual(explicit.report, "report-retry-20261021-123045.txt")
+        self.assertEqual(cli.report, explicit.report)
+
+    def test_explicit_report_paths_are_preserved(self):
+        for report in ("report.txt", "custom.txt"):
+            for mode in ([], ["--retry-failed"]):
+                with self.subTest(report=report, mode=mode):
+                    args = mod.parse_args(mode + ["-r", report])
+                    self.assertEqual(args.report, report)
+        self.assertEqual(mod.parse_args([]).report, "report.txt")
 
 
 class BuildPathTests(RunnerTestCase):
