@@ -259,9 +259,10 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     If `heartbeat` > 0 and `label` is set, a line is logged every
     `heartbeat` seconds while the command is still running, so a slow
     command does not look stuck:
-        still <label><counter_suffix> (<fmt_duration>)<suffix_fn()>
-    `counter_suffix` is the '(n/total)' fetch progress; `suffix_fn()` may
-    return a ', <size> so far' suffix. `start` (a monotonic timestamp) is
+        still <label><counter_suffix> (<fmt_duration><suffix_fn(output)>)
+    `counter_suffix` is the '(n/total)' fetch progress; `suffix_fn(output)`
+    receives cumulative partial output (bytes, str, or None) and returns
+    extra progress text. `start` (a monotonic timestamp) is
     the reference for the elapsed time (e.g. the start of a multi-stage test);
     it defaults to now.
     `log_err` routes heartbeat diagnostics to stderr for machine-readable
@@ -291,8 +292,8 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
                 out, _ = (proc.communicate(timeout=heartbeat)
                           if heartbeat > 0 else proc.communicate())
                 break
-            except subprocess.TimeoutExpired:
-                suffix = suffix_fn() if suffix_fn else ""
+            except subprocess.TimeoutExpired as exc:
+                suffix = suffix_fn(exc.output) if suffix_fn else ""
                 log(f"{PROG}: still {label}{counter_suffix} "
                     f"({fmt_duration(time.monotonic() - t0)}{suffix})",
                     err=log_err)
@@ -437,6 +438,36 @@ def select_nvrs(nvrs: list, pkgs: list) -> list:
     return out
 
 
+def koji_download_percent(output: bytes | str | None) -> int | None:
+    """Read Koji's latest native progress bar for the current RPM, if any."""
+    if not output:
+        return None
+    # TimeoutExpired.output can be bytes even when Popen uses text=True.
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    start = 0
+    for heading in re.finditer(r"(?:^|[\r\n])Downloading(?=[: ])", output):
+        start = heading.end()
+    # A new Downloading heading resets progress: the preceding RPM's 100%
+    # must not appear while waiting for the next RPM's first progress bar.
+    latest = None
+    for bar in re.finditer(r"(?:^|[\r\n])\[[= ]+\]\s*(\d{1,3}|\?{3})%",
+                           output[start:]):
+        latest = bar.group(1)
+    if latest is None or latest == "???":
+        return None
+    percent = int(latest)
+    return percent if 0 <= percent <= 100 else None
+
+
+def fetch_progress_suffix(pdir: Path, output: bytes | str | None) -> str:
+    size = human(_dir_bytes(pdir))
+    percent = koji_download_percent(output)
+    if percent is None:
+        return f", {size} so far"
+    return f", {size}, {percent}% of current RPM so far"
+
+
 def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
     pdir = build_dir(args.dir, nvr)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -465,7 +496,7 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
                   label=f"fetching {nvr}",
                   heartbeat=args.heartbeat,
                   counter_suffix=counter_suffix,
-                  suffix_fn=lambda: f", {human(_dir_bytes(pdir))} so far")
+                  suffix_fn=lambda output: fetch_progress_suffix(pdir, output))
     elapsed = time.monotonic() - t0
     logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
     logfile.write_text(out)

@@ -499,6 +499,71 @@ class BuildPathTests(RunnerTestCase):
                 mod.JOURNAL._fh.close()
 
 
+class FetchProgressTests(RunnerTestCase):
+    @staticmethod
+    def bar(percent):
+        return f"[{'=' * 21}{' ' * 15}] {percent:>4} 913.00 MiB / 1.46 GiB\r"
+
+    def test_latest_native_bar_in_bytes_or_text(self):
+        output = ("Downloading [1/2]: demo.rpm\n" + self.bar("12%")
+                  + self.bar("61%"))
+        for snapshot in (output, output.encode(), output.replace("\r", "\n"),
+                         output.encode().replace(b"demo", b"\xffdemo")):
+            with self.subTest(snapshot=snapshot):
+                self.assertEqual(mod.koji_download_percent(snapshot), 61)
+
+    def test_new_rpm_does_not_inherit_completed_percentage(self):
+        completed = "Downloading [1/2]: first.rpm\n" + self.bar("100%")
+        for heading in ("Downloading [2/2]: next.rpm\n", "Downloading: next.rpm\n",
+                        "Downloading [2/"):
+            with self.subTest(heading=heading):
+                output = completed + heading
+                self.assertIsNone(mod.koji_download_percent(output))
+                self.assertEqual(mod.koji_download_percent(output + "\n"
+                                                          + self.bar("3%")), 3)
+
+    def test_missing_unknown_or_invalid_progress_has_no_percentage(self):
+        for output in (None, b"", "Downloading: demo.rpm\n", "retry 61% complete",
+                       self.bar("101%"), self.bar("61%") + self.bar("???%")):
+            with self.subTest(output=output):
+                self.assertIsNone(mod.koji_download_percent(output))
+
+    def test_partial_bar_preserves_last_complete_current_rpm_bar(self):
+        output = "Downloading: demo.rpm\n" + self.bar("61%") + "[======"
+        self.assertEqual(mod.koji_download_percent(output), 61)
+
+    def test_fetch_heartbeat_uses_native_progress_and_keeps_full_output(self):
+        args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
+        (self.downloads / "logs").mkdir(parents=True)
+        first = "Downloading [1/2]: first.rpm\n" + self.bar("61%")
+        next_rpm = first + self.bar("100%") + "Downloading [2/2]: next.rpm\n"
+        final = next_rpm + self.bar("21%") + self.bar("100%") + "\n"
+        cmd = ["koji", "download-build", "demo-1-1"]
+        proc = Mock()
+        proc.returncode = 0
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd, 1, output=first.encode()),
+            subprocess.TimeoutExpired(cmd, 1, output=next_rpm.encode()),
+            subprocess.TimeoutExpired(cmd, 1, output=next_rpm + self.bar("21%")),
+            (final, None),
+        ]
+        with patch.object(mod.subprocess, "Popen", return_value=proc) as popen, \
+                patch.object(mod, "_dir_bytes", return_value=913 * 1024**2), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            result = mod.fetch_one("demo-1-1", args, mod.Counter(2))
+        self.assertTrue(result.ok)
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], cmd)
+        beats = [line for line in stdout.getvalue().splitlines() if "still fetching" in line]
+        self.assertEqual(len(beats), 3)
+        self.assertIn("fetching demo-1-1 (1/2)", beats[0])
+        self.assertIn(", 913 MiB, 61% of current RPM so far)", beats[0])
+        self.assertIn(", 913 MiB so far)", beats[1])
+        self.assertNotIn("%", beats[1])
+        self.assertIn(", 913 MiB, 21% of current RPM so far)", beats[2])
+        self.assertEqual(result.log.read_bytes().decode(), final)
+
+
 class FetchRecoveryTests(RunnerTestCase):
     def test_duplicate_nvrs_are_processed_once(self):
         self.listfile.write_text("demo-1-1\ndemo-1-1  # repeated\n")

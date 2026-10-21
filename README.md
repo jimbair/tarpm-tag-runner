@@ -241,6 +241,11 @@ delay termination. Threaded log lines are locked and flushed. Fetch
 completion lines include RPM count, size, and duration; test lines include progress and
 duration. An unavailable run log does not stop the run.
 
+Fetch heartbeats reuse Koji's native percentage for the current RPM when
+available, for example `(5m 00s, 913 MiB, 61% of current RPM so far)`.
+The size is the total downloaded for the build; the percentage resets for
+each RPM. Clients without usable progress output show only the size.
+
 | Exit | Meaning |
 | --- | --- |
 | `0` | All fetches/tests succeeded (possibly with warnings), or nothing to resume/retry. |
