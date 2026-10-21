@@ -1,425 +1,238 @@
 # tarpm-tag-runner
 
-Fetch the latest builds of packages from a Fedora Koji tag, and run each
-RPM through a **tarpm** test cycle (unpack → repack → unpack the repacked
-RPM). Failures are collected in a single report.
+Fetch the latest builds from a Fedora Koji tag and test each downloaded RPM
+with **tarpm**: unpack → repack → unpack again → compare file listings.
+Tests include source RPMs by default. Failures go into one report; listing
+differences are non-fatal warnings.
 
-## Overview
+The runner processes up to `-j` builds at once, downloading and testing each
+build before cleaning it up. Passed RPMs are deleted by default, keeping
+disk use to active builds plus retained failures. Use a low `-j` for a full
+tag: a single 1.5 GiB RPM can need over 10 GiB during its round-trip.
+`--keep` and `--no-test` retain downloads and therefore need more disk.
 
-A single Python script, `tarpm-tag-runner.py` (Python ≥ 3.9, standard
-library only, threaded via `concurrent.futures`). The tarpm test runs
-**by default** on every fetched RPM, **including the source RPM**
-(maximum coverage): `--no-test` fetches only, `--no-src` skips
-`.src.rpm`, `--test-only` tests already-downloaded RPMs. The default
-run pipelines each build — fetch, test, clean up — with `-j` builds in
-flight, so disk use stays bounded to the builds in flight plus the
-failures (passed RPMs are removed after their test). Results are
-written to a single text report, plus an optional `--json FILE`.
+## Setup and quick start
 
-## Requirements
-
-- Python ≥ 3.9 (standard library only)
-- a configured `koji` client (Fedora hub), e.g. `dnf install koji` — the
-  same one fedpkg ships
-- `tarpm` (the test phase runs by default):
-  ```bash
-  dnf copr enable dcantrell/tarpm
-  dnf install tarpm
-  ```
-
-## Usage
-
-```
-python3 tarpm-tag-runner.py [options]
-
-Fetch:
-  -t TAG            Koji tag to query (default: f44)
-  -p PKG            include builds whose NVR equals PKG or starts with PKG-
-                    (repeatable; default: every package in the tag)
-  -a ARCH           fetch: download ARCH plus noarch and the source RPM
-                    (src unless --no-src; koji matches the arch exactly,
-                    so those are added back); test: only test RPMs for
-                    ARCH (plus noarch and src). Repeatable. Default: all
-                    arches plus the source RPM.
-  -d DIR            download directory (default: ./rpms); each build goes
-                    to DIR/<NVR>/
-  -n NUM            only process the first NUM builds (smoke test)
-      --list        print the NVRs that would be fetched and exit
-                    without downloading
-      --from-file FILE
-                    read the NVR list from FILE (same format as
-                    'koji latest-pkg --all TAG'; blank lines and
-                    '#' comments ignored) instead of the cached
-                    list or Koji
-      --refresh     re-fetch the tag list from Koji, even if a cached
-                    copy (DIR/tag-<TAG>.txt) exists
-
-Test (tarpm round-trip: unpack -> repack -> unpack repacked; runs by
-     default on every fetched RPM, including the source RPM):
-      --no-test     fetch only; skip the tarpm test phase
-      --no-src      skip testing .src.rpm files; discard any sources
-                    after a successful fetch (tested by default)
-      --test-only   skip fetching; test the RPMs already in DIR (the -p
-                    and -n filters apply to the downloaded builds)
-      --keep        keep per-RPM test work dirs (ext/, ext2/, repacked rpm),
-                    logs, and the original RPMs even for passing RPMs
-                    (default: passing RPMs and work dirs removed;
-                    warning logs retained)
-
-Common:
-  -r FILE           report file (default: ./report.txt)
-      --run-log FILE
-                    append the run log (every log line, plus one header
-                    line per invocation) to FILE (default: DIR/run.log)
-      --no-run-log  do not write a run log
-  -j N              number of parallel fetches/tests (default: 1)
-      --heartbeat N
-                    while a command runs longer than this many seconds,
-                    log a progress line every N seconds so a slow command
-                    does not look stuck (0 disables; default: 60)
-      --json FILE   also write machine-readable results to FILE (JSON)
-      --resume      skip builds whose latest journal record
-                    (DIR/journal.jsonl) is pass or warn
-      --retry-failed
-                    re-run only the builds whose latest journal record is
-                    fetch-fail or test-fail; each starts from a clean
-                    DIR/<NVR>/. Default report:
-                    report-retry-YYYYmmdd-HHMMSS.txt
-  -v                verbose: echo each external command
-  -h, --help        show this help and exit
-```
-
-### Examples
+Requires Python ≥ 3.9 (standard library only), a `koji` client configured for
+the Fedora hub, and `tarpm`. On Fedora with DNF5:
 
 ```bash
-# See what would be fetched, without downloading anything:
-python3 tarpm-tag-runner.py --list -t f44 -p 7zip
-
-# Fetch those builds (4 in parallel); the tarpm test runs by default:
-python3 tarpm-tag-runner.py -t f44 -j 4 -p 7zip -p 389-ds-base
-
-# Same, with a JSON results file next to the text report:
-python3 tarpm-tag-runner.py -t f44 -j 4 -p 7zip --json results.json
-
-# Fetch only, without testing:
-python3 tarpm-tag-runner.py -t f44 -j 4 -p 7zip --no-test
-
-# Test, but skip the source RPM:
-python3 tarpm-tag-runner.py -t f44 -j 4 -p 7zip --no-src
-
-# Smoke test: first 3 packages of the whole tag, x86_64 only:
-python3 tarpm-tag-runner.py -t f44 -a x86_64 -n 3
-
-# Re-run the tests only, on RPMs already downloaded (e.g. after a tarpm
-# update), x86_64 + noarch, 8 in parallel:
-python3 tarpm-tag-runner.py --test-only -a x86_64 -j 8
-
-# Re-run exactly the builds that failed in the last run (the failure
-# list is plain NVRs, so this works even without the local journal):
-python3 tarpm-tag-runner.py --from-file rpms/logs/failed-all.txt -j 4
+sudo dnf install python3 koji dnf5-plugins
+sudo dnf copr enable dcantrell/tarpm
+sudo dnf install tarpm
 ```
 
-A `-p` filter matches source-package names in the tag list: `-p 7zip`
-selects the `7zip` build (`7zip-25.01-5.fc44`) — and any other source
-package whose name starts with `7zip-`. The `7zip-reduced`,
-`7zip-standalone`, and `7zip-standalone-all` entries you see in a build
-are subpackages of that one build, not separate selections; they are
-fetched and tested along with it. A full NVR (e.g.
-`7zip-25.01-5.fc44`) matches exactly.
+```bash
+# Preview a small selection without downloading RPMs:
+python3 tarpm-tag-runner.py -t f44 -p hello --list
 
-The tag list is cached as `DIR/tag-<TAG>.txt` (raw `koji latest-pkg
---all` output). Later runs for the same tag reuse it instead of
-querying Koji — re-testing the exact same build set, and avoiding
-repeated tag fetches. `--refresh` forces a re-fetch; `--from-file FILE`
-reads an explicit list (same format).
+# Fetch and test hello, including its source RPM; keep all artifacts:
+python3 tarpm-tag-runner.py -t f44 -p hello -a x86_64 --keep
 
-## The tarpm test cycle
+# Test two source-package selections, four builds at once:
+python3 tarpm-tag-runner.py -t f44 -p 7zip -p 389-ds-base -j 4 --json results.json
 
-For each fetched RPM (the test is the default; `--no-test` skips it;
-`.src.rpm` is included by default, `--no-src` skips it):
-
-1. `tarpm -x -f in.rpm -O <work>/ext` — unpack
-2. `tarpm -c -f <work>/<base>-repacked.rpm <work>/ext` — repack
-3. `tarpm -x -f <repacked.rpm> -O <work>/ext2` — unpack the repacked RPM
-4. `tarpm -t` on both original and repacked, compared in Python
-   (`difflib`) — content check, reported as a **warning** (non-fatal) if
-   the file lists differ; a listing that fails to generate is a stage
-   failure, not a diff
-
-A stage failure stops that RPM's cycle at that stage. The failing stage
-and exit code are recorded, along with the error signature of the failing
-output (see Error signatures). The stage names, as they appear in reports,
-the journal, and the `failed-<stage>.txt` lists:
-
-| stage             | command                         | fails when                                  |
-|-------------------|---------------------------------|---------------------------------------------|
-| `unpack`          | `tarpm -x` on the original RPM  | the original cannot be unpacked             |
-| `repack`          | `tarpm -c` on the unpacked tree | the tree cannot be repacked into an RPM     |
-| `unpack-repacked` | `tarpm -x` on the repacked RPM  | the repacked RPM cannot be unpacked         |
-| `list-original`   | `tarpm -t` on the original RPM  | the listing exits non-zero                  |
-| `list-repacked`   | `tarpm -t` on the repacked RPM  | the listing exits non-zero                  |
-
-A runner-side exception (e.g. disk full) is recorded as a test failure
-with stage `exception` and the exception text; a fetch failure has stage
-`fetch`.
-
-### What is left on disk
-
-On a clean pass the work dir, the original RPM, and the test log are all
-removed, so a full-tag run leaves only the failures (`--keep` retains
-everything for passes too). For a failed RPM, two different things remain
-and it matters which is which:
-
-- `DIR/<NVR>/<base>.rpm` is the **original** koji download. The runner
-  never modifies it; it is deleted after a pass, including warnings,
-  unless --keep is used.
-- `DIR/<NVR>/.tarpm-<base>/` holds the **test artifacts** of the last
-  attempt: `ext/`, the repacked RPM, `ext2/`, and the two listings. Which
-  of them exist depends on how far the cycle got. Each new test of that
-  RPM wipes and rebuilds this directory.
-
-The original is not guaranteed to be complete if the run was killed
-mid-fetch (see Exit status), so a re-run does not trust files left on
-disk: `--retry-failed` and `--resume` start each build from a fresh
-download (see Journal, resume, and retry). Use `--test-only` only when you
-deliberately want to re-test the RPMs already on disk, for example right
-after a tarpm update on a run that finished cleanly.
-
-A pass *with a warning* keeps its test log: it holds the content diff, the
-only surviving copy. Each RPM gets its own log under `logs/`
-(`<rpm-basename>.test.log`), so subpackages of the same build never
-clobber each other. Fetch logs are `<NVR>.fetch.log`; they are removed
-when the fetch succeeds and kept on failure.
-
-## Layout
-
+# Download only, then test the local RPMs separately:
+python3 tarpm-tag-runner.py -p hello -a x86_64 --no-test
+python3 tarpm-tag-runner.py --test-only -p hello -a x86_64
 ```
+
+## Options and build selection
+
+Run `python3 tarpm-tag-runner.py --help` for CLI help. Defaults: tag `f44`,
+download directory `./rpms`, report `./report.txt`, one worker, all binary
+architectures plus source RPMs. Koji's default debuginfo exclusion applies.
+
+| Option | Effect |
+| --- | --- |
+| `-t TAG` | Koji tag to query. |
+| `-p PKG` | Select NVRs equal to `PKG` or starting with `PKG-`; repeatable. |
+| `-a ARCH` | Select this arch plus `noarch` and `src` (unless `--no-src`); repeatable. |
+| `-d DIR` | Put each build in `DIR/<NVR>/`. |
+| `-n NUM` | Process the first NUM builds; `0` means no limit. |
+| `--list` | Print selected NVRs and exit without downloading RPMs. |
+| `--from-file FILE` | Read a build list instead of querying Koji or using the cache. |
+| `--refresh` | Replace the cached tag list with a fresh Koji query. |
+| `--no-test` | Download only; tarpm is not required. |
+| `--no-src` | Skip source tests and discard source RPMs after a successful fetch. |
+| `--test-only` | Test local RPMs; `-p`, `-n`, `-a`, and `--no-src` still apply. |
+| `--keep` | Retain originals, test work directories, and logs even for passes. |
+| `-j N` | Parallel builds in normal runs; parallel RPMs in `--test-only`. |
+| `-r FILE` | Text report path. |
+| `--json FILE` | Also write per-build fetch and per-RPM test results as JSON. |
+| `--run-log FILE` | Append runner log lines to FILE; default `DIR/run.log`. |
+| `--no-run-log` | Disable the run log. |
+| `--heartbeat N` | Log progress every N seconds during external commands; default 60, `0` disables. |
+| `--resume` | Skip journaled test passes/warnings; download and test the rest afresh. |
+| `--retry-failed` | Download and test only journaled failures, starting from clean build directories. |
+| `-v` | Echo external commands. |
+| `-h`, `--help` | Show help and exit. |
+
+`-p` selects **source-package builds**, including their binary subpackages.
+For example, `-p 7zip` selects `7zip` and source packages named `7zip-*`;
+`7zip-reduced` binaries within the selected build are included automatically.
+A full NVR such as `7zip-25.01-5.fc44` can select that exact build.
+
+Tag lists are cached as `DIR/tag-<TAG>.txt`, containing raw
+`koji latest-pkg --all TAG` output. Later runs reuse that snapshot until
+`--refresh`. `--from-file` accepts the same output or plain NVRs: the first
+whitespace-delimited token on each line is used; headers, blank lines, and
+`#` comments are ignored. Duplicate NVRs run once. `-n` is applied after
+package filtering and before journal filtering. In `--test-only`, it limits
+matching build directories in alphabetical order.
+
+Koji matches architectures exactly, so the runner adds `noarch` and `src`
+when `-a` is supplied. Without `-a`, `--no-src` may still download source
+RPMs because Koji has no source-exclusion option; they are deleted after a
+successful fetch, even with `--keep`. Failed downloads retain partial files.
+In `--test-only`, source RPMs are simply skipped and left on disk.
+
+## Test cycle and retained files
+
+Each RPM goes through these stages; a nonzero exit stops that RPM's cycle.
+Other RPMs continue. A runner exception is a test failure at stage
+`exception`; download failures use stage `fetch`.
+
+| Stage | Command |
+| --- | --- |
+| `unpack` | `tarpm -x -f <original.rpm> -O <work>/ext` |
+| `repack` | `tarpm -c -f <work>/<base>-repacked.rpm <work>/ext` |
+| `unpack-repacked` | `tarpm -x -f <work>/<base>-repacked.rpm -O <work>/ext2` |
+| `list-original` | `tarpm -t -f <original.rpm>` |
+| `list-repacked` | `tarpm -t -f <work>/<base>-repacked.rpm` |
+
+The two listing outputs are compared with Python's `difflib`. A difference
+is a `content-diff` warning, not a failure; failure to generate a listing
+is a failed stage. This compares listings, not file bytes or all metadata.
+
+| Result | Original RPM and work directory | Test log |
+| --- | --- | --- |
+| Clean pass | Deleted | Deleted |
+| Pass with warning | Deleted | Kept with the diff |
+| Failure | Kept | Kept when available |
+| Any result with `--keep` | Kept | Kept |
+
+Original downloads are never modified. Test work directories are rebuilt
+on every attempt; retained artifacts show only the last attempt. Empty
+build directories are removed. To retest successful RPMs after updating
+tarpm, use `--keep` on the original run or download them again.
+
+```text
 rpms/
-├── 7zip-25.01-5.fc44/
-│   ├── 7zip-25.01-5.fc44.src.rpm           # original koji download
-│   ├── 7zip-25.01-5.fc44.x86_64.rpm        # (removed after a clean pass)
-│   ├── ...                                 # more RPMs of the build
-│   └── .tarpm-<base>/                      # test artifacts, last attempt
+├── tag-f44.txt                      # cached tag list
+├── journal.jsonl                    # finished-build records
+├── run.log                          # append-only runner log
+├── <NVR>/
+│   ├── <base>.rpm                   # original download
+│   └── .tarpm-<base>/               # work directory
 │       ├── ext/
 │       ├── <base>-repacked.rpm
 │       ├── ext2/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
-├── journal.jsonl                           # one JSON line per build
-├── run.log                                 # tee of every log line
 └── logs/
-    ├── 7zip-25.01-5.fc44.fetch.log         # kept on fetch failure
-    ├── 7zip-25.01-5.fc44.x86_64.test.log   # kept on failure or warning
-    ├── failed-all.txt                      # failing build NVRs
-    ├── failed-fetch.txt                    # fetch failures
-    ├── failed-<stage>.txt                  # one per failing stage
-    ├── failed-sig-<slug>-<hash>.txt        # top 20 error signatures
-    └── failed-index.tsv                    # stage, signature, nvr, rpm
+    ├── <NVR>.fetch.log              # kept on fetch failure or --keep
+    ├── <base>.test.log              # kept on failure, warning, or --keep
+    └── failed-*                     # failure lists described below
 ```
 
-The `.rpm` files are the unmodified originals; `.tarpm-<base>/` holds the
-test artifacts, kept on failure or with `--keep` and rebuilt by each new
-test (see "What is left on disk"). The `failed-*` lists describe the most
-recent report (see "Failure lists").
+## Resume, retry, and interrupts
 
-The report is written to `./report.txt` by default (the current
-directory; `-r` changes it) — it is not inside DIR. Its header also
-records the run log path (`run log:`, or `- (disabled)`).
+Finished builds append records to `DIR/journal.jsonl` immediately, so a
+crash preserves completed work. Records contain `nvr`, `status`, `stage`,
+`exit_code`, `signature`, `rpms` (failed or warned RPM basenames), and `ts`
+(UTC). The latest record per NVR wins; invalid lines are ignored, and an
+incomplete tail is separated before new records are appended.
 
-## Run log
-
-By default every log line is tee'd to `DIR/run.log` in append mode: each
-invocation adds one header line — `=== <PROG> start <UTC>: <argv> ===` —
-followed by that run's log lines, so several runs stack in one file. Each
-line is one locked write+flush, so `-j` runs never interleave lines.
-`--run-log FILE` chooses a different file, `--no-run-log` disables it
-entirely. Force-quit messages and uncaught tracebacks are written to it
-as well. An unopenable or unwritable run log never aborts the run — it
-simply proceeds without one.
-
-## Journal, resume, and retry
-
-Every finished build appends one JSON line to `DIR/journal.jsonl` (one
-`os.write()` under a lock per line; the reader skips a torn or invalid
-last line, and the latest record per NVR wins). Fields: `nvr`, `status`
-(`fetched`, `pass`, `warn`, `fetch-fail`, `test-fail`), `stage`, `exit_code`,
-`signature` (see Error signatures), `rpms` (failing RPM basenames; for
-`warn`, the warned ones), and `ts` (UTC). Records are written as each
-build finishes, so an interrupted or crashed run still keeps the records
-of the builds that completed; a build that did not finish gets no
-record.
-
-`fetched` means download succeeded without any completed tests (including
-`--no-test`); `--resume` still tests these builds. `--test-only` does not
-update the journal. A torn final line is separated before the next append,
-so it does not consume the new record.
-
-- `--resume` skips builds whose latest record is `pass` or `warn`, so an
-  interrupted run can be continued without re-testing what already
-  passed. Each selected build starts from a clean download directory.
-- `--retry-failed` re-runs only the builds whose latest record is
-  `fetch-fail` or `test-fail`, each from a clean `DIR/<NVR>/`, through
-  the normal fetch-and-test pipeline (`-j`, `-a`, `--no-src`, `-n`, and
-  `-p` all still apply). Its report goes to
-  `report-retry-YYYYmmdd-HHMMSS.txt` unless `-r` is given.
-- If nothing is left to do, the run exits 0 with a message.
-
-`--resume` and `--retry-failed` are mutually exclusive, and neither may
-be combined with `--test-only`, `--refresh`, or `--no-test` (exit 2).
-
-Typical uses:
+Statuses are `fetched` (download succeeded without completed tests), `pass`,
+`warn`, `fetch-fail`, and `test-fail`. `--test-only` does not update the
+journal. Resume with the same architecture/source settings: journal records
+are per build and do not identify the test configuration.
 
 ```bash
-# A run was killed, crashed, or stopped with Ctrl+C: run the same command
-# again with --resume. Builds that finished as pass/warn are skipped;
-# builds that never ran, were in flight, or failed are (re)done.
+# Continue an interrupted run; re-run failures and unfinished/fetched builds:
 python3 tarpm-tag-runner.py -t f44 -j 2 --resume
 
-# After installing a newer tarpm: re-run only what failed before, each
-# build from a fresh download.
+# Re-run recorded failures after a tarpm update:
 python3 tarpm-tag-runner.py -t f44 -j 2 --retry-failed
 ```
 
-Things to know:
+Both modes clear each selected build directory before downloading. They
+select from the normal tag/file list after `-p` and `-n`, so journal NVRs
+outside that selection are not retried. They test every selected RPM of a
+build, not just its previously failing RPMs. Nothing to do exits 0.
+`--retry-failed` defaults to `report-retry-YYYYmmdd-HHMMSS.txt` unless `-r`
+is supplied. The two modes are mutually exclusive and cannot be combined
+with `--test-only`, `--refresh`, or `--no-test`. `--refresh` also conflicts
+with `--from-file`.
 
-- `--resume` also re-runs earlier failures (it skips only `pass` and
-  `warn`), so after a crash the failures from the part that finished
-  before the crash are tested again, and the report and `failed-*` lists
-  of the resumed run still cover every outstanding failure.
-- The report and failure lists describe only the invocation that wrote
-  them. A build that warned before the crash is skipped on `--resume`, so
-  it does not appear in the resumed run's `TEST WARNINGS`; its record in
-  `journal.jsonl` and its test log are still there.
-- Both options select from the same build list as a normal run (the tag
-  list, `--from-file`, `-p`, `-n`), so a journal NVR that is not in that
-  list is not retried. To retry a set of NVRs on another machine, use a
-  failure list with `--from-file` (see Failure lists).
-- Records are per build, so a retry re-downloads and re-tests every RPM of
-  a failed build, not just the one that failed.
+The first Ctrl+C drops queued work, lets active builds finish, writes a
+partial report, and exits 130. Worker commands run in separate sessions
+and survive the first interrupt. A second Ctrl+C force-quits without a
+report or cleanup; orphaned commands can stop on a closed output pipe,
+leaving truncated RPMs or partial work directories. Continue with
+`--resume` to get fresh downloads. `--retry-failed` alone misses unfinished
+builds with no failure record. Use `--test-only` only for files you intend
+to trust as test inputs.
 
-## Failure lists
+## Reports, logs, and failure lists
 
-Whenever a report is written, the run's failures are also written as
-plain NVR lists under `DIR/logs/`. The files always describe the most
-recent run that wrote a report: they are overwritten when that run had
-failures, and removed when it did not, so they never describe a stale
-run. Each list has no header lines: one build NVR per line, sorted and
-deduplicated, each optionally followed by `  # detail` (the failing
-stage, exit code, and signature):
+The text report defaults to `./report.txt`, **outside** the download
+directory. It records the selection, counts, runtime, tag-list source,
+run-log path, retained warning logs, and failures with log tails (15 lines
+for fetches, 20 for tests) or runner exception text. Failure rollups group
+by stage, exit code, and error signature, with up to three example builds
+or RPMs per group; the console prints the five most common types.
+`--json` includes individual results, warning/log paths, exception text,
+and signatures.
 
-- `failed-all.txt` — every build with a fetch or test failure
-- `failed-fetch.txt` — the fetch failures
-- `failed-<stage>.txt` — one per failing stage (e.g.
-  `failed-repack.txt`, `failed-unpack-repacked.txt`,
-  `failed-list-original.txt`)
-- `failed-sig-<slug>-<hash>.txt` — one per error signature, top 20 by
-  failure count (the 6-hex-char hash keeps distinct signatures from
-  colliding)
-- `failed-index.tsv` — one row per failure:
-  `stage<TAB>signature<TAB>nvr<TAB>rpm` (fetch failures leave the rpm
-  column empty)
+An error signature takes the last `tarpm: ` output line (prefix removed),
+or the last nonempty line otherwise. Common absolute paths become
+`<path>`; hex addresses and runs of four or more digits become `N`. The
+result is truncated to 120 characters for grouping.
 
-The lists feed straight back to `--from-file` (it takes the first
-token of each line and ignores blank lines and `#` comments), so a set
-of failures can be re-run on demand — even on a machine without the
-local journal:
+Every report replaces the failure lists in `DIR/logs/`; a report with no
+failures removes old lists. Lists contain sorted, deduplicated NVRs,
+optionally followed by `  # detail`:
+
+| File | Contents |
+| --- | --- |
+| `failed-all.txt` | Every failed build. |
+| `failed-fetch.txt` | Fetch failures. |
+| `failed-<stage>.txt` | Builds with a failure at that stage. |
+| `failed-sig-<slug>-<hash>.txt` | Builds for each of the top 20 signatures; six hex hash digits distinguish filenames. |
+| `failed-index.tsv` | One row per failure: `stage`, `signature`, `nvr`, `rpm`, tab-separated; fetch rows have no RPM. |
 
 ```bash
+# Re-run a failure list, including on a machine without the journal:
 python3 tarpm-tag-runner.py --from-file rpms/logs/failed-all.txt -j 4
 ```
 
-Passed RPMs are removed from their build dir after a successful test
-(kept on failure, or with `--keep`); a build dir left empty by that
-cleanup is removed as well.
+Reports and failure lists describe only the invocation that wrote them.
+Warnings skipped by `--resume` remain in the journal and old test logs,
+not in the resumed report. Invocations that exit without writing a report
+leave the prior report/lists intact.
 
-## Report
+The run log appends a UTC start/argv header and timestamped runner lines
+for each invocation, including heartbeats, force-quit messages, and uncaught
+tracebacks. Threaded lines are locked and flushed. Fetch completion lines
+include RPM count, size, and duration; test lines include progress and
+duration. An unavailable run log does not stop the run.
 
-`report.txt` (path configurable with `-r`) has a summary — per phase
-(fetch: selected/ok/failed; test: rpms/ok/failed/warnings, plus how many
-passed RPMs were removed) — followed by `FETCH FAILURES` (exit code + last
-15 lines of the log), `TEST FAILURES` (stage + exit code — or the
-exception text when there is no exit code — + last 20 lines of the log),
-`TEST WARNINGS`, and failure-type rollups: `FETCH FAILURES BY TYPE` and
-`TEST FAILURES BY TYPE` group the failures by (stage, exit code, error
-signature), most common first, with up to 3 example NVRs per group. The
-same rollup, limited to the top 5 types, is printed to the console at
-the end of the run.
+| Exit | Meaning |
+| --- | --- |
+| `0` | All fetches/tests succeeded (possibly with warnings), or nothing to resume/retry. |
+| `1` | A fetch or test failed; see the report. |
+| `2` | Invalid arguments or setup/selection error, such as missing tarpm or nothing to test. |
+| `130` | Ctrl+C; takes precedence over failures. A force-quit has no new report. |
 
-With `--json FILE`, the same results are written as machine-readable JSON:
-per-build fetch results, and per-RPM test results (stage, exit code,
-warning, log path, `error` text when a runner exception was caught, and
-the `signature` of the failing output).
+## Development
 
-## Error signatures
+Run the unit and regression suite without external tools or network access:
 
-Each failed fetch or test records a `signature`: the last `tarpm: ` line
-of the failing command's output (prefix stripped), or the last non-empty
-line when there is no such line — with absolute paths replaced by
-`<path>`, hex addresses and 4+ digit runs replaced by `N`, truncated to
-120 characters. The same failure therefore gets the same signature
-regardless of which RPM, path, or address it hit; that is what the
-`... BY TYPE` report sections and the console top-5 summary group by.
+```bash
+python3 test-tarpm-tag-runner.py
+```
 
-The pure `error_signature()` helper is covered by unit tests:
-
-    python3 test-tarpm-tag-runner.py
-
-(stdlib `unittest`; no koji, tarpm, or network needed).
-
-## Slow commands, disk, and the full run
-
-A few builds are huge. `0ad-data-0.28.0-2.fc44`, for instance, ships a
-~1.5 GiB `.noarch.rpm` and a ~1.4 GiB `.src.rpm`; fetching them took over
-10 minutes and the tarpm round-trip of the 1.5 GiB RPM ran for 10+ minutes.
-Two consequences for a full-tag run:
-
-- **Heartbeats.** When a `koji` or `tarpm` command runs longer than
-  `--heartbeat N` seconds (default 60; `0` disables), a progress line is
-  logged every N seconds so a slow command does not look stuck:
-
-      [ts] tarpm-tag-runner: still fetching 0ad-data-0.28.0-2.fc44 (12/20) (10m 02s, 2.2 GiB so far)
-      [ts] tarpm-tag-runner: still testing 0ad-data-0.28.0-2.fc44.noarch (unpack) (1/2) (10m 02s)
-
-  Completion lines carry the same facts, so a finished run shows what was
-  slow:
-
-      [ts] [fetch]  0ad-data-0.28.0-2.fc44 ok (2 RPMs, 2.9 GiB, 10m 22s)
-      [ts] [test]   0ad-data-0.28.0-2.fc44.noarch ok (1/2, 15m 05s)
-
-  (`[ts]` is the UTC timestamp; the lines above are the exact formats.)
-- **Disk.** A round-trip keeps the original RPM, the unpacked tree, the
-  repacked RPM, and the second unpack on disk at once. A 1.5 GiB RPM can
-  need well over 10 GiB in flight, and `-j N` multiplies that by N. Run the
-  full ~23,000-build tag with a low `-j` (1–2) on a disk large enough for
-  its biggest builds.
-
-## Exit status
-
-Ctrl+C (first press) stops gracefully: queued work is dropped, in-flight
-work finishes, the partial results are reported, and the exit status is
-130 (even if that run also had failures). External commands (koji,
-tarpm) run in their own session, so they survive Ctrl+C and finish.
-Builds that finished before the interrupt are in the journal, so
-`--resume` continues from there.
-
-A second Ctrl+C while waiting force-quits immediately (no report, no
-cleanup). The in-flight koji/tarpm processes are orphaned, and their
-output pipe is gone: observed behavior is that they die on their next
-write to it (a `BrokenPipeError`, exit 120) rather than finishing. That
-can leave a truncated RPM (`rpm -K` reports `DIGESTS NOT OK`) or a partial
-work dir. Do not trust files from a force-quit run: continue with
-`--resume`, or delete the unfinished `DIR/<NVR>/` directories before
-re-running. `--retry-failed` covers recorded failures only; it skips
-unfinished builds that have no failure record.
-
-| code | meaning                                    |
-|------|--------------------------------------------|
-| 0    | all fetches and tests succeeded, or nothing to do (`--resume` / `--retry-failed`) |
-| 1    | one or more fetches/tests failed (report)  |
-| 2    | usage / environment error (koji/tarpm not found, bad args, nothing to test) |
-| 130  | interrupted by Ctrl+C (partial report)     |
-
-## Roadmap
-
-- stricter checks (e.g. treat content-diff as a failure, header
-  comparison), CentOS Stream / AlmaLinux sources (non-Koji backends)
+Future checks may make content differences fatal or compare headers;
+CentOS Stream/AlmaLinux backends are also planned.
