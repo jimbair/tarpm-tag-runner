@@ -62,6 +62,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -121,6 +122,66 @@ def _dir_bytes(pdir: Path) -> int:
     except OSError:
         pass
     return total
+
+
+def _file_bytes(path: Path) -> int | None:
+    """Logical size of a regular file, or None if not available."""
+    try:
+        info = path.lstat()
+        return info.st_size if stat.S_ISREG(info.st_mode) else None
+    except OSError:
+        return None
+
+
+def _tree_bytes(root: Path) -> int:
+    """Sum regular file sizes without following symlinks or counting hardlinks twice."""
+    total = 0
+    seen = set()
+    for directory, _, files in os.walk(root, followlinks=False):
+        for name in files:
+            try:
+                info = (Path(directory) / name).lstat()
+            except OSError:
+                continue  # Extraction may still be changing the tree.
+            key = (info.st_dev, info.st_ino)
+            if stat.S_ISREG(info.st_mode) and key not in seen:
+                total += info.st_size
+                seen.add(key)
+    return total
+
+
+def _tarpm_payload_bytes(pid: int | None) -> int | None:
+    """Size of tarpm's anonymous compressed payload, when /proc exposes it."""
+    if pid is None:
+        return None
+    sizes = []
+    try:
+        for fd in (Path("/proc") / str(pid) / "fd").iterdir():
+            try:
+                target = os.readlink(fd)
+                if (target.startswith("/memfd:")
+                        and target.endswith(f"-payload.{pid} (deleted)")):
+                    sizes.append(fd.stat().st_size)
+            except OSError:
+                continue  # File descriptors can close between these calls.
+    except OSError:
+        pass  # No procfs, restricted access, or the child has already exited.
+    # Duplicated descriptors refer to the same payload; do not sum them.
+    return max(sizes) if sizes else None
+
+
+def repack_progress_suffix(repacked: Path, pid: int | None,
+                           original_size: int | None, unpacked_size: int) -> str:
+    parts = []
+    payload = _tarpm_payload_bytes(pid)
+    if payload is not None:
+        parts.append(f"{human(payload)} compressed payload")
+    written = _file_bytes(repacked)
+    parts.append("RPM pending" if written is None else f"{human(written)} RPM written")
+    parts.append(f"{human(unpacked_size)} unpacked input")
+    if original_size is not None:
+        parts.append(f"{human(original_size)} original RPM")
+    return ", " + ", ".join(parts)
 
 
 def error_signature(text: str) -> str:
@@ -259,12 +320,12 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     If `heartbeat` > 0 and `label` is set, a line is logged every
     `heartbeat` seconds while the command is still running, so a slow
     command does not look stuck:
-        still <label><counter_suffix> (<fmt_duration><suffix_fn(output)>)
-    `counter_suffix` is the '(n/total)' fetch progress; `suffix_fn(output)`
+        still <label><counter_suffix> (<fmt_duration><suffix_fn(output, pid)>)
+    `counter_suffix` is the '(n/total)' fetch progress; `suffix_fn(output, pid)`
     receives cumulative partial output (bytes, str, or None) and returns
-    extra progress text. `start` (a monotonic timestamp) is
-    the reference for the elapsed time (e.g. the start of a multi-stage test);
-    it defaults to now.
+    extra progress text using the child PID if needed. `start` (a monotonic
+    timestamp) is the reference for the elapsed time (e.g. the start of a
+    multi-stage test); it defaults to now.
     `log_err` routes heartbeat diagnostics to stderr for machine-readable
     stdout, such as --list output.
     """
@@ -293,7 +354,7 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
                           if heartbeat > 0 else proc.communicate())
                 break
             except subprocess.TimeoutExpired as exc:
-                suffix = suffix_fn(exc.output) if suffix_fn else ""
+                suffix = suffix_fn(exc.output, proc.pid) if suffix_fn else ""
                 log(f"{PROG}: still {label}{counter_suffix} "
                     f"({fmt_duration(time.monotonic() - t0)}{suffix})",
                     err=log_err)
@@ -496,7 +557,7 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
                   label=f"fetching {nvr}",
                   heartbeat=args.heartbeat,
                   counter_suffix=counter_suffix,
-                  suffix_fn=lambda output: fetch_progress_suffix(pdir, output))
+                  suffix_fn=lambda output, pid: fetch_progress_suffix(pdir, output))
     elapsed = time.monotonic() - t0
     logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
     logfile.write_text(out)
@@ -594,14 +655,27 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     failed_rc = None
     failed_out = ""
     repacked = work / f"{base}-repacked.rpm"
+    original_size = _file_bytes(rpm)
 
-    def stage(name: str, cmd: list) -> bool:
-        nonlocal failed_stage, failed_rc, failed_out
+    def stage_start(name: str, cmd: list, suffix_fn=None) -> None:
+        suffix = suffix_fn(None, None) if suffix_fn else ""
+        log(f"{PROG}: testing {base} ({name}){_progress(progress)} "
+            f"({fmt_duration(time.monotonic() - test_t0)}{suffix})")
         if args.verbose:
             log("+ " + " ".join(str(c) for c in cmd))
+
+    def unpack_suffix(directory: Path, input_size: int | None) -> str:
+        suffix = f", {human(_tree_bytes(directory))} unpacked"
+        if input_size is not None:
+            suffix += f", {human(input_size)} input RPM"
+        return suffix
+
+    def stage(name: str, cmd: list, suffix_fn=None) -> bool:
+        nonlocal failed_stage, failed_rc, failed_out
+        stage_start(name, cmd, suffix_fn)
         rc, out = run(cmd, label=f"testing {base} ({name})",
                       heartbeat=args.heartbeat, start=test_t0,
-                      counter_suffix=_progress(progress))
+                      counter_suffix=_progress(progress), suffix_fn=suffix_fn)
         buf.append("$ " + " ".join(str(c) for c in cmd))
         if out.strip():
             buf.append(out.rstrip("\n"))
@@ -612,20 +686,26 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             return False
         return True
 
-    ok = stage("unpack", ["tarpm", "-x", "-f", str(rpm), "-O", str(work / "ext")])
+    ok = stage("unpack", ["tarpm", "-x", "-f", str(rpm), "-O", str(work / "ext")],
+               suffix_fn=lambda output, pid: unpack_suffix(work / "ext", original_size))
     if ok:
-        ok = stage("repack", ["tarpm", "-c", "-f", str(repacked), str(work / "ext")])
+        # The input is now fixed. Scan it once, rather than on every repack heartbeat.
+        unpacked_size = _tree_bytes(work / "ext")
+        ok = stage("repack", ["tarpm", "-c", "-f", str(repacked), str(work / "ext")],
+                   suffix_fn=lambda output, pid: repack_progress_suffix(
+                       repacked, pid, original_size, unpacked_size))
     if ok:
+        repacked_size = _file_bytes(repacked)
         ok = stage("unpack-repacked",
-                   ["tarpm", "-x", "-f", str(repacked), "-O", str(work / "ext2")])
+                   ["tarpm", "-x", "-f", str(repacked), "-O", str(work / "ext2")],
+                   suffix_fn=lambda output, pid: unpack_suffix(work / "ext2", repacked_size))
 
     # Extra check: file list of original vs repacked (warning only, in case
     # tarpm -t output is noisy). A listing that fails to generate is a
     # failed stage, not a diff to compare.
     warning = None
     if ok:
-        if args.verbose:
-            log("+ tarpm -t -f " + str(rpm))
+        stage_start("list-original", ["tarpm", "-t", "-f", str(rpm)])
         rc, list_orig = run(["tarpm", "-t", "-f", str(rpm)],
                             label=f"testing {base} (list-original)",
                             heartbeat=args.heartbeat, start=test_t0,
@@ -639,8 +719,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             buf.append("$ tarpm -t -f " + str(rpm))
             buf.append(list_orig.strip() or "(no output)")
     if ok:
-        if args.verbose:
-            log("+ tarpm -t -f " + str(repacked))
+        stage_start("list-repacked", ["tarpm", "-t", "-f", str(repacked)])
         rc, list_repacked = run(["tarpm", "-t", "-f", str(repacked)],
                                 label=f"testing {base} (list-repacked)",
                                 heartbeat=args.heartbeat, start=test_t0,

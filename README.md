@@ -107,6 +107,17 @@ Other RPMs continue. A runner exception is a test failure at stage
 | `list-original` | `tarpm -t -f <original.rpm>` |
 | `list-repacked` | `tarpm -t -f <work>/<base>-repacked.rpm` |
 
+Each stage logs its start, even if it finishes before a heartbeat.
+Unpack heartbeats show extracted bytes and the input RPM size. Repack
+heartbeats show the compressed payload size (via Linux `/proc`, when
+accessible), RPM bytes written, and the unpacked/original input sizes.
+Tarpm builds its payload in an anonymous memory-backed file before writing
+the RPM, so the RPM can remain pending for most of repacking. These are
+sizes, not completion percentages: compression ratios vary, and checksum
+passes can continue while output sizes stay unchanged. Sizes count logical
+file bytes, without following symlinks or counting hardlinks twice; the
+repack input tree is measured once.
+
 The two listing outputs are compared with Python's `difflib`. A difference
 is a `content-diff` warning, not a failure; failure to generate a listing
 is a failed stage. This compares listings, not file bytes or all metadata.

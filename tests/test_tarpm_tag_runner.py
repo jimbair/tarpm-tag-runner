@@ -634,6 +634,143 @@ class FetchRecoveryTests(RunnerTestCase):
         self.assertTrue(source.exists())
 
 
+class TestProgressTests(RunnerTestCase):
+    def test_tree_sizes_ignore_links_outside_tree_and_count_hardlinks_once(self):
+        tree = self.root / "tree"
+        nested = tree / "payload/nested"
+        nested.mkdir(parents=True)
+        (tree / "header.json").write_bytes(b"x" * 17)
+        source = nested / "data"
+        source.write_bytes(b"x" * 31)
+        os.link(source, nested / "hardlink")
+        (tree / "file-link").symlink_to(source)
+        (tree / "dir-link").symlink_to(self.root, target_is_directory=True)
+        os.mkfifo(tree / "pipe")
+        self.assertEqual(mod._tree_bytes(tree), 48)
+        self.assertEqual(mod._tree_bytes(self.root / "missing"), 0)
+        self.assertEqual(mod._file_bytes(source), 31)
+        for path in (tree, tree / "missing", tree / "file-link", tree / "pipe"):
+            with self.subTest(path=path):
+                self.assertIsNone(mod._file_bytes(path))
+
+    def test_payload_probe_ignores_unrelated_and_disappearing_descriptors(self):
+        payload = self.root / "payload"
+        payload.write_bytes(b"x" * 1024)
+        fds = [self.root / str(i) for i in range(4)]
+        for fd in fds[:3]:
+            fd.symlink_to(payload)
+
+        def target(fd):
+            if fd == fds[3]:
+                raise FileNotFoundError("descriptor closed")
+            return ("/memfd:demo-payload.321 (deleted)" if fd in fds[:2]
+                    else "/memfd:unrelated (deleted)")
+
+        with patch.object(mod.Path, "iterdir", return_value=iter(fds)), \
+                patch.object(mod.os, "readlink", side_effect=target):
+            self.assertEqual(mod._tarpm_payload_bytes(321), 1024)
+
+    def test_payload_probe_tolerates_unavailable_procfs(self):
+        with patch.object(mod.Path, "iterdir", side_effect=PermissionError):
+            self.assertIsNone(mod._tarpm_payload_bytes(321))
+            self.assertIsNone(mod._tarpm_payload_bytes(None))
+
+    @unittest.skipUnless(hasattr(os, "memfd_create") and Path("/proc/self/fd").is_dir(),
+                         "Linux memfd and procfs required")
+    def test_real_anonymous_payload_growth(self):
+        fd = os.memfd_create(f"demo-payload.{os.getpid()}", os.MFD_CLOEXEC)
+        self.addCleanup(os.close, fd)
+        duplicate = os.dup(fd)
+        self.addCleanup(os.close, duplicate)
+        os.write(fd, b"x" * 1024)
+        self.assertEqual(mod._tarpm_payload_bytes(os.getpid()), 1024)
+        os.write(fd, b"x" * 1024)
+        self.assertEqual(mod._tarpm_payload_bytes(os.getpid()), 2048)
+
+    def test_repack_falls_back_to_rpm_size_and_cached_input_sizes(self):
+        repacked = self.root / "repacked.rpm"
+        with patch.object(mod, "_tarpm_payload_bytes", return_value=None):
+            self.assertEqual(mod.repack_progress_suffix(repacked, 321, 2048, 4096),
+                             ", RPM pending, 4 KiB unpacked input, 2 KiB original RPM")
+            repacked.write_bytes(b"x" * 1024)
+            self.assertEqual(mod.repack_progress_suffix(repacked, 321, None, 4096),
+                             ", 1 KiB RPM written, 4 KiB unpacked input")
+
+    def test_stage_starts_and_heartbeats_show_sizes(self):
+        args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_bytes(b"x" * 2048)
+        (self.downloads / "logs").mkdir()
+        work = rpm.parent / ".tarpm-demo-1-1.noarch"
+        repacked = work / "demo-1-1.noarch-repacked.rpm"
+
+        def extract(directory):
+            directory.mkdir(parents=True)
+            (directory / "data").write_bytes(b"x" * 4096)
+
+        def child(output="", write=None):
+            proc = Mock(pid=321, returncode=0)
+            pending = write
+
+            def communicate(**kwargs):
+                nonlocal pending
+                if pending:
+                    pending()
+                    pending = None
+                    raise subprocess.TimeoutExpired(["tarpm"], 1)
+                return output, None
+
+            proc.communicate.side_effect = communicate
+            return proc
+
+        children = [child(write=lambda: extract(work / "ext/payload")),
+                    child(write=lambda: repacked.write_bytes(b"x" * 1536)),
+                    child(write=lambda: extract(work / "ext2/payload")),
+                    child("same listing\n"), child("same listing\n")]
+        with patch.object(mod.subprocess, "Popen", side_effect=children) as popen, \
+                patch.object(mod, "_tarpm_payload_bytes",
+                             side_effect=lambda pid: 1024 if pid == 321 else None), \
+                patch.object(mod, "_tree_bytes", wraps=mod._tree_bytes) as tree_bytes, \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            result = mod.test_one(rpm, args, progress=(1, 2))
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.warning)
+        self.assertEqual(popen.call_count, 5)
+        starts = [line for line in stdout.getvalue().splitlines() if ": testing " in line]
+        self.assertEqual(len(starts), 5)
+        for line, stage in zip(starts, ("unpack", "repack", "unpack-repacked",
+                                       "list-original", "list-repacked")):
+            self.assertIn(f"({stage}) (1/2)", line)
+        self.assertIn("RPM pending, 4 KiB unpacked input, 2 KiB original RPM", starts[1])
+        beats = [line for line in stdout.getvalue().splitlines() if "still testing" in line]
+        self.assertEqual(len(beats), 3)
+        self.assertIn("4 KiB unpacked, 2 KiB input RPM", beats[0])
+        self.assertIn("1 KiB compressed payload, 1.5 KiB RPM written", beats[1])
+        self.assertIn("4 KiB unpacked input, 2 KiB original RPM", beats[1])
+        self.assertNotIn("%", beats[1])
+        self.assertIn("4 KiB unpacked, 1.5 KiB input RPM", beats[2])
+        # The completed input is measured once after unpacking, not repeatedly
+        # during the repack stage (two earlier scans are unpack start/heartbeat).
+        self.assertEqual(sum(call.args == (work / "ext",)
+                             for call in tree_bytes.call_args_list), 3)
+
+    def test_failed_stage_does_not_announce_later_stages(self):
+        args = mod.parse_args(self.argv + ["--heartbeat", "0"])
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("rpm")
+        (self.downloads / "logs").mkdir()
+        with patch.object(mod, "run", return_value=(1, "unpack failed")), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            result = mod.test_one(rpm, args)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.stage, "unpack")
+        starts = [line for line in stdout.getvalue().splitlines() if ": testing " in line]
+        self.assertEqual(len(starts), 1)
+        self.assertIn("(unpack)", starts[0])
+
+
 class ArtifactRetentionTests(RunnerTestCase):
     def test_warning_retains_only_log_unless_keep(self):
         for keep in (False, True):

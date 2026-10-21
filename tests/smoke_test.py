@@ -79,8 +79,12 @@ def main():
             "completed tests must be journaled")
     require(json.loads((downloads / "run.json").read_text())["run_id"] == manifest["run_id"],
             "resume must preserve the active run ID")
+    run_log = (downloads / "run.log").read_text()
     for row in resumed["test"]:
         rpm = Path(row["rpm"])
+        for stage in ("unpack", "repack", "unpack-repacked", "list-original", "list-repacked"):
+            require(f"testing {rpm.stem} ({stage})" in run_log,
+                    f"stage start missing from run log: {rpm.stem} ({stage})")
         work = rpm.parent / f".tarpm-{rpm.stem}"
         for artifact in (rpm, work / "ext", work / "ext2",
                          work / f"{rpm.stem}-repacked.rpm",
