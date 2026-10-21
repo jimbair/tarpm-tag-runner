@@ -33,7 +33,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Real hello RPM smoke tests
-        run: python3 .github/scripts/smoke-test.py --output "$RUNNER_TEMP/hello-smoke"
+        run: python3 tests/smoke_test.py --output "$RUNNER_TEMP/hello-smoke"
 
       - name: Upload smoke-test reports, logs, and RPM artifacts
         if: always()

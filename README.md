@@ -242,7 +242,7 @@ artifacts are uploaded as `hello-smoke` for seven days, including on failure.
 To run the same smoke tests locally after installing the tools:
 
 ```bash
-python3 .github/scripts/smoke-test.py --output /tmp/hello-smoke
+python3 tests/smoke_test.py --output /tmp/hello-smoke
 ```
 
 The output directory must be new. Smoke tests require network access;

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 
-RUNNER = Path(__file__).resolve().parents[2] / "tarpm-tag-runner.py"
+RUNNER = Path(__file__).resolve().parents[1] / "tarpm-tag-runner.py"
 
 
 def require(condition, message):
