@@ -381,6 +381,9 @@ def read_nvrs(args) -> tuple:
         if nvr.startswith("#") or nvr.startswith("-") or nvr == "Build":
             continue
         nvrs.append(nvr)
+    # Input files can repeat NVRs. Each build must have exactly one worker:
+    # duplicate workers share and delete the same RPMs and work directories.
+    nvrs = list(dict.fromkeys(nvrs))
     if source.startswith("cached"):
         log(f"{PROG}: tag {args.tag}: using cached list ({len(nvrs)} packages, "
             f"saved {saved})")
@@ -440,6 +443,12 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
     logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
     logfile.write_text(out)
     if rc == 0:
+        # Koji has no exclude-source switch. Without an explicit arch
+        # filter it downloads src along with all binary arches; discard
+        # those skipped RPMs now so --no-src cannot accumulate them.
+        if args.no_src:
+            for rpm in pdir.glob("*.src.rpm"):
+                rpm.unlink()
         n_rpms = sum(1 for p in pdir.glob("*.rpm") if p.is_file())
         log(f"[fetch]  {nvr} ok ({n_rpms} RPMs, {human(_dir_bytes(pdir))}, "
             f"{fmt_duration(elapsed)})")
@@ -1322,10 +1331,12 @@ def main(argv=None) -> int:
             fetch_counter = Counter(len(selected))
 
             def work(nvr):
-                # --retry-failed: start from a clean build dir so stale
-                # RPMs from the failed run cannot survive the re-run.
-                if args.retry_failed:
-                    shutil.rmtree(Path(args.dir) / nvr, ignore_errors=True)
+                # Both recovery modes need a fresh download. If cleanup
+                # fails, fail this build rather than reuse untrusted RPMs.
+                if args.retry_failed or args.resume:
+                    bdir = Path(args.dir) / nvr
+                    if bdir.exists():
+                        shutil.rmtree(bdir)
                 fetch, tests = process_build(nvr, args, fetch_counter)
                 # Journal the build as it finishes, so a run that is
                 # interrupted or crashes still records what completed.

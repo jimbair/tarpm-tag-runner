@@ -96,6 +96,76 @@ class JournalRecoveryTests(RunnerTestCase):
                          {old["nvr"]: old, new["nvr"]: new})
 
 
+class FetchRecoveryTests(RunnerTestCase):
+    def test_duplicate_nvrs_are_processed_once(self):
+        self.listfile.write_text("demo-1-1\ndemo-1-1  # repeated\n")
+        with patch.object(mod, "fetch_one", return_value=mod.FetchResult(
+                "demo-1-1", True)) as fetch:
+            self.assertEqual(self.run_main("--no-test", "-j", "2"), 0)
+        fetch.assert_called_once()
+
+    def test_recovery_clears_build_before_download(self):
+        for mode in ("--resume", "--retry-failed"):
+            with self.subTest(mode=mode):
+                bdir = self.downloads / "demo-1-1"
+                bdir.mkdir(parents=True, exist_ok=True)
+                (bdir / "partial.rpm").write_text("truncated download")
+                journal = self.downloads / "journal.jsonl"
+                journal.write_text(json.dumps({"nvr": "demo-1-1",
+                                               "status": "test-fail"}) + "\n")
+
+                def process(nvr, args, counter):
+                    self.assertFalse(bdir.exists())
+                    return mod.FetchResult(nvr, True), []
+
+                with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                        patch.object(mod, "process_build", side_effect=process) as work:
+                    self.assertEqual(self.run_main(mode), 0)
+                work.assert_called_once()
+                mod.JOURNAL._fh.close()
+
+    def test_failed_resume_cleanup_does_not_reuse_rpms(self):
+        (self.downloads / "demo-1-1").mkdir(parents=True)
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")), \
+                patch.object(mod, "process_build") as process:
+            self.assertEqual(self.run_main("--resume"), 1)
+        process.assert_not_called()
+        record = mod.read_journal(str(self.downloads / "journal.jsonl"))
+        self.assertEqual(record["demo-1-1"]["status"], "fetch-fail")
+
+    def test_no_src_discards_source_downloads(self):
+        for arch in ([], ["-a", "x86_64"]):
+            with self.subTest(arch=arch):
+                args = mod.parse_args(self.argv + ["--no-src", "--keep"] + arch)
+                (self.downloads / "logs").mkdir(parents=True, exist_ok=True)
+
+                def download(cmd, cwd, **kwargs):
+                    (cwd / "demo-1-1.src.rpm").write_text("source")
+                    (cwd / "demo-1-1.x86_64.rpm").write_text("binary")
+                    return 0, "downloaded"
+
+                with patch.object(mod, "run", side_effect=download), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = mod.fetch_one("demo-1-1", args)
+                self.assertTrue(result.ok)
+                self.assertFalse((self.downloads / "demo-1-1/demo-1-1.src.rpm").exists())
+                self.assertTrue((self.downloads / "demo-1-1/demo-1-1.x86_64.rpm").exists())
+
+    def test_no_src_preserves_partial_download_on_failure(self):
+        args = mod.parse_args(self.argv + ["--no-src"])
+        (self.downloads / "logs").mkdir(parents=True)
+        bdir = self.downloads / "demo-1-1"
+        bdir.mkdir()
+        source = bdir / "demo-1-1.src.rpm"
+        source.write_text("partial source")
+        with patch.object(mod, "run", return_value=(1, "download failed")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = mod.fetch_one("demo-1-1", args)
+        self.assertFalse(result.ok)
+        self.assertTrue(source.exists())
+
+
 class ErrorSignatureTests(unittest.TestCase):
     def test_create_payload_line(self):
         # The "tarpm: " line is used, with the prefix stripped.
