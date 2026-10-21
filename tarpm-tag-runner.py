@@ -910,7 +910,15 @@ class Journal:
     def open(self, path: str) -> None:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            self._fh = open(path, "ab")
+            self._fh = open(path, "a+b", buffering=0)
+            # A crash can leave a partial final line. Separate it from the
+            # next record so the reader can discard it without also losing
+            # the first completed build of the new run. Preserve a valid
+            # final record that merely lacks its newline, too.
+            if self._fh.seek(0, os.SEEK_END):
+                self._fh.seek(-1, os.SEEK_END)
+                if self._fh.read(1) != b"\n":
+                    os.write(self._fh.fileno(), b"\n")
             self.path = path
         except OSError:
             self._fh = None
@@ -959,13 +967,15 @@ def read_journal(path: str) -> dict:
 def journal_record(nvr: str, fetch: "FetchResult | None", tests: list) -> dict:
     """One journal line for a finished build.
 
-    status is pass, warn, fetch-fail, or test-fail; stage/exit_code/
+    status is fetched, pass, warn, fetch-fail, or test-fail; stage/exit_code/
     signature come from the failing fetch or the first failing test;
     rpms lists the failing (or, for warn, warning) RPM basenames.
     """
     rec = {
         "nvr": nvr,
-        "status": "pass",
+        # Fetch-only runs (and builds with no selected test RPMs) must
+        # remain eligible for testing by a subsequent --resume.
+        "status": "pass" if tests else "fetched",
         "stage": "",
         "exit_code": None,
         "signature": "",

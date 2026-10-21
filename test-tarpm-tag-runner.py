@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Unit tests for the pure helpers in tarpm-tag-runner.py.
+"""Unit and regression tests for tarpm-tag-runner.py.
 
-No koji, tarpm, or network needed: only the parts of the script that
-are pure functions are exercised. Run with:
+No koji, tarpm, or network needed: external commands are mocked. Run with:
 
     python3 test-tarpm-tag-runner.py
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,6 +32,68 @@ def load_module():
 
 
 mod = load_module()
+
+
+class RunnerTestCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ttr-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.listfile = self.root / "nvrs.txt"
+        self.listfile.write_text("demo-1-1\n")
+        self.downloads = self.root / "rpms"
+        self.argv = ["--from-file", str(self.listfile),
+                     "-d", str(self.downloads),
+                     "-r", str(self.root / "report.txt"), "--no-run-log"]
+        journal = mod.Journal()
+        self.enter_patch = patch.object(mod, "JOURNAL", journal)
+        self.enter_patch.start()
+        self.addCleanup(self.enter_patch.stop)
+        self.addCleanup(lambda: journal._fh.close() if journal._fh else None)
+
+    def run_main(self, *extra):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return mod.main(self.argv + list(extra))
+
+
+class JournalRecoveryTests(RunnerTestCase):
+    def test_fetch_only_does_not_make_resume_skip_tests(self):
+        with patch.object(mod, "fetch_one", return_value=mod.FetchResult(
+                nvr="demo-1-1", ok=True)):
+            self.assertEqual(self.run_main("--no-test"), 0)
+        latest = mod.read_journal(str(self.downloads / "journal.jsonl"))
+        self.assertEqual(latest["demo-1-1"]["status"], "fetched")
+        mod.JOURNAL._fh.close()
+        test = mod.TestResult(rpm="demo-1-1.noarch.rpm", nvr="demo-1-1",
+                              arch="noarch", ok=True)
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build", return_value=(
+                    mod.FetchResult("demo-1-1", True), [test])) as process:
+            self.assertEqual(self.run_main("--resume"), 0)
+        process.assert_called_once()
+        latest = mod.read_journal(str(self.downloads / "journal.jsonl"))
+        self.assertEqual(latest["demo-1-1"]["status"], "pass")
+
+    def test_new_record_survives_torn_tail(self):
+        path = self.root / "journal.jsonl"
+        old = {"nvr": "old-1-1", "status": "pass"}
+        path.write_text(json.dumps(old) + '\n{"nvr":"broken')
+        mod.JOURNAL.open(str(path))
+        new = {"nvr": "new-1-1", "status": "test-fail"}
+        mod.JOURNAL.append(new)
+        self.assertEqual(mod.read_journal(str(path)),
+                         {old["nvr"]: old, new["nvr"]: new})
+
+    def test_valid_tail_without_newline_is_preserved(self):
+        path = self.root / "journal.jsonl"
+        old = {"nvr": "old-1-1", "status": "pass"}
+        path.write_text(json.dumps(old))
+        mod.JOURNAL.open(str(path))
+        new = {"nvr": "new-1-1", "status": "pass"}
+        mod.JOURNAL.append(new)
+        self.assertEqual(mod.read_journal(str(path)),
+                         {old["nvr"]: old, new["nvr"]: new})
 
 
 class ErrorSignatureTests(unittest.TestCase):
