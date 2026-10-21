@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
 
       - name: Unit and regression tests
-        run: python3 test-tarpm-tag-runner.py
+        run: python3 -m unittest discover -s tests -v
 
       - name: Real hello RPM smoke tests
         run: python3 .github/scripts/smoke-test.py --output "$RUNNER_TEMP/hello-smoke"

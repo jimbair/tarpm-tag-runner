@@ -231,7 +231,7 @@ duration. An unavailable run log does not stop the run.
 Run the unit and regression suite without external tools or network access:
 
 ```bash
-python3 test-tarpm-tag-runner.py
+python3 -m unittest discover -s tests -v
 ```
 
 GitHub Actions installs Koji and tarpm in Fedora 44, runs that suite, and

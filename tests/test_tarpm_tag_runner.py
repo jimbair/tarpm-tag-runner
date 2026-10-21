@@ -3,7 +3,7 @@
 
 No koji, tarpm, or network needed: external commands are mocked. Run with:
 
-    python3 test-tarpm-tag-runner.py
+    python3 -m unittest discover -s tests -v
 """
 import contextlib
 import importlib.util
@@ -17,11 +17,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_module():
-    path = os.path.join(_HERE, "tarpm-tag-runner.py")
+    path = _ROOT / "tarpm-tag-runner.py"
     spec = importlib.util.spec_from_file_location("tarpm_tag_runner", path)
     mod = importlib.util.module_from_spec(spec)
     # dataclasses resolves string annotations against sys.modules, so the
