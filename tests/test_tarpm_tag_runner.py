@@ -11,12 +11,14 @@ import io
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -140,7 +142,7 @@ class CliSelectionTests(RunnerTestCase):
 
     def test_fresh_list_and_heartbeat_diagnostics_use_stderr(self):
         self.argv = ["-d", str(self.downloads), "--no-run-log"]
-        proc = unittest.mock.Mock()
+        proc = Mock()
         proc.communicate.side_effect = [
             mod.subprocess.TimeoutExpired(["koji"], 60),
             ("demo-1-1 f44 user\n", None),
@@ -409,6 +411,87 @@ class ErrorSignatureTests(unittest.TestCase):
     def test_empty_output(self):
         self.assertEqual(mod.error_signature(""), "")
         self.assertEqual(mod.error_signature("\n  \n\t\n"), "")
+
+
+class PoolInterruptTests(RunnerTestCase):
+    def exercise_interrupt(self, phase):
+        started, release = threading.Event(), threading.Event()
+        completed = []
+
+        def worker(item):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("worker was not released after interrupt")
+            completed.append(item)
+            return item
+
+        def items():
+            yield "active"
+            self.assertTrue(started.wait(5))
+            yield "queued"
+            if phase == "submission":
+                raise KeyboardInterrupt
+
+        original_handler = signal.getsignal(signal.SIGINT)
+        with patch.object(mod, "log", side_effect=lambda *a, **kw: release.set()):
+            if phase == "collection":
+                with patch.object(mod.concurrent.futures, "as_completed",
+                                  side_effect=KeyboardInterrupt):
+                    results, interrupted = mod.run_pool(worker, items(), 1)
+            else:
+                results, interrupted = mod.run_pool(worker, items(), 1)
+        self.assertTrue(interrupted)
+        self.assertEqual(results, ["active"])
+        self.assertEqual(completed, ["active"])
+        self.assertEqual(signal.getsignal(signal.SIGINT), original_handler)
+
+    def test_interrupt_during_submission_drops_queued_work(self):
+        self.exercise_interrupt("submission")
+
+    def test_interrupt_during_collection_drops_queued_work(self):
+        self.exercise_interrupt("collection")
+
+    def test_interrupt_before_future_is_tracked_keeps_partial_report(self):
+        started, release = threading.Event(), threading.Event()
+        executor = mod.concurrent.futures.ThreadPoolExecutor
+
+        class InterruptedSubmit(executor):
+            def submit(self, *args, **kwargs):
+                super().submit(*args, **kwargs)
+                if not started.wait(5):
+                    raise RuntimeError("worker did not start")
+                # Simulate SIGINT after enqueueing, before returning the
+                # future to run_pool's tracking list.
+                raise KeyboardInterrupt
+
+        def process(nvr, args, counter):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("worker was not released after interrupt")
+            return (mod.FetchResult(nvr, True),
+                    [mod.TestResult(rpm=nvr + ".noarch.rpm", nvr=nvr,
+                                    arch="noarch", ok=True)])
+
+        def log(message, **kwargs):
+            if "interrupted:" in message:
+                release.set()
+
+        json_path = self.root / "partial.json"
+        original_handler = signal.getsignal(signal.SIGINT)
+        with patch.object(mod.concurrent.futures, "ThreadPoolExecutor", InterruptedSubmit), \
+                patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build", side_effect=process), \
+                patch.object(mod, "log", side_effect=log):
+            self.assertEqual(self.run_main("--json", str(json_path)), 130)
+        report = (self.root / "report.txt").read_text()
+        self.assertIn("interrupted: yes", report)
+        self.assertIn("completed: 1 build(s)", report)
+        data = json.loads(json_path.read_text())
+        self.assertEqual(len(data["fetch"]), 1)
+        self.assertEqual(len(data["test"]), 1)
+        latest = mod.read_journal(str(self.downloads / "journal.jsonl"))
+        self.assertEqual(latest["demo-1-1"]["status"], "pass")
+        self.assertEqual(signal.getsignal(signal.SIGINT), original_handler)
 
 
 class JournalInterruptTests(unittest.TestCase):

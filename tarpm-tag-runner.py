@@ -724,41 +724,55 @@ def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
     is called and its return value is used as that item's result, so a
     single bad item cannot abort the whole run.
     """
+    results = []
+    result_lock = threading.Lock()
+    stopping = threading.Event()
+
     def call(item):
+        # A worker can dequeue before the main thread cancels its future.
+        # Do not start more build work once an interrupt has been observed.
+        if stopping.is_set():
+            return
         try:
-            return worker(item)
+            result = worker(item)
         except Exception as exc:
             if on_error is None:
                 raise
             log(f"{PROG}: error processing {item}: {exc}", err=True)
-            return on_error(item, exc)
+            result = on_error(item, exc)
+        # Collect in the worker so a signal between submit() and tracking
+        # its returned future cannot lose a finished build from the report.
+        with result_lock:
+            results.append(result)
 
-    results = []
     interrupted = False
-    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = [pool.submit(call, item) for item in items]
-        collected = set()
-        try:
-            for fut in concurrent.futures.as_completed(futures):
-                results.append(fut.result())
-                collected.add(fut)
-        except KeyboardInterrupt:
-            interrupted = True
-            # Any further Ctrl+C now force-quits immediately (os._exit)
-            # instead of unwinding into the executor's shutdown, which
-            # would wait for the in-flight children to finish.
-            signal.signal(signal.SIGINT, _force_quit)
-            log(f"{PROG}: interrupted: finishing in-flight work, then "
-                  f"stopping (Ctrl+C again to force-quit)", err=True)
-            for f in futures:
-                f.cancel()
-            for f in futures:
-                if f in collected or f.cancelled():
-                    continue
-                try:
-                    results.append(f.result())
-                except KeyboardInterrupt:
-                    raise
+    previous_sigint = None
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = []
+            try:
+                # Submission is part of the interruptible work too.
+                for item in items:
+                    futures.append(pool.submit(call, item))
+                for fut in concurrent.futures.as_completed(futures):
+                    fut.result()
+            except KeyboardInterrupt:
+                interrupted = True
+                stopping.set()
+                # A second Ctrl+C while active work finishes force-quits.
+                previous_sigint = signal.signal(signal.SIGINT, _force_quit)
+                log(f"{PROG}: interrupted: finishing in-flight work, then "
+                      f"stopping (Ctrl+C again to force-quit)", err=True)
+                for fut in futures:
+                    fut.cancel()
+                for fut in futures:
+                    if not fut.cancelled():
+                        fut.result()
+            # The executor also joins a submitted future that a signal
+            # interrupted before it could be added to futures above.
+    finally:
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
     return results, interrupted
 
 
