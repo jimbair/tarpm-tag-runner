@@ -205,6 +205,37 @@ class ReportPathTests(unittest.TestCase):
 
 
 class BuildPathTests(RunnerTestCase):
+    def test_test_only_rejects_symlink_before_testing_any_rpm(self):
+        outside = self.root / "outside-1-1"
+        outside.mkdir()
+        original = outside / "demo-1-1.noarch.rpm"
+        original.write_text("external original")
+        valid = self.downloads / "aaa-1-1/aaa-1-1.noarch.rpm"
+        valid.parent.mkdir(parents=True)
+        valid.write_text("local original")
+        (self.downloads / "demo-1-1").symlink_to(outside, target_is_directory=True)
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "run") as command:
+            self.assertEqual(self.run_main("--test-only"), 2)
+        command.assert_not_called()
+        self.assertEqual(original.read_text(), "external original")
+        self.assertEqual(valid.read_text(), "local original")
+
+    def test_test_only_cleanup_leaves_filtered_symlink_alone(self):
+        outside = self.root / "empty-outside"
+        outside.mkdir()
+        rpm = self.downloads / "good-1-1/good-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("local original")
+        link = self.downloads / "other-1-1"
+        link.symlink_to(outside, target_is_directory=True)
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "run", return_value=(0, "listing\n")):
+            self.assertEqual(self.run_main("--test-only", "-p", "good"), 0)
+        self.assertFalse(rpm.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(outside.is_dir())
+
     def test_invalid_nvrs_are_rejected_before_any_build_runs(self):
         outside = self.root / "outside-1-1"
         outside.mkdir()

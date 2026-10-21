@@ -534,7 +534,7 @@ def collect_test_units(args) -> list:
         builds += 1
         if args.limit and builds > args.limit:
             break
-        units.extend(build_units(d, args))
+        units.extend(build_units(build_dir(args.dir, d.name), args))
     return units
 
 
@@ -1408,7 +1408,11 @@ def main(argv=None) -> int:
     elif do_test:
         # --test-only: test the RPMs already under DIR.
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
-        units = collect_test_units(args)
+        try:
+            units = collect_test_units(args)
+        except UsageError as exc:
+            log(f"{PROG}: error: {exc}", err=True)
+            return 2
         if not units:
             log(f"{PROG}: error: no RPMs found to test under {args.dir}",
                   err=True)
@@ -1431,7 +1435,8 @@ def main(argv=None) -> int:
         # Remove build dirs whose RPMs all passed and were removed above.
         if not args.keep:
             for d in sorted(Path(args.dir).iterdir(), key=lambda p: p.name):
-                if d.is_dir() and d.name != "logs" and not any(d.iterdir()):
+                if (d.is_dir() and not d.is_symlink() and d.name != "logs"
+                        and not any(d.iterdir())):
                     d.rmdir()
 
     fetch_for_report = fetch_results if do_fetch else None

@@ -81,8 +81,8 @@ whitespace-delimited token on each line is used; headers, blank lines, and
 package filtering and before journal filtering. In `--test-only`, it limits
 matching build directories in alphabetical order.
 
-Build lists must contain plain `name-version-release` values. Fetch and
-recovery reject paths and symlinked build directories.
+Build lists must contain plain `name-version-release` values. Fetch,
+recovery, and local testing reject paths and symlinked build directories.
 
 `--list` applies resume/retry journal filters before printing and sends
 diagnostics to stderr, so stdout can be saved and reused with `--from-file`.
