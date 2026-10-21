@@ -96,6 +96,62 @@ class JournalRecoveryTests(RunnerTestCase):
                          {old["nvr"]: old, new["nvr"]: new})
 
 
+class BuildPathTests(RunnerTestCase):
+    def test_invalid_nvrs_are_rejected_before_any_build_runs(self):
+        outside = self.root / "outside-1-1"
+        outside.mkdir()
+        marker = outside / "keep.txt"
+        marker.write_text("unrelated data")
+        for invalid in ("../outside-1-1", str(outside), ".", "..", "demo",
+                        "demo--1", "dir/demo-1-1", r"dir\demo-1-1"):
+            with self.subTest(nvr=invalid):
+                self.listfile.write_text(f"demo-1-1\n{invalid}\n")
+                with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                        patch.object(mod, "process_build") as process:
+                    self.assertEqual(self.run_main("--resume"), 2)
+                process.assert_not_called()
+                self.assertEqual(marker.read_text(), "unrelated data")
+
+    def test_valid_nvrs_include_rpm_version_separators(self):
+        for nvr in ("hello-2.12.2-1.fc44", "389-ds-base-3.1.2-1.fc44",
+                    "libstdc++-16.0.1-0.1.fc44", "demo-1.0~rc1^git-1.fc44"):
+            with self.subTest(nvr=nvr):
+                self.assertEqual(mod.build_dir(str(self.downloads), nvr),
+                                 self.downloads / nvr)
+
+    def test_direct_fetch_rejects_paths_and_symlinks(self):
+        self.downloads.mkdir()
+        outside = self.root / "outside-1-1"
+        outside.mkdir()
+        (self.downloads / "demo-1-1").symlink_to(outside, target_is_directory=True)
+        args = mod.parse_args(self.argv)
+        for nvr in ("../outside-1-1", "demo-1-1"):
+            with self.subTest(nvr=nvr), patch.object(mod, "run") as command:
+                with self.assertRaises(mod.UsageError):
+                    mod.fetch_one(nvr, args)
+                command.assert_not_called()
+
+    def test_recovery_does_not_delete_symlink_targets(self):
+        outside = self.root / "outside-1-1"
+        outside.mkdir()
+        marker = outside / "keep.txt"
+        marker.write_text("unrelated data")
+        self.downloads.mkdir()
+        link = self.downloads / "demo-1-1"
+        link.symlink_to(outside, target_is_directory=True)
+        for mode in ("--resume", "--retry-failed"):
+            with self.subTest(mode=mode):
+                (self.downloads / "journal.jsonl").write_text(json.dumps(
+                    {"nvr": "demo-1-1", "status": "test-fail"}) + "\n")
+                with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                        patch.object(mod, "process_build") as process:
+                    self.assertEqual(self.run_main(mode), 1)
+                process.assert_not_called()
+                self.assertEqual(marker.read_text(), "unrelated data")
+                self.assertTrue(link.is_symlink())
+                mod.JOURNAL._fh.close()
+
+
 class FetchRecoveryTests(RunnerTestCase):
     def test_duplicate_nvrs_are_processed_once(self):
         self.listfile.write_text("demo-1-1\ndemo-1-1  # repeated\n")

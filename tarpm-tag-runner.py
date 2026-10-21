@@ -326,6 +326,26 @@ class TestResult:
 # fetch phase
 # ---------------------------------------------------------------------------
 
+def validate_nvr(nvr: str) -> None:
+    """Require a plain RPM name-version-release, never a filesystem path."""
+    if not re.fullmatch(
+            r"[A-Za-z0-9_+][A-Za-z0-9_+.-]*-[A-Za-z0-9_+.~^]+-[A-Za-z0-9_+.~^]+",
+            nvr):
+        raise UsageError(f"invalid build NVR: {nvr!r} "
+                         "(expected name-version-release, without paths)")
+
+
+def build_dir(directory: str, nvr: str) -> Path:
+    """Return a build path confined to a direct child of the download root."""
+    validate_nvr(nvr)
+    root = Path(directory)
+    path = root / nvr
+    if path.is_symlink() or path.resolve().parent != root.resolve():
+        raise UsageError(f"unsafe build directory: {path} "
+                         "(must be a direct child, not a symlink)")
+    return path
+
+
 def read_nvrs(args) -> tuple:
     """Return (NVR list, tag-list source) for the run.
 
@@ -381,6 +401,7 @@ def read_nvrs(args) -> tuple:
         # skip comment lines, and the table header lines (title row + dashes)
         if nvr.startswith("#") or nvr.startswith("-") or nvr == "Build":
             continue
+        validate_nvr(nvr)
         nvrs.append(nvr)
     # Input files can repeat NVRs. Each build must have exactly one worker:
     # duplicate workers share and delete the same RPMs and work directories.
@@ -412,7 +433,7 @@ def select_nvrs(nvrs: list, pkgs: list) -> list:
 
 
 def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
-    pdir = Path(args.dir) / nvr
+    pdir = build_dir(args.dir, nvr)
     pdir.mkdir(parents=True, exist_ok=True)
     cmd = ["koji", "download-build"]
     if args.arch:
@@ -644,7 +665,7 @@ def process_build(nvr: str, args, fetch_counter=None) -> tuple:
         # and the fetch log are kept for inspection and can be tested
         # later with --test-only.
         return fetch, []
-    bdir = Path(args.dir) / nvr
+    bdir = build_dir(args.dir, nvr)
     units = build_units(bdir, args)
     total = len(units)
     tests = []
@@ -1335,7 +1356,7 @@ def main(argv=None) -> int:
                 # Both recovery modes need a fresh download. If cleanup
                 # fails, fail this build rather than reuse untrusted RPMs.
                 if args.retry_failed or args.resume:
-                    bdir = Path(args.dir) / nvr
+                    bdir = build_dir(args.dir, nvr)
                     if bdir.exists():
                         shutil.rmtree(bdir)
                 fetch, tests = process_build(nvr, args, fetch_counter)

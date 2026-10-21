@@ -81,6 +81,9 @@ whitespace-delimited token on each line is used; headers, blank lines, and
 package filtering and before journal filtering. In `--test-only`, it limits
 matching build directories in alphabetical order.
 
+Build lists must contain plain `name-version-release` values. Fetch and
+recovery reject paths and symlinked build directories.
+
 Koji matches architectures exactly, so the runner adds `noarch` and `src`
 when `-a` is supplied. Without `-a`, `--no-src` may still download source
 RPMs because Koji has no source-exclusion option; they are deleted after a
