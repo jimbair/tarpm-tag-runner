@@ -55,6 +55,11 @@ def main():
     require(all(row["ok"] for row in fetched["fetch"]), "hello download failed")
     require(all(row["status"] == "fetched" for row in journal().values()),
             "fetch-only builds must remain eligible for resume")
+    manifest = json.loads((downloads / "run.json").read_text())
+    require(set(manifest["nvrs"]) == {row["nvr"] for row in fetched["fetch"]},
+            "run manifest must capture the complete selection")
+    require(all(row.get("run_id") == manifest["run_id"] for row in journal().values()),
+            "journal records must belong to the active run")
     require(list(downloads.glob("*/*.src.rpm")), "source RPM was not fetched")
 
     # A resumed build must discard everything left by an earlier attempt.
@@ -72,6 +77,8 @@ def main():
             "resume reused a stale build directory")
     require(all(row["status"] in ("pass", "warn") for row in journal().values()),
             "completed tests must be journaled")
+    require(json.loads((downloads / "run.json").read_text())["run_id"] == manifest["run_id"],
+            "resume must preserve the active run ID")
     for row in resumed["test"]:
         rpm = Path(row["rpm"])
         work = rpm.parent / f".tarpm-{rpm.stem}"

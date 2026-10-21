@@ -63,7 +63,7 @@ architectures plus source RPMs. Koji's default debuginfo exclusion applies.
 | `--run-log FILE` | Append runner log lines to FILE; default `DIR/run.log`. |
 | `--no-run-log` | Disable the run log. |
 | `--heartbeat N` | Log progress every N seconds during external commands; default 60, `0` disables. |
-| `--resume` | Skip journaled test passes/warnings; download and test the rest afresh. |
+| `--resume` | Continue the active run, skipping its test passes/warnings; download and test the rest afresh. |
 | `--retry-failed` | Download and test only journaled failures, starting from clean build directories. |
 | `-v` | Echo external commands. |
 | `-h`, `--help` | Show help and exit. |
@@ -127,6 +127,7 @@ tarpm, use `--keep` on the original run or download them again.
 rpms/
 ├── tag-f44.txt                      # cached tag list
 ├── journal.jsonl                    # finished-build records
+├── run.json                         # active run ID and full build selection
 ├── run.log                          # append-only runner log
 ├── <NVR>/
 │   ├── <base>.rpm                   # original download
@@ -144,9 +145,17 @@ rpms/
 
 ## Resume, retry, and interrupts
 
+Before workers start, each fetch invocation atomically saves its run ID and
+full build selection in `DIR/run.json`. Resume reuses that manifest and
+skips only passes/warnings recorded for its run ID. Older successes cannot
+hide unfinished or queued re-tests. A new normal or retry run replaces the
+manifest; use separate directories for simultaneous runs. `--list` and
+`--test-only` leave it unchanged.
+
 Finished builds append records to `DIR/journal.jsonl` immediately, so a
-crash preserves completed work. Records contain `nvr`, `status`, `stage`,
-`exit_code`, `signature`, `rpms` (failed or warned RPM basenames), and `ts`
+process crash preserves completed work. Records contain `run_id`, `nvr`,
+`status`, `stage`, `exit_code`, `signature`, `rpms` (failed or warned RPM
+basenames), and `ts`
 (UTC). The latest record per NVR wins; invalid lines are ignored, and an
 incomplete tail is separated before new records are appended.
 Short writes are retried; failed appends are rolled back with a warning.
@@ -154,8 +163,11 @@ If rollback fails, further journal writes are disabled to prevent corruption.
 
 Statuses are `fetched` (download succeeded without completed tests), `pass`,
 `warn`, `fetch-fail`, and `test-fail`. `--test-only` does not update the
-journal. Resume with the same architecture/source settings: journal records
-are per build and do not identify the test configuration.
+journal. Resume with the same architecture/source settings: records are per
+build and do not identify the test configuration. Without a manifest, resume
+uses legacy journal history and creates a manifest before doing new work;
+an invalid manifest is an error. Retry selects the latest failures across
+all run IDs.
 
 ```bash
 # Continue an interrupted run; re-run failures and unfinished/fetched builds:
@@ -165,10 +177,11 @@ python3 tarpm-tag-runner.py -t f44 -j 2 --resume
 python3 tarpm-tag-runner.py -t f44 -j 2 --retry-failed
 ```
 
-Both modes clear each selected build directory before downloading. They
-select from the normal tag/file list after `-p` and `-n`, so journal NVRs
-outside that selection are not retried. They test every selected RPM of a
-build, not just its previously failing RPMs. Nothing to do exits 0.
+Both modes clear each selected build directory before downloading. Normal
+tag/file selection, `-p`, and `-n` still apply; resume also restricts work to
+the manifest's selection, preserving pending builds outside a temporary
+filter. They test every selected RPM of a build, not just its previously
+failing RPMs. Nothing to do exits 0.
 `--retry-failed` defaults to `report-retry-YYYYmmdd-HHMMSS.txt` unless `-r`
 is supplied. The two modes are mutually exclusive and cannot be combined
 with `--test-only`, `--refresh`, or `--no-test`. `--refresh` also conflicts
@@ -224,8 +237,8 @@ leave the prior report/lists intact.
 The run log appends a UTC start/argv header and timestamped runner lines
 for each invocation, including heartbeats and uncaught tracebacks. A
 force-quit attempts a nonblocking message to stderr only, so logging cannot
-delay termination. Threaded log lines are locked and flushed. Fetch completion lines
-include RPM count, size, and duration; test lines include progress and
+delay termination. Threaded log lines are locked and flushed. Fetch
+completion lines include RPM count, size, and duration; test lines include progress and
 duration. An unavailable run log does not stop the run.
 
 | Exit | Meaning |

@@ -100,6 +100,138 @@ class JournalRecoveryTests(RunnerTestCase):
                          {old["nvr"]: old, new["nvr"]: new})
 
 
+class RunManifestTests(RunnerTestCase):
+    def passed_build(self, nvr, args, counter):
+        return (mod.FetchResult(nvr, True),
+                [mod.TestResult(rpm=nvr + ".noarch.rpm", nvr=nvr,
+                                arch="noarch", ok=True)])
+
+    def test_interrupted_rerun_resumes_active_and_queued_old_passes(self):
+        nvrs = ["done-1-1", "active-1-1", "queued-1-1"]
+        self.listfile.write_text("\n".join(nvrs) + "\n")
+        manifest_path = self.downloads / "run.json"
+        mod.write_run_manifest(manifest_path, nvrs, "old-run")
+        (self.downloads / "journal.jsonl").write_text("".join(
+            json.dumps({"nvr": nvr, "status": "pass", "run_id": "old-run"}) + "\n"
+            for nvr in nvrs))
+        partial = self.downloads / "active-1-1/partial.rpm"
+
+        def process(nvr, args, counter):
+            current = mod.read_run_manifest(manifest_path)
+            self.assertNotEqual(current["run_id"], "old-run")
+            self.assertEqual(current["nvrs"], nvrs)
+            if nvr == "active-1-1":
+                partial.parent.mkdir()
+                partial.write_text("incomplete rerun")
+                raise KeyboardInterrupt
+            return self.passed_build(nvr, args, counter)
+
+        def interrupted_pool(worker, items, jobs, on_error=None):
+            worker(items[0])
+            worker(items[1])
+            self.fail("active build should interrupt before queued build starts")
+
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build", side_effect=process), \
+                patch.object(mod, "run_pool", side_effect=interrupted_pool), \
+                self.assertRaises(KeyboardInterrupt):
+            self.run_main()
+        run_id = mod.read_run_manifest(manifest_path)["run_id"]
+        self.assertTrue(partial.exists())
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("--resume"), 0)
+        self.assertEqual([call.args[0] for call in process.call_args_list], nvrs[1:])
+        self.assertFalse(partial.exists())
+        current = mod.read_journal(str(self.downloads / "journal.jsonl"), run_id=run_id)
+        self.assertEqual(set(current), set(nvrs))
+        self.assertTrue(all(record["status"] == "pass" for record in current.values()))
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build") as process:
+            self.assertEqual(self.run_main("--resume"), 0)
+        process.assert_not_called()
+        self.assertEqual(mod.read_run_manifest(manifest_path)["run_id"], run_id)
+
+    def test_failed_manifest_replace_preserves_previous_run_and_rpms(self):
+        path = self.downloads / "run.json"
+        mod.write_run_manifest(path, ["demo-1-1"], "previous-run")
+        before = path.read_bytes()
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir()
+        rpm.write_text("previous RPM")
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod.os, "replace", side_effect=OSError("disk full")), \
+                patch.object(mod, "process_build") as process:
+            self.assertEqual(self.run_main(), 2)
+        process.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(rpm.read_text(), "previous RPM")
+        self.assertEqual(list(self.downloads.glob(".run-*.tmp")), [])
+
+    def test_invalid_manifest_never_falls_back_to_old_passes(self):
+        self.downloads.mkdir()
+        (self.downloads / "journal.jsonl").write_text(json.dumps(
+            {"nvr": "demo-1-1", "status": "pass"}) + "\n")
+        for invalid in ('{"run_id":', '{}',
+                        '{"run_id":"new", "nvrs":["../demo-1-1"]}'):
+            with self.subTest(manifest=invalid):
+                (self.downloads / "run.json").write_text(invalid)
+                with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                        patch.object(mod, "process_build") as process:
+                    self.assertEqual(self.run_main("--resume"), 2)
+                process.assert_not_called()
+
+    def test_list_does_not_replace_manifest(self):
+        path = self.downloads / "run.json"
+        mod.write_run_manifest(path, ["demo-1-1"], "existing-run")
+        before = path.read_bytes()
+        for options in (["--list"], ["--resume", "--list"]):
+            with self.subTest(options=options):
+                self.assertEqual(self.run_main(*options), 0)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_filtered_resume_preserves_other_pending_builds(self):
+        nvrs = ["aaa-1-1", "bbb-1-1"]
+        self.listfile.write_text("\n".join(nvrs) + "\n")
+        path = self.downloads / "run.json"
+        mod.write_run_manifest(path, nvrs, "current-run")
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("--resume", "-p", "aaa"), 0)
+        self.assertEqual([call.args[0] for call in process.call_args_list], nvrs[:1])
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("--resume"), 0)
+        self.assertEqual([call.args[0] for call in process.call_args_list], nvrs[1:])
+        self.assertEqual(mod.read_run_manifest(path)["nvrs"], nvrs)
+        self.assertEqual(mod.read_run_manifest(path)["run_id"], "current-run")
+
+    def test_resume_does_not_add_builds_outside_active_run(self):
+        self.listfile.write_text("demo-1-1\nother-1-1\n")
+        mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "current-run")
+        (self.downloads / "journal.jsonl").write_text(json.dumps(
+            {"nvr": "demo-1-1", "status": "pass", "run_id": "current-run"}) + "\n")
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build") as process:
+            self.assertEqual(self.run_main("--resume"), 0)
+        process.assert_not_called()
+
+    def test_retry_uses_historical_failures_but_starts_a_new_run(self):
+        path = self.downloads / "run.json"
+        mod.write_run_manifest(path, ["other-1-1"], "previous-run")
+        (self.downloads / "journal.jsonl").write_text(json.dumps(
+            {"nvr": "demo-1-1", "status": "test-fail", "run_id": "older-run"}) + "\n")
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("--retry-failed"), 0)
+        process.assert_called_once()
+        manifest = mod.read_run_manifest(path)
+        self.assertNotEqual(manifest["run_id"], "previous-run")
+        self.assertEqual(manifest["nvrs"], ["demo-1-1"])
+        current = mod.read_journal(str(self.downloads / "journal.jsonl"))
+        self.assertEqual(current["demo-1-1"]["run_id"], manifest["run_id"])
+
+
 class JournalWriteTests(RunnerTestCase):
     def test_short_writes_complete_each_record(self):
         path = self.root / "journal.jsonl"

@@ -64,9 +64,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -952,6 +954,45 @@ def write_json(path: Path, args, fetch: list | None, test: list | None) -> None:
 # --retry-failed)
 # ---------------------------------------------------------------------------
 
+def read_run_manifest(path: Path) -> dict | None:
+    """Read the active run's selection; an invalid manifest is never ignored."""
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"cannot read run manifest {path}: {exc}") from exc
+    if (not isinstance(manifest, dict)
+            or not isinstance(manifest.get("run_id"), str)
+            or not manifest["run_id"]
+            or not isinstance(manifest.get("nvrs"), list)
+            or not all(isinstance(nvr, str) for nvr in manifest["nvrs"])):
+        raise UsageError(f"invalid run manifest: {path}")
+    for nvr in manifest["nvrs"]:
+        validate_nvr(nvr)
+    return manifest
+
+
+def write_run_manifest(path: Path, nvrs: list, run_id: str) -> None:
+    """Atomically replace run state before any worker can modify build files."""
+    manifest = {"run_id": run_id, "nvrs": nvrs, "ts": now_utc()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=path.parent, prefix=".run-",
+                                         suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(manifest, stream)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 class Journal:
     """Append-only journal of finished builds (one JSON line each).
 
@@ -1029,12 +1070,12 @@ class Journal:
 JOURNAL = Journal()
 
 
-def read_journal(path: str) -> dict:
+def read_journal(path: str, run_id: str | None = None) -> dict:
     """Latest journal record per NVR.
 
     Lines are processed in file order, so the last valid record for an
     NVR wins; torn or invalid lines (e.g. a truncated final line) are
-    skipped.
+    skipped. With run_id, only records belonging to that run are considered.
     """
     latest = {}
     try:
@@ -1049,13 +1090,16 @@ def read_journal(path: str) -> dict:
                     continue
                 if not isinstance(rec, dict) or not isinstance(rec.get("nvr"), str):
                     continue
+                if run_id is not None and rec.get("run_id") != run_id:
+                    continue
                 latest[rec["nvr"]] = rec
     except OSError:
         pass
     return latest
 
 
-def journal_record(nvr: str, fetch: "FetchResult | None", tests: list) -> dict:
+def journal_record(nvr: str, fetch: "FetchResult | None", tests: list,
+                   run_id: str | None = None) -> dict:
     """One journal line for a finished build.
 
     status is fetched, pass, warn, fetch-fail, or test-fail; stage/exit_code/
@@ -1073,6 +1117,8 @@ def journal_record(nvr: str, fetch: "FetchResult | None", tests: list) -> dict:
         "rpms": [],
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if run_id is not None:
+        rec["run_id"] = run_id
     if fetch is not None and not fetch.ok:
         rec.update(status="fetch-fail", stage="fetch",
                    exit_code=fetch.exit_code, signature=fetch.signature)
@@ -1264,8 +1310,8 @@ def parse_args(argv) -> argparse.Namespace:
                          "progress line every N seconds (0 disables; "
                          "default: 60)")
     ap.add_argument("--resume", action="store_true",
-                    help="skip builds whose latest journal record "
-                         "(DIR/journal.jsonl) is pass or warn")
+                    help="continue DIR/run.json, skipping that run's test "
+                         "passes/warnings (legacy journal fallback if absent)")
     ap.add_argument("--retry-failed", action="store_true",
                     help="re-run only the builds whose latest journal "
                          "record is fetch-fail or test-fail; each starts "
@@ -1343,6 +1389,8 @@ def main(argv=None) -> int:
     test_results: list = []
     interrupted = False
     total_selected = 0
+    manifest = None
+    run_id = None
     if do_fetch:
         try:
             nvrs, tag_source = read_nvrs(args)
@@ -1375,8 +1423,18 @@ def main(argv=None) -> int:
                 return 0
 
         if args.resume:
-            # Skip what already passed; continue the rest.
-            latest = read_journal(journal_path)
+            # Only passes from this run can satisfy its selection. Older
+            # successes must not hide unfinished or queued re-test attempts.
+            try:
+                manifest = read_run_manifest(Path(args.dir) / "run.json")
+            except UsageError as exc:
+                log(f"{PROG}: error: {exc}", err=True)
+                return 2
+            if manifest is not None:
+                run_id = manifest["run_id"]
+                run_builds = set(manifest["nvrs"])
+                selected = [n for n in selected if n in run_builds]
+            latest = read_journal(journal_path, run_id=run_id)
             before = len(selected)
             selected = [n for n in selected
                         if latest.get(n, {}).get("status")
@@ -1385,7 +1443,7 @@ def main(argv=None) -> int:
                   f"{before} build(s) already passed (journal: "
                   f"{journal_path})", err=args.list)
             if not selected:
-                log(f"{PROG}: nothing to do: all builds already passed "
+                log(f"{PROG}: nothing to do: no pending builds in this selection "
                       f"(journal: {journal_path})", err=args.list)
                 return 0
 
@@ -1396,6 +1454,14 @@ def main(argv=None) -> int:
                   f"{args.tag}", err=True)
             return 0
 
+        if manifest is None:
+            run_id = uuid.uuid4().hex
+            try:
+                write_run_manifest(Path(args.dir) / "run.json", selected, run_id)
+            except OSError as exc:
+                log(f"{PROG}: error: cannot save run manifest: {exc}", err=True)
+                return 2
+
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
         total_selected = len(selected)
 
@@ -1404,7 +1470,7 @@ def main(argv=None) -> int:
             # --retry-failed can pick the build up again.
             fetch = FetchResult(nvr=nvr, ok=False, error=repr(exc),
                                 signature="exception")
-            JOURNAL.append(journal_record(nvr, fetch, []))
+            JOURNAL.append(journal_record(nvr, fetch, [], run_id=run_id))
             return fetch
 
         if do_test:
@@ -1425,7 +1491,7 @@ def main(argv=None) -> int:
                 fetch, tests = process_build(nvr, args, fetch_counter)
                 # Journal the build as it finishes, so a run that is
                 # interrupted or crashes still records what completed.
-                JOURNAL.append(journal_record(fetch.nvr, fetch, tests))
+                JOURNAL.append(journal_record(fetch.nvr, fetch, tests, run_id=run_id))
                 return fetch, tests
 
             results, interrupted = run_pool(
@@ -1441,7 +1507,7 @@ def main(argv=None) -> int:
 
             def fetch_worker(nvr):
                 result = fetch_one(nvr, args, fetch_counter)
-                JOURNAL.append(journal_record(nvr, result, []))
+                JOURNAL.append(journal_record(nvr, result, [], run_id=run_id))
                 return result
 
             results, interrupted = run_pool(
