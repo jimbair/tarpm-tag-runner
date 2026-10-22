@@ -98,6 +98,11 @@ def fmt_duration(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+def fmt_command_duration(seconds: float) -> str:
+    """Keep fast command measurements visible instead of rounding them to 0.0s."""
+    return f"{seconds * 1000:.1f}ms" if seconds < 1 else fmt_duration(seconds)
+
+
 def human(n: int) -> str:
     """Binary (1024) human size: '950 KiB', '838 MiB', '2.9 GiB'."""
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
@@ -377,6 +382,7 @@ class FetchResult:
     log: Path | None = None
     error: str | None = None         # worker exception text, if any
     signature: str = ""             # error_signature of the failing output
+    duration_seconds: float | None = None  # download command wall time
 
 
 @dataclasses.dataclass
@@ -391,6 +397,8 @@ class TestResult:
     log: Path | None = None
     error: str | None = None          # worker exception text, if any
     signature: str = ""             # error_signature of the failing output
+    duration_seconds: float | None = None  # test wall time, before cleanup
+    stage_seconds: dict = dataclasses.field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +636,8 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
     else:
         log(f"[fetch]  {nvr} FAIL (exit {rc}; log: {logfile})")
     return FetchResult(nvr=nvr, ok=(rc == 0), exit_code=rc, log=logfile,
-                       signature="" if rc == 0 else error_signature(out))
+                       signature="" if rc == 0 else error_signature(out),
+                       duration_seconds=elapsed)
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +725,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         return suffix
 
     unpacked_size = None
+    stage_seconds = {}
 
     def repack_suffix(output, pid) -> str:
         nonlocal unpacked_size
@@ -724,13 +734,19 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             unpacked_size = _tree_bytes(work / "ext")
         return repack_progress_suffix(repacked, pid, original_size, unpacked_size)
 
-    def stage(name: str, cmd: list, suffix_fn=None) -> bool:
-        nonlocal failed_stage, failed_rc, failed_out
+    def timed_run(name: str, cmd: list, suffix_fn=None) -> tuple:
         if args.verbose:
             log("+ " + " ".join(str(c) for c in cmd))
+        start = time.monotonic()
         rc, out = run(cmd, label=f"testing {base} ({name})",
                       heartbeat=args.heartbeat, start=test_t0,
                       counter_suffix=_progress(progress), suffix_fn=suffix_fn)
+        stage_seconds[name] = time.monotonic() - start
+        return rc, out
+
+    def stage(name: str, cmd: list, suffix_fn=None) -> bool:
+        nonlocal failed_stage, failed_rc, failed_out
+        rc, out = timed_run(name, cmd, suffix_fn)
         buf.append("$ " + " ".join(str(c) for c in cmd))
         if out.strip():
             buf.append(out.rstrip("\n"))
@@ -757,12 +773,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     # failed stage, not a diff to compare.
     warning = None
     if ok:
-        if args.verbose:
-            log("+ tarpm -t -f " + str(rpm))
-        rc, list_orig = run(["tarpm", "-t", "-f", str(rpm)],
-                            label=f"testing {base} (list-original)",
-                            heartbeat=args.heartbeat, start=test_t0,
-                            counter_suffix=_progress(progress))
+        rc, list_orig = timed_run("list-original", ["tarpm", "-t", "-f", str(rpm)])
         (work / "list-orig.txt").write_text(list_orig)
         if rc != 0:
             ok = False
@@ -772,12 +783,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             buf.append("$ tarpm -t -f " + str(rpm))
             buf.append(list_orig.strip() or "(no output)")
     if ok:
-        if args.verbose:
-            log("+ tarpm -t -f " + str(repacked))
-        rc, list_repacked = run(["tarpm", "-t", "-f", str(repacked)],
-                                label=f"testing {base} (list-repacked)",
-                                heartbeat=args.heartbeat, start=test_t0,
-                                counter_suffix=_progress(progress))
+        rc, list_repacked = timed_run("list-repacked", ["tarpm", "-t", "-f", str(repacked)])
         (work / "list-repacked.txt").write_text(list_repacked)
         if rc != 0:
             ok = False
@@ -793,13 +799,17 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             list_orig.splitlines(), list_repacked.splitlines(),
             fromfile="original", tofile="repacked", lineterm="")))
 
+    duration = time.monotonic() - test_t0
+    buf.append("timings: " + ", ".join(f"{name}={seconds:.3f}s"
+                                       for name, seconds in stage_seconds.items()))
     logfile.write_text("\n".join(buf) + "\n")
 
     res = TestResult(rpm=str(rpm), nvr=nvr, arch=arch, ok=ok,
                      stage=failed_stage, exit_code=failed_rc,
                      warning=warning, log=logfile,
-                     signature="" if ok else error_signature(failed_out))
-    tail = _test_tail(progress, time.monotonic() - test_t0)
+                     signature="" if ok else error_signature(failed_out),
+                     duration_seconds=duration, stage_seconds=stage_seconds)
+    tail = _test_tail(progress, duration)
     if not ok:
         log(f"[test]   {base} FAIL (stage: {failed_stage}, exit {failed_rc}; "
               f"log: {logfile}){tail}")
@@ -1077,10 +1087,121 @@ def result_summary(fetch: list | None, test: list | None) -> dict:
     return summary
 
 
+def timing_summary(fetch: list | None, test: list | None) -> dict:
+    """Aggregate measured command times; parallel worker time is not session time."""
+    samples = {}
+    for result in fetch or []:
+        if result.duration_seconds is not None:
+            samples.setdefault("fetch", []).append((result.duration_seconds, result.nvr))
+    for result in test or []:
+        for stage, seconds in result.stage_seconds.items():
+            samples.setdefault(stage, []).append((seconds, rpm_label(result.rpm)))
+    summary = {}
+    for stage, values in samples.items():
+        total = sum(seconds for seconds, _ in values)
+        slowest = sorted(values, key=lambda item: (-item[0], item[1]))[:5]
+        summary[stage] = {"count": len(values), "total_seconds": total,
+                          "mean_seconds": total / len(values),
+                          "max_seconds": slowest[0][0],
+                          "slowest": [{"name": name, "seconds": seconds}
+                                      for seconds, name in slowest]}
+    return summary
+
+
+def comparison_cases(rows: list, phase: str) -> dict:
+    """Index exact build/RPM identities, independent of download directory."""
+    cases = {}
+    for row in rows:
+        if dataclasses.is_dataclass(row):
+            row = dataclasses.asdict(row)
+        if (not isinstance(row, dict) or not isinstance(row.get("nvr"), str)
+                or not row["nvr"] or not isinstance(row.get("ok"), bool)):
+            raise ValueError(f"invalid {phase} result: expected nvr and boolean ok")
+        for field in ("stage", "signature", "error", "warning"):
+            if row.get(field) is not None and not isinstance(row[field], str):
+                raise ValueError(f"invalid {phase} result: {field} must be text or null")
+        if (row.get("exit_code") is not None
+                and type(row["exit_code"]) is not int):
+            raise ValueError(f"invalid {phase} result: exit_code must be an integer or null")
+        rpm = None
+        if phase == "test":
+            if not isinstance(row.get("rpm"), str) or not row["rpm"]:
+                raise ValueError("invalid test result: expected rpm")
+            rpm = Path(row["rpm"]).name
+        key = (row["nvr"], rpm)
+        if key in cases:
+            raise ValueError(f"duplicate {phase} result: {rpm or row['nvr']}")
+        cases[key] = {"nvr": row["nvr"], "rpm": rpm, "ok": row["ok"],
+                      "warning": row.get("warning"),
+                      "stage": "fetch" if phase == "fetch" else row.get("stage") or "unknown",
+                      "exit_code": row.get("exit_code"),
+                      "signature": "" if row["ok"] else (
+                          row.get("signature") or error_signature(row.get("error") or "")
+                          or "(no diagnostic output)")}
+    return cases
+
+
+def read_comparison_report(path: Path) -> dict:
+    """Load and validate a JSON baseline before any downloads or cleanup."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("expected a JSON report object")
+        if not all(isinstance(payload.get(phase), list) for phase in ("fetch", "test")):
+            raise ValueError("expected fetch and test result arrays")
+        cases = {phase: comparison_cases(payload[phase], phase) for phase in ("fetch", "test")}
+        session = payload.get("session")
+        if session is not None and not isinstance(session, dict):
+            raise ValueError("session must be an object or null")
+        tarpm = session.get("tarpm") if session else None
+        if tarpm is not None:
+            if not isinstance(tarpm, dict) or not isinstance(tarpm.get("package"), dict):
+                raise ValueError("tarpm metadata must contain a package object")
+            if any(not isinstance(value, str) for value in tarpm['package'].values()):
+                raise ValueError("tarpm package fields must be text")
+        return {"source": str(path), "generated": payload.get("generated"),
+                "tag": payload.get("tag"),
+                "tarpm": tarpm,
+                "cases": cases}
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"cannot compare with {path}: {exc}") from exc
+
+
+def compare_results(baseline: dict, fetch: list | None, test: list | None) -> dict:
+    """Only overlapping identities can regress or resolve; omissions remain unverified."""
+    comparison = {key: baseline[key] for key in ("source", "generated", "tag", "tarpm")}
+    for phase, results in (("fetch", fetch), ("test", test)):
+        previous = baseline['cases'][phase]
+        current = comparison_cases(results or [], phase)
+        shared = current.keys() & previous.keys()
+        changes = {"rechecked": len(shared), "new_cases": len(current.keys() - previous.keys()),
+                   "not_rechecked": len(previous.keys() - current.keys()),
+                   "regressions": [], "resolved": [], "persistent": [],
+                   "changed_failures": [], "first_seen_failures": []}
+        for key in sorted(current):
+            after = current[key]
+            before = previous.get(key)
+            entry = {"nvr": after['nvr'], "rpm": after['rpm'],
+                     "before": before, "after": after}
+            if before is None:
+                if not after['ok']:
+                    changes['first_seen_failures'].append(entry)
+            elif before['ok'] and not after['ok']:
+                changes['regressions'].append(entry)
+            elif not before['ok'] and after['ok']:
+                changes['resolved'].append(entry)
+            elif not before['ok'] and not after['ok']:
+                changes['persistent'].append(entry)
+                if any(before[key] != after[key] for key in ("stage", "exit_code", "signature")):
+                    changes['changed_failures'].append(entry)
+        comparison[phase] = changes
+    return comparison
+
+
 def write_report(args, fetch: list | None, test: list | None,
                  runtime: float, tag_source: str | None = None,
                  interrupted: bool = False, total_selected: int = 0,
-                 session: dict | None = None) -> Path:
+                 session: dict | None = None, comparison: dict | None = None) -> Path:
     report = Path(args.report)
     fetch_failed = [r for r in (fetch or []) if not r.ok]
     test_failed = [r for r in (test or []) if not r.ok]
@@ -1140,7 +1261,7 @@ def write_report(args, fetch: list | None, test: list | None,
     A(f"downloads: {args.dir}")
     A(f"run log:   {args.run_log if args.run_log else '- (disabled)'}")
 
-    # Rank common failures before the potentially very long per-RPM log tails.
+    # Keep ranked failures ahead of comparison details and per-RPM log tails.
     for phase in ("fetch", "test"):
         groups = failure_summary(fetch, test, phase)
         if not groups:
@@ -1151,6 +1272,52 @@ def write_report(args, fetch: list | None, test: list | None,
             A(f"- {group['count']}x ({group['percent_of_failures']:.1f}% of {phase} failures) "
               f"stage {group['stage']}, exit {group['exit_code']}: {group['signature']}")
             A(f"    e.g. {', '.join(group['examples'])}")
+
+    if comparison:
+        A("")
+        A("=== COMPARISON WITH PREVIOUS RUN ===")
+        A(f"baseline: {comparison['source']} (generated: {comparison['generated']}; "
+          f"tag: {comparison['tag']})")
+        previous_tarpm = comparison['tarpm']
+        if isinstance(previous_tarpm, dict):
+            A(f"previous tarpm: {package_label(previous_tarpm)}")
+        A("Only exact build/RPM matches can regress or resolve; omitted cases are not resolved.")
+        for phase in ("fetch", "test"):
+            changes = comparison[phase]
+            A(f"{phase}: {changes['rechecked']} rechecked, {changes['new_cases']} new cases, "
+              f"{changes['not_rechecked']} not rechecked")
+            A(f"  {len(changes['regressions'])} regressions, {len(changes['resolved'])} resolved, "
+              f"{len(changes['persistent'])} still failing "
+              f"({len(changes['changed_failures'])} changed diagnostics), "
+              f"{len(changes['first_seen_failures'])} first-seen failures")
+
+    timings = timing_summary(fetch, test)
+    if timings:
+        A("")
+        A("=== COMMAND TIMINGS ===")
+        A("Times include failed commands; totals sum workers and may exceed session runtime.")
+        for stage, timing in sorted(timings.items(), key=lambda item: (-item[1]['total_seconds'], item[0])):
+            A(f"- {stage}: {timing['count']} command(s), total {fmt_command_duration(timing['total_seconds'])}, "
+              f"mean {fmt_command_duration(timing['mean_seconds'])}, "
+              f"max {fmt_command_duration(timing['max_seconds'])}")
+            A("    slowest: " + "; ".join(f"{row['name']} ({fmt_command_duration(row['seconds'])})"
+                                              for row in timing['slowest']))
+
+    if comparison:
+        A("")
+        A("=== COMPARISON DETAILS ===")
+        for phase in ("fetch", "test"):
+            for category, label in (("regressions", "REGRESSION"), ("resolved", "RESOLVED"),
+                                    ("changed_failures", "CHANGED FAILURE"),
+                                    ("first_seen_failures", "FIRST-SEEN FAILURE")):
+                for change in comparison[phase][category]:
+                    before, after = change['before'], change['after']
+                    detail = before if category == "resolved" else after
+                    A(f"- {phase} {label} {change['rpm'] or change['nvr']}: "
+                      f"stage {detail['stage']}, exit {detail['exit_code']}: {detail['signature']}")
+                    if category == "changed_failures":
+                        A(f"    previously: stage {before['stage']}, exit {before['exit_code']}: "
+                          f"{before['signature']}")
 
     if fetch is not None and fetch_failed:
         A("")
@@ -1205,7 +1372,7 @@ def write_report(args, fetch: list | None, test: list | None,
 
 
 def write_json(path: Path, args, fetch: list | None, test: list | None,
-              session: dict | None = None) -> None:
+              session: dict | None = None, comparison: dict | None = None) -> None:
     def ser(results):
         return [dataclasses.asdict(r) for r in (results or [])]
 
@@ -1219,6 +1386,8 @@ def write_json(path: Path, args, fetch: list | None, test: list | None,
         "summary": result_summary(fetch, test),
         "failure_types": {phase: failure_summary(fetch, test, phase)
                           for phase in ("fetch", "test")},
+        "timings": timing_summary(fetch, test),
+        "comparison": comparison,
     }
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
 
@@ -1593,6 +1762,9 @@ def parse_args(argv) -> argparse.Namespace:
                          "report-retry-YYYYmmdd-HHMMSS.txt")
     ap.add_argument("--json", metavar="FILE",
                     help="also write the results as JSON to FILE")
+    ap.add_argument("--compare", metavar="FILE",
+                    help="compare exact build/RPM outcomes with a previous JSON report; "
+                         "omitted cases are not treated as resolved")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="echo each external command")
     args = ap.parse_args(argv)
@@ -1606,6 +1778,8 @@ def parse_args(argv) -> argparse.Namespace:
         ap.error("--heartbeat expects a non-negative integer")
     if args.no_test and args.test_only:
         ap.error("--no-test is incompatible with --test-only")
+    if args.compare and args.list:
+        ap.error("--compare is incompatible with --list")
     if args.list and args.test_only:
         ap.error("--list is incompatible with --test-only")
     if args.refresh and args.from_file:
@@ -1637,6 +1811,11 @@ def main(argv=None) -> int:
     t0 = time.monotonic()
     started = datetime.now(timezone.utc).isoformat()
     args = parse_args(argv)
+    try:
+        baseline = read_comparison_report(Path(args.compare)) if args.compare else None
+    except UsageError as exc:
+        log(f"{PROG}: error: {exc}", err=True)
+        return 2
     if args.run_log:
         RUNLOG.open(args.run_log)
     # One header per invocation (a no-op when the run log is disabled);
@@ -1842,6 +2021,8 @@ def main(argv=None) -> int:
 
     fetch_for_report = fetch_results if do_fetch else None
     test_for_report = test_results if do_test else None
+    comparison = (compare_results(baseline, fetch_for_report, test_for_report)
+                  if baseline is not None else None)
     any_failed = any(not r.ok for r in fetch_results + test_results)
     session.update(finished=datetime.now(timezone.utc).isoformat(),
                    runtime_seconds=time.monotonic() - t0,
@@ -1851,10 +2032,19 @@ def main(argv=None) -> int:
     report = write_report(args, fetch_for_report, test_for_report,
                           session['runtime_seconds'], tag_source,
                           interrupted=interrupted,
-                          total_selected=total_selected, session=session)
+                          total_selected=total_selected, session=session, comparison=comparison)
     write_failure_lists(args, fetch_for_report, test_for_report)
     if args.json:
-        write_json(Path(args.json), args, fetch_for_report, test_for_report, session=session)
+        write_json(Path(args.json), args, fetch_for_report, test_for_report,
+                   session=session, comparison=comparison)
+
+    if comparison:
+        for phase in ("fetch", "test"):
+            changes = comparison[phase]
+            log(f"{PROG}: comparison ({phase}): {len(changes['regressions'])} regressions, "
+                f"{len(changes['resolved'])} resolved, {len(changes['persistent'])} still failing, "
+                f"{len(changes['first_seen_failures'])} first-seen failures; "
+                f"{changes['not_rechecked']} not rechecked")
 
     if do_fetch:
         nf = sum(1 for r in fetch_results if not r.ok)

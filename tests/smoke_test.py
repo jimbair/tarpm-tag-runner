@@ -80,6 +80,14 @@ def main():
     report = (output / "resume-and-test.txt").read_text()
     require(session["tarpm"]["rpm_info"] in report,
             "text report must retain the RPM build metadata")
+    expected_stages = {"unpack", "repack", "unpack-repacked", "list-original", "list-repacked"}
+    require(expected_stages <= resumed["timings"].keys(),
+            "summary must include all five command timings")
+    for row in resumed["test"]:
+        require(expected_stages == row["stage_seconds"].keys()
+                and all(seconds > 0 for seconds in row["stage_seconds"].values())
+                and row["duration_seconds"] >= sum(row["stage_seconds"].values()),
+                "each passed RPM must retain all stage timings and its duration")
     require({"src", "x86_64"} <= {row["arch"] for row in resumed["test"]},
             "resume must test source and binary RPMs")
     require(all(not sentinel.exists() for sentinel in sentinels),
@@ -106,7 +114,8 @@ def main():
     require(skipped is None and journal() == before,
             "resume should skip tested builds without writing new results")
 
-    local = invoke("test-only", "--test-only", "--no-src", "-j", "2")
+    local = invoke("test-only", "--test-only", "--no-src", "-j", "2",
+                   "--compare", str(output / "resume-and-test.json"))
     require(local and not local["fetch"] and local["test"],
             "test-only must test downloaded binaries")
     require(all(row["ok"] and row["arch"] != "src" for row in local["test"]),
@@ -116,6 +125,11 @@ def main():
     require(list(downloads.glob("*/*.src.rpm")),
             "test-only must leave skipped source RPMs alone")
     require(journal() == before, "test-only must not update the build journal")
+    comparison = local["comparison"]["test"]
+    require(comparison["rechecked"] == len(local["test"])
+            and comparison["not_rechecked"] == sum(row["arch"] == "src" for row in resumed["test"])
+            and not comparison["regressions"] and not comparison["resolved"],
+            "local comparison must recheck binaries and leave skipped sources unverified")
 
     # Exercise --no-src without -a, where Koji downloads all architectures.
     no_src_dir = output / "no-src-rpms"

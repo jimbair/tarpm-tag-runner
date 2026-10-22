@@ -569,6 +569,175 @@ class ReportPathTests(unittest.TestCase):
         self.assertEqual(mod.parse_args([]).report, "report.txt")
 
 
+class TimingTests(RunnerTestCase):
+    def test_stage_times_include_the_failing_command_and_skip_unreached_stages(self):
+        stages = ["unpack", "repack", "unpack-repacked", "list-original", "list-repacked"]
+        for failure in [None] + stages:
+            with self.subTest(failure=failure):
+                args = mod.parse_args(self.argv + ["--keep"])
+                rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+                rpm.parent.mkdir(parents=True, exist_ok=True)
+                rpm.write_text("rpm")
+                (self.downloads / "logs").mkdir(exist_ok=True)
+                elapsed = 100.0
+                visited = []
+
+                def command(cmd, **kwargs):
+                    nonlocal elapsed
+                    name = stages[len(visited)]
+                    visited.append(name)
+                    elapsed += len(visited) * 2
+                    return (1, "tarpm: failed") if name == failure else (0, "same listing\n")
+
+                with patch.object(mod.time, "monotonic", side_effect=lambda: elapsed), \
+                        patch.object(mod, "run", side_effect=command), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = mod.test_one(rpm, args)
+                expected = stages if failure is None else stages[:stages.index(failure) + 1]
+                self.assertEqual(list(result.stage_seconds), expected)
+                self.assertEqual(result.stage_seconds,
+                                 {name: (i + 1) * 2 for i, name in enumerate(expected)})
+                self.assertEqual(result.duration_seconds, elapsed - 100)
+                self.assertEqual(result.ok, failure is None)
+                self.assertEqual(result.stage, failure)
+                self.assertIn("timings: unpack=2.000s", result.log.read_text())
+
+    def test_fetch_time_and_summary_show_measured_failures_without_inventing_exception_times(self):
+        args = mod.parse_args(self.argv)
+        (self.downloads / "logs").mkdir(parents=True)
+        with patch.object(mod, "run", return_value=(1, "failed download")), \
+                patch.object(mod.time, "monotonic", side_effect=[10, 14.5]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            fetched = mod.fetch_one("demo-1-1", args)
+        self.assertFalse(fetched.ok)
+        self.assertEqual(fetched.duration_seconds, 4.5)
+        fetch = [fetched, mod.FetchResult("unknown-1-1", False, error="worker exception")]
+        tests = [mod.TestResult(f"demo-1-1.{i}.rpm", "demo-1-1", str(i), True,
+                               duration_seconds=i, stage_seconds={"repack": i, "unpack": 0.012})
+                 for i in range(1, 7)]
+        summary = mod.timing_summary(fetch, tests)
+        self.assertEqual(summary['fetch']['count'], 1)
+        self.assertEqual(summary['fetch']['total_seconds'], 4.5)
+        self.assertEqual(summary['repack']['total_seconds'], 21)
+        self.assertEqual(summary['repack']['mean_seconds'], 3.5)
+        self.assertEqual(summary['repack']['max_seconds'], 6)
+        self.assertEqual(len(summary['repack']['slowest']), 5)
+        self.assertEqual(summary['repack']['slowest'][0]['name'], "demo-1-1.6")
+        report = mod.write_report(args, fetch, tests, 10).read_text()
+        self.assertIn("totals sum workers and may exceed session runtime", report)
+        self.assertIn("repack: 6 command(s), total 21.0s", report)
+        self.assertIn("mean 12.0ms", report)
+        path = self.root / "timings.json"
+        mod.write_json(path, args, fetch, tests)
+        data = json.loads(path.read_text())
+        self.assertEqual(data['timings'], summary)
+        self.assertEqual(data['test'][0]['stage_seconds'], {"repack": 1, "unpack": 0.012})
+
+
+class ComparisonTests(RunnerTestCase):
+    def baseline(self, fetch=(), test=()):
+        path = self.root / "baseline.json"
+        # Deliberately use the older schema without session metadata or timings.
+        path.write_text(json.dumps({
+            "generated": "2026-10-21T10:00:00+00:00", "tag": "f44",
+            "fetch": [mod.dataclasses.asdict(row) for row in fetch],
+            "test": [mod.dataclasses.asdict(row) for row in test]}))
+        return path
+
+    def test_exact_identities_distinguish_regressions_resolutions_and_coverage(self):
+        def test(name, ok, signature="", stage="repack", prefix="/previous/rpms"):
+            return mod.TestResult(f"{prefix}/{name}-1-1/{name}-1-1.src.rpm",
+                                  f"{name}-1-1", "src", ok,
+                                  None if ok else stage, None if ok else 1, signature=signature)
+
+        previous = [test("regressed", True), test("resolved", False, "old error"),
+                    test("persistent", False, "same error"),
+                    test("changed", False, "old error"), test("omitted", False, "old error"),
+                    test("rebuilt", False, "old error")]
+        current = [test("regressed", False, "new error", prefix="/new/rpms"),
+                   test("resolved", True), test("persistent", False, "same error"),
+                   test("changed", False, "new error", stage="unpack"),
+                   test("new", False, "new error"),
+                   mod.TestResult("rebuilt-2-1.src.rpm", "rebuilt-2-1", "src", True)]
+        baseline = mod.read_comparison_report(self.baseline(test=previous))
+        comparison = mod.compare_results(baseline, None, current)
+        changes = comparison['test']
+        self.assertEqual(changes['rechecked'], 4)
+        self.assertEqual(changes['new_cases'], 2)
+        self.assertEqual(changes['not_rechecked'], 2)
+        self.assertEqual([row['nvr'] for row in changes['regressions']], ["regressed-1-1"])
+        self.assertEqual([row['nvr'] for row in changes['resolved']], ["resolved-1-1"])
+        self.assertEqual(len(changes['persistent']), 2)
+        self.assertEqual([row['nvr'] for row in changes['changed_failures']], ["changed-1-1"])
+        self.assertEqual([row['nvr'] for row in changes['first_seen_failures']], ["new-1-1"])
+        args = mod.parse_args(self.argv)
+        report = mod.write_report(args, None, current, 5, comparison=comparison).read_text()
+        self.assertIn("REGRESSION regressed-1-1.src.rpm", report)
+        self.assertIn("RESOLVED resolved-1-1.src.rpm", report)
+        self.assertIn("previously: stage repack, exit 1: old error", report)
+        self.assertNotIn("RESOLVED omitted", report)
+        self.assertLess(report.index("=== TEST FAILURES BY TYPE ==="),
+                        report.index("=== COMPARISON DETAILS ==="))
+        path = self.root / "comparison.json"
+        mod.write_json(path, args, None, current, comparison=comparison)
+        self.assertEqual(json.loads(path.read_text())['comparison'], comparison)
+
+    def test_fetch_resolution_does_not_resolve_tests_that_were_not_run(self):
+        path = self.baseline(
+            fetch=[mod.FetchResult("demo-1-1", False, 1, signature="network error")],
+            test=[mod.TestResult("demo-1-1.src.rpm", "demo-1-1", "src", False,
+                                 "repack", 1, signature="payload error")])
+        changes = mod.compare_results(mod.read_comparison_report(path),
+                                      [mod.FetchResult("demo-1-1", True)], None)
+        self.assertEqual(len(changes['fetch']['resolved']), 1)
+        self.assertEqual(changes['test']['resolved'], [])
+        self.assertEqual(changes['test']['not_rechecked'], 1)
+
+    def test_invalid_baselines_fail_before_work_or_output_changes(self):
+        path = self.root / "invalid.json"
+        invalid = ["not JSON", "[]", '{}', '{"fetch": [], "test": null}',
+                   '{"fetch": [{"nvr": "demo-1-1", "ok": "false"}], "test": []}',
+                   '{"fetch": [], "test": [{"nvr": "demo-1-1", "ok": true}]}',
+                   '{"fetch": [], "test": [], "session": {"tarpm": {"package": null}}}',
+                   json.dumps({"fetch": [{"nvr": "demo-1-1", "ok": True}] * 2, "test": []})]
+        for contents in invalid:
+            with self.subTest(contents=contents):
+                path.write_text(contents)
+                with patch.object(mod, "fetch_one") as fetch, \
+                        patch.object(mod, "process_build") as process:
+                    self.assertEqual(self.run_main("--no-test", "--compare", str(path)), 2)
+                fetch.assert_not_called()
+                process.assert_not_called()
+                self.assertFalse(self.downloads.exists())
+                self.assertFalse((self.root / "report.txt").exists())
+        with self.assertRaises(mod.UsageError):
+            mod.read_comparison_report(self.root / "missing.json")
+
+    def test_main_loads_baseline_before_overwriting_the_same_json_path(self):
+        path = self.baseline(fetch=[mod.FetchResult("demo-1-1", False, 1, signature="network error")])
+        with patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
+            self.assertEqual(self.run_main("--no-test", "--compare", str(path),
+                                           "--json", str(path)), 0)
+        data = json.loads(path.read_text())
+        self.assertEqual(len(data['comparison']['fetch']['resolved']), 1)
+        self.assertEqual(data['comparison']['generated'], "2026-10-21T10:00:00+00:00")
+        self.assertIn("1 resolved", (self.root / "report.txt").read_text())
+
+    def test_current_failure_still_exits_one_when_comparison_is_text_only(self):
+        path = self.baseline(fetch=[mod.FetchResult("demo-1-1", True)])
+        failed = mod.FetchResult("demo-1-1", False, 1, signature="download failed")
+        with patch.object(mod, "fetch_one", return_value=failed):
+            self.assertEqual(self.run_main("--no-test", "--compare", str(path)), 1)
+        report = (self.root / "report.txt").read_text()
+        self.assertIn("fetch REGRESSION demo-1-1", report)
+        self.assertIn("1 regressions", report)
+
+    def test_list_cannot_silently_ignore_comparison(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
+            mod.parse_args(["--list", "--compare", "baseline.json"])
+        self.assertEqual(exc.exception.code, 2)
+
+
 class BuildPathTests(RunnerTestCase):
     def test_test_only_rejects_symlink_before_testing_any_rpm(self):
         outside = self.root / "outside-1-1"

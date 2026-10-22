@@ -60,6 +60,7 @@ architectures plus source RPMs. Koji's default debuginfo exclusion applies.
 | `-j N` | Parallel builds in normal runs; parallel RPMs in `--test-only`. |
 | `-r FILE` | Text report path. |
 | `--json FILE` | Also write per-build fetch and per-RPM test results as JSON. |
+| `--compare FILE` | Compare outcomes with a previous JSON report; incompatible with `--list`. |
 | `--run-log FILE` | Append runner log lines to FILE; default `DIR/run.log`. |
 | `--no-run-log` | Disable the run log. |
 | `--heartbeat N` | Log progress every N seconds during external commands; default 60, `0` disables. |
@@ -245,6 +246,56 @@ run-log path, and retained warning logs.
 | `session` | Start/end, numeric `runtime_seconds`, status, interruption flag, command argument list, settings, system details, and `tarpm` package fields/full `rpm_info`/query error (`tarpm` is null for fetch-only). |
 | `summary` | Counts for each enabled phase; test counts include `clean_passed` and `warnings` (`ok` includes warnings). |
 | `failure_types` | Ranked `fetch` and `test` groups with stage, exit code, signature, count, `percent_of_failures`, and examples. |
+| `timings` | Per-command-stage counts, total/mean/max seconds, and up to five slowest builds or RPMs. |
+| `comparison` | Baseline identity and per-phase outcome changes when `--compare` is used; otherwise null. |
+
+Each fetch result includes `duration_seconds` for its download command.
+Each test result includes `duration_seconds` for its round-trip before
+cleanup and a `stage_seconds` map for the commands reached: `unpack`,
+`repack`, `unpack-repacked`, `list-original`, and `list-repacked`. Timings
+use a monotonic clock and include commands that returned a failure.
+Unreached stages have no entry; results without a completed measurement
+(such as runner exceptions) have a null duration and an empty stage map.
+The text report ranks stages by total command time and names the five
+slowest inputs for each. Totals sum parallel workers and can exceed session
+runtime; averages include only measured commands. Per-test logs also retain
+stage timings when the log is kept. Subsecond command times display in
+milliseconds in the text summary.
+
+Use a saved JSON report as a baseline to see what changed after updating
+tarpm:
+
+```bash
+python3 tarpm-tag-runner.py -t f44 -p hello -a x86_64 --json baseline.json
+# After updating tarpm, repeat the same selection:
+python3 tarpm-tag-runner.py -t f44 -p hello -a x86_64 \
+    --compare baseline.json --json current.json
+```
+
+Comparison works in text reports without requiring a new `--json` output.
+It identifies a fetch by exact build NVR, and a test by exact build NVR and
+RPM filename, regardless of download directory. Its summary separates:
+
+- **Regressions:** previously passed, now failed.
+- **Resolved:** previously failed, now passed (possibly with a warning).
+- **Still failing:** failed both times; changed stage, exit code, or
+  normalized signature is reported separately within these failures.
+- **First-seen failures:** failed now with no matching baseline result.
+- **Not rechecked:** baseline results absent from the current invocation.
+
+Filtered, resumed, interrupted, and fetch-only runs cannot establish that
+omitted tests passed. An RPM from a newer build is a new case rather than
+evidence that an older build's failure was resolved. Comparisons report
+observed outcome changes without attributing them to tarpm alone; use the
+same selection and environment when evaluating a tarpm update. The baseline
+path, generation time, tag, and tarpm package (when available) appear in the
+report. Older JSON reports without session metadata are supported.
+
+The baseline is read and validated before work begins, so invalid or
+ambiguous results fail with exit status 2 before downloads or cleanup.
+Using the same file for `--compare` and `--json` compares against its old
+contents before replacing it. Comparison does not alter the usual exit
+status: current failures still exit 1, and interruption still exits 130.
 
 An error signature takes the last `tarpm: ` output line (prefix removed),
 or the last nonempty line otherwise. Common absolute paths become
