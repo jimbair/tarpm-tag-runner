@@ -211,18 +211,47 @@ to trust as test inputs.
 ## Reports, logs, and failure lists
 
 The text report defaults to `./report.txt`, **outside** the download
-directory. It records the selection, counts, runtime, tag-list source,
-run-log path, retained warning logs, and failures with log tails (15 lines
-for fetches, 20 for tests) or runner exception text. Failure rollups group
-by stage, exit code, and error signature, with up to three example builds
-or RPMs per group; the console prints the five most common types.
-`--json` includes individual results, warning/log paths, exception text,
-and signatures.
+directory. Its opening summary records UTC session start/end times,
+wall-clock runtime, completion/interruption status, the invocation command,
+mode, worker count, architecture/source selections, package filters, and
+system/Python versions. Runtime covers the current invocation through worker
+completion, including setup and downloads; it is not cumulative across
+`--resume` or retry invocations and does not sum parallel worker times.
+Test counts distinguish clean passes, passes with warnings, and failures,
+and include the percentage of tested RPMs that failed.
+
+Before testing, the runner identifies the `tarpm` executable selected from
+`PATH` and queries its owning RPM with `rpm -qi --file <resolved-binary>`.
+The summary shows its package name, version, release, and architecture
+(including a nonzero epoch). The full RPM metadata is included at the end
+of the report, preserving COPR build details such as build date and source
+RPM. It does not use `tarpm --version`. A missing `rpm` command, unowned
+executable, failed query, or five-second query timeout is reported without
+preventing tests. Fetch-only runs skip the query.
+
+Failure rollups appear **before individual failure logs**, sorted by count,
+and group by stage, exit code, and error signature. Each group shows its
+count, percentage of failures in that phase, and up to three example builds
+or RPMs; the console prints the five most common types. Counts represent
+failed build downloads for fetches and failed RPM tests for tests. Detailed
+failures retain log tails (15 lines for fetches, 20 for tests), signatures,
+and runner exception text. The report also records the tag-list source,
+run-log path, and retained warning logs.
+
+`--json` retains the individual `fetch` and `test` result arrays and adds:
+
+| Field | Contents |
+| --- | --- |
+| `session` | Start/end, numeric `runtime_seconds`, status, interruption flag, command argument list, settings, system details, and `tarpm` package fields/full `rpm_info`/query error (`tarpm` is null for fetch-only). |
+| `summary` | Counts for each enabled phase; test counts include `clean_passed` and `warnings` (`ok` includes warnings). |
+| `failure_types` | Ranked `fetch` and `test` groups with stage, exit code, signature, count, `percent_of_failures`, and examples. |
 
 An error signature takes the last `tarpm: ` output line (prefix removed),
 or the last nonempty line otherwise. Common absolute paths become
 `<path>`; hex addresses and runs of four or more digits become `N`. The
-result is truncated to 120 characters for grouping.
+result is truncated to 120 characters for grouping. If no signature was
+captured, grouping uses normalized runner exception text or the explicit
+`(no diagnostic output)` label.
 
 Every report replaces the failure lists in `DIR/logs/`; a report with no
 failures removes old lists. Lists contain sorted, deduplicated NVRs,

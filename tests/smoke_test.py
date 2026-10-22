@@ -71,6 +71,15 @@ def main():
     resumed = invoke("resume-and-test", "--resume", "--keep")
     require(resumed and resumed["test"] and all(row["ok"] for row in resumed["test"]),
             "resume must round-trip the fetched hello RPMs")
+    session = resumed["session"]
+    require(session["runtime_seconds"] > 0 and session["status"] == "passed",
+            "session must record runtime and completion status")
+    require(not session["tarpm"]["error"] and session["tarpm"]["rpm_info"]
+            and session["tarpm"]["package"].get("release"),
+            "report must identify the installed tarpm RPM build")
+    report = (output / "resume-and-test.txt").read_text()
+    require(session["tarpm"]["rpm_info"] in report,
+            "text report must retain the RPM build metadata")
     require({"src", "x86_64"} <= {row["arch"] for row in resumed["test"]},
             "resume must test source and binary RPMs")
     require(all(not sentinel.exists() for sentinel in sentinels),

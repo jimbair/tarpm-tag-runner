@@ -59,7 +59,9 @@ import difflib
 import hashlib
 import json
 import os
+import platform
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -954,6 +956,59 @@ def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
 # report
 # ---------------------------------------------------------------------------
 
+def tarpm_package_info() -> dict:
+    """Identify the executable being tested using its owning RPM, once per session.
+
+    Keep the full rpm -qi output for COPR build provenance. An unavailable
+    RPM database or a locally built executable must not prevent testing.
+    """
+    executable = shutil.which("tarpm")
+    info = {"executable": executable, "package": {}, "rpm_info": None,
+            "error": None}
+    if executable is None:
+        info["error"] = "tarpm not found in PATH"
+        return info
+    try:
+        # Follow symlinks so alternatives and /bin -> /usr/bin still query
+        # the package owning the executable actually selected from PATH.
+        result = subprocess.run(
+            ["rpm", "-qi", "--file", str(Path(executable).resolve())],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "LC_ALL": "C"}, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        info["error"] = f"RPM metadata unavailable: {exc}"
+        return info
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        info["error"] = f"rpm -qi failed (exit {result.returncode}): {detail}"
+        return info
+    info["rpm_info"] = result.stdout.strip()
+    fields = {"Name": "name", "Epoch": "epoch", "Version": "version",
+              "Release": "release", "Architecture": "arch"}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() in fields:
+            info["package"][fields[key.strip()]] = value.strip()
+    if not all(info["package"].get(k) for k in ("name", "version", "release", "arch")):
+        info["error"] = "rpm -qi returned incomplete package identity; see RPM metadata"
+    return info
+
+
+def package_label(info: dict) -> str:
+    package = info.get("package", {})
+    if not all(package.get(k) for k in ("name", "version", "release", "arch")):
+        return "unknown"
+    epoch = package.get("epoch")
+    prefix = f"{epoch}:" if epoch and epoch not in ("0", "(none)") else ""
+    return (f"{package['name']}-{prefix}{package['version']}-"
+            f"{package['release']}.{package['arch']}")
+
+
+def result_signature(result) -> str:
+    """Retain captured signatures, with useful fallbacks for worker exceptions."""
+    return result.signature or error_signature(result.error or "") or "(no diagnostic output)"
+
+
 def tail(text: str, n: int) -> str:
     lines = text.splitlines()
     if not lines:
@@ -985,11 +1040,11 @@ def failure_types(fetch: list | None, test: list | None,
     if phase in (None, "fetch"):
         for r in fetch or []:
             if not r.ok:
-                add("fetch", r.exit_code, r.signature, r.nvr)
+                add("fetch", r.exit_code, result_signature(r), r.nvr)
     if phase in (None, "test"):
         for r in test or []:
             if not r.ok:
-                add(r.stage or "unknown", r.exit_code, r.signature,
+                add(r.stage or "unknown", r.exit_code, result_signature(r),
                     rpm_label(r.rpm))
     rows = []
     for (stage, exit_code, signature), names in groups.items():
@@ -999,9 +1054,33 @@ def failure_types(fetch: list | None, test: list | None,
     return rows
 
 
+def failure_summary(fetch: list | None, test: list | None, phase: str) -> list:
+    rows = failure_types(fetch, test, phase)
+    total = sum(row[3] for row in rows)
+    return [{"stage": stage, "exit_code": rc, "signature": sig,
+             "count": count, "percent_of_failures": round(100 * count / total, 1),
+             "examples": examples}
+            for stage, rc, sig, count, examples in rows]
+
+
+def result_summary(fetch: list | None, test: list | None) -> dict:
+    summary = {}
+    for phase, results in (("fetch", fetch), ("test", test)):
+        if results is None:
+            continue
+        failed = sum(not r.ok for r in results)
+        counts = {"total": len(results), "ok": len(results) - failed, "failed": failed}
+        if phase == "test":
+            warned = sum(bool(r.ok and r.warning) for r in results)
+            counts.update(warnings=warned, clean_passed=counts["ok"] - warned)
+        summary[phase] = counts
+    return summary
+
+
 def write_report(args, fetch: list | None, test: list | None,
                  runtime: float, tag_source: str | None = None,
-                 interrupted: bool = False, total_selected: int = 0) -> Path:
+                 interrupted: bool = False, total_selected: int = 0,
+                 session: dict | None = None) -> Path:
     report = Path(args.report)
     fetch_failed = [r for r in (fetch or []) if not r.ok]
     test_failed = [r for r in (test or []) if not r.ok]
@@ -1010,9 +1089,29 @@ def write_report(args, fetch: list | None, test: list | None,
     L = []
     A = L.append
     A(f"=== {PROG} report ===")
-    A(f"generated: {now_utc()}")
+    A(f"generated: {session['finished'] if session else now_utc()}")
     A(f"tag:       {args.tag}")
     A(f"runtime:   {fmt_duration(runtime)}")
+    if session:
+        A(f"started:   {session['started']}")
+        A(f"status:    {session['status']}")
+        A(f"command:   {shlex.join(session['command'])}")
+        A(f"mode:      {session['mode']}; workers: {args.jobs}")
+        A(f"arches:    {', '.join(args.arch) if args.arch else 'all'} "
+          f"(includes noarch; source RPMs {'excluded' if args.no_src else 'included'})")
+        A(f"filters:   packages={', '.join(args.pkg) or 'all'}; limit={args.limit or 'none'}; "
+          f"resume={args.resume}; retry-failed={args.retry_failed}; keep={args.keep}")
+        system = session['system']
+        A(f"system:    {system['system']} {system['release']} {system['machine']}; "
+          f"Python {system['python']}")
+        info = session['tarpm']
+        if info is None:
+            A("tarpm:     not used (fetch only)")
+        else:
+            A(f"tarpm:     {package_label(info)} (RPM package)")
+            A(f"binary:    {info['executable']}")
+            if info['error']:
+                A(f"RPM query: {info['error']}")
     if interrupted:
         A("interrupted: yes (Ctrl+C; partial results)")
     if fetch is not None:
@@ -1028,13 +1127,30 @@ def write_report(args, fetch: list | None, test: list | None,
         A("--- test (tarpm unpack -> repack -> unpack) ---")
         A(f"rpms:     {len(test)}")
         A(f"ok:       {len(test) - len(test_failed)}")
+        A(f"clean:    {len(test) - len(test_failed) - len(test_warn)}")
         A(f"failed:   {len(test_failed)}")
         A(f"warnings: {len(test_warn)}")
+        if test:
+            A(f"failure rate: {100 * len(test_failed) / len(test):.1f}% of tested RPMs")
+        if session and 'selected_rpms' in session:
+            A(f"selected: {session['selected_rpms']} RPM(s); completed: {len(test)}")
         if not args.keep:
             A(f"removed:  {len(test) - len(test_failed)} passed RPM(s) "
               f"(failures kept)")
     A(f"downloads: {args.dir}")
     A(f"run log:   {args.run_log if args.run_log else '- (disabled)'}")
+
+    # Rank common failures before the potentially very long per-RPM log tails.
+    for phase in ("fetch", "test"):
+        groups = failure_summary(fetch, test, phase)
+        if not groups:
+            continue
+        A("")
+        A(f"=== {phase.upper()} FAILURES BY TYPE ===")
+        for group in groups:
+            A(f"- {group['count']}x ({group['percent_of_failures']:.1f}% of {phase} failures) "
+              f"stage {group['stage']}, exit {group['exit_code']}: {group['signature']}")
+            A(f"    e.g. {', '.join(group['examples'])}")
 
     if fetch is not None and fetch_failed:
         A("")
@@ -1046,6 +1162,7 @@ def write_report(args, fetch: list | None, test: list | None,
                 A(f"--- {r.nvr} ---")
             if r.error:
                 A(f"    error: {r.error}")
+            A(f"    signature: {result_signature(r)}")
             if r.log is not None and r.log.is_file():
                 A(f"log: {r.log}")
                 A(tail(r.log.read_text(), 15))
@@ -1064,6 +1181,7 @@ def write_report(args, fetch: list | None, test: list | None,
                 A(f"--- {rpm_label(r.rpm)} (stage: {r.stage}) ---")
             if r.error:
                 A(f"    error: {r.error}")
+            A(f"    signature: {result_signature(r)}")
             if r.log is not None and r.log.is_file():
                 A(f"log: {r.log}")
                 A(tail(r.log.read_text(), 20))
@@ -1077,36 +1195,30 @@ def write_report(args, fetch: list | None, test: list | None,
         for r in test_warn:
             A(f"- {rpm_label(r.rpm)}: {r.warning} (see {r.log})")
 
-    if fetch is not None and fetch_failed:
+    if session and session['tarpm'] and session['tarpm']['rpm_info']:
         A("")
-        A("=== FETCH FAILURES BY TYPE ===")
-        for stage, rc, sig, count, examples in failure_types(fetch, None,
-                                                             "fetch"):
-            A(f"- {count}x stage {stage}, exit {rc}: {sig}")
-            A(f"    e.g. {', '.join(examples)}")
-
-    if test is not None and test_failed:
-        A("")
-        A("=== TEST FAILURES BY TYPE ===")
-        for stage, rc, sig, count, examples in failure_types(None, test,
-                                                             "test"):
-            A(f"- {count}x stage {stage}, exit {rc}: {sig}")
-            A(f"    e.g. {', '.join(examples)}")
+        A("=== TARPM RPM METADATA (rpm -qi --file <binary>, captured before testing) ===")
+        A(session['tarpm']['rpm_info'])
 
     report.write_text("\n".join(L) + "\n")
     return report
 
 
-def write_json(path: Path, args, fetch: list | None, test: list | None) -> None:
+def write_json(path: Path, args, fetch: list | None, test: list | None,
+              session: dict | None = None) -> None:
     def ser(results):
         return [dataclasses.asdict(r) for r in (results or [])]
 
     payload = {
-        "generated": datetime.now(timezone.utc).isoformat(),
+        "generated": session['finished'] if session else datetime.now(timezone.utc).isoformat(),
         "tag": args.tag,
         "downloads": args.dir,
         "fetch": ser(fetch),
         "test": ser(test),
+        "session": session,
+        "summary": result_summary(fetch, test),
+        "failure_types": {phase: failure_summary(fetch, test, phase)
+                          for phase in ("fetch", "test")},
     }
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
 
@@ -1322,10 +1434,10 @@ def failure_rows(fetch: list | None, test: list | None) -> list:
     rows = []
     for r in fetch or []:
         if not r.ok:
-            rows.append(("fetch", r.signature, r.nvr, "", r.exit_code))
+            rows.append(("fetch", result_signature(r), r.nvr, "", r.exit_code))
     for r in test or []:
         if not r.ok:
-            rows.append((r.stage or "unknown", r.signature, r.nvr,
+            rows.append((r.stage or "unknown", result_signature(r), r.nvr,
                          rpm_label(r.rpm), r.exit_code))
     return rows
 
@@ -1523,6 +1635,7 @@ def parse_args(argv) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     t0 = time.monotonic()
+    started = datetime.now(timezone.utc).isoformat()
     args = parse_args(argv)
     if args.run_log:
         RUNLOG.open(args.run_log)
@@ -1545,6 +1658,20 @@ def main(argv=None) -> int:
         log(f"{PROG}: error: tarpm not found in PATH (needed for the "
               f"test phase; use --no-test to fetch only)", err=True)
         return 2
+
+    session = {
+        "started": started,
+        "command": [sys.executable, str(Path(__file__).resolve()),
+                    *(argv if argv is not None else sys.argv[1:])],
+        "mode": "test-only" if args.test_only else "fetch-and-test" if do_test else "fetch-only",
+        "settings": {"jobs": args.jobs, "architectures": args.arch,
+                     "include_source": not args.no_src, "packages": args.pkg,
+                     "limit": args.limit, "keep": args.keep, "resume": args.resume,
+                     "retry_failed": args.retry_failed},
+        "system": {"system": platform.system(), "release": platform.release(),
+                   "machine": platform.machine(), "python": platform.python_version()},
+        "tarpm": None,
+    }
 
     tag_source = None
     fetch_results: list = []
@@ -1631,11 +1758,12 @@ def main(argv=None) -> int:
             # A worker exception is journaled like a fetch failure so
             # --retry-failed can pick the build up again.
             fetch = FetchResult(nvr=nvr, ok=False, error=repr(exc),
-                                signature="exception")
+                                signature=error_signature(repr(exc)))
             JOURNAL.append(journal_record(nvr, fetch, [], run_id=run_id))
             return fetch
 
         if do_test:
+            session['tarpm'] = tarpm_package_info()
             # Default: pipeline per build — fetch, test, clean up — with
             # -j builds in flight, so disk use stays bounded to the builds
             # in flight plus the failures.
@@ -1688,6 +1816,8 @@ def main(argv=None) -> int:
             log(f"{PROG}: error: no RPMs found to test under {args.dir}",
                   err=True)
             return 2
+        session['selected_rpms'] = len(units)
+        session['tarpm'] = tarpm_package_info()
         log(f"{PROG}: testing {len(units)} RPM(s) with tarpm "
               f"(parallelism: {args.jobs})")
         test_counter = Counter(len(units))
@@ -1712,18 +1842,22 @@ def main(argv=None) -> int:
 
     fetch_for_report = fetch_results if do_fetch else None
     test_for_report = test_results if do_test else None
+    any_failed = any(not r.ok for r in fetch_results + test_results)
+    session.update(finished=datetime.now(timezone.utc).isoformat(),
+                   runtime_seconds=time.monotonic() - t0,
+                   interrupted=interrupted, selected_builds=total_selected if do_fetch else None,
+                   tag_source=tag_source,
+                   status="interrupted" if interrupted else "failed" if any_failed else "passed")
     report = write_report(args, fetch_for_report, test_for_report,
-                          time.monotonic() - t0, tag_source,
+                          session['runtime_seconds'], tag_source,
                           interrupted=interrupted,
-                          total_selected=total_selected)
+                          total_selected=total_selected, session=session)
     write_failure_lists(args, fetch_for_report, test_for_report)
     if args.json:
-        write_json(Path(args.json), args, fetch_for_report, test_for_report)
+        write_json(Path(args.json), args, fetch_for_report, test_for_report, session=session)
 
-    any_failed = False
     if do_fetch:
         nf = sum(1 for r in fetch_results if not r.ok)
-        any_failed = any_failed or nf > 0
         if interrupted:
             log(f"{PROG}: fetch: {len(fetch_results)} of "
                   f"{total_selected} build(s) completed, "
@@ -1735,7 +1869,6 @@ def main(argv=None) -> int:
     if do_test:
         nt = sum(1 for r in test_results if not r.ok)
         nw = sum(1 for r in test_results if r.ok and r.warning)
-        any_failed = any_failed or nt > 0
         log(f"{PROG}: test:  {len(test_results)} RPM(s), "
               f"{len(test_results) - nt} ok, {nt} failed, {nw} warning(s).")
         if not args.keep and len(test_results) - nt:

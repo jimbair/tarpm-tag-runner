@@ -54,6 +54,12 @@ class RunnerTestCase(unittest.TestCase):
         self.enter_patch.start()
         self.addCleanup(self.enter_patch.stop)
         self.addCleanup(lambda: journal._fh.close() if journal._fh else None)
+        # Main-loop tests must not query the host's RPM database.
+        package_patch = patch.object(mod, "tarpm_package_info", return_value={
+            "executable": "/fake/tarpm", "package": {}, "rpm_info": None,
+            "error": "RPM metadata unavailable in unit tests"})
+        package_patch.start()
+        self.addCleanup(package_patch.stop)
 
     def run_main(self, *extra):
         with contextlib.redirect_stdout(io.StringIO()), \
@@ -390,6 +396,157 @@ class CliSelectionTests(RunnerTestCase):
                 self.assertEqual(stdout, "")
                 self.assertIn("nothing to do", stderr)
                 mod.JOURNAL._fh.close()
+
+
+class PackageMetadataTests(unittest.TestCase):
+    def test_queries_resolved_executable_and_keeps_copr_build_details(self):
+        rpm_info = ("Name        : tarpm\nEpoch       : 1\nVersion     : 0.1\n"
+                    "Release     : 20261022.gitabcdef.fc44\nArchitecture: x86_64\n"
+                    "Build Date  : Thu Oct 22 10:00:00 2026\n"
+                    "Source RPM  : tarpm-0.1-20261022.gitabcdef.fc44.src.rpm\n")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "tarpm-real"
+            binary.touch()
+            link = Path(directory) / "tarpm"
+            link.symlink_to(binary)
+            with patch.object(mod.shutil, "which", return_value=str(link)), \
+                    patch.object(mod.subprocess, "run", return_value=Mock(
+                        returncode=0, stdout=rpm_info, stderr="")) as query:
+                info = mod.tarpm_package_info()
+            self.assertEqual(query.call_args.args[0],
+                             ["rpm", "-qi", "--file", str(binary.resolve())])
+            self.assertEqual(query.call_args.kwargs["env"]["LC_ALL"], "C")
+            self.assertEqual(query.call_args.kwargs["timeout"], 5)
+            self.assertEqual(info["executable"], str(link))
+            self.assertEqual(info["rpm_info"], rpm_info.strip())
+            self.assertEqual(mod.package_label(info),
+                             "tarpm-1:0.1-20261022.gitabcdef.fc44.x86_64")
+            self.assertIsNone(info["error"])
+
+    def test_metadata_failures_are_nonfatal_and_explained(self):
+        for failure in (FileNotFoundError("rpm missing"), PermissionError("denied"),
+                        subprocess.TimeoutExpired(["rpm"], 5)):
+            with self.subTest(failure=failure), \
+                    patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                    patch.object(mod.subprocess, "run", side_effect=failure):
+                info = mod.tarpm_package_info()
+                self.assertIn("RPM metadata unavailable", info["error"])
+                self.assertEqual(mod.package_label(info), "unknown")
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod.subprocess, "run", return_value=Mock(
+                    returncode=1, stdout="file is not owned by any package", stderr="")):
+            info = mod.tarpm_package_info()
+            self.assertIn("not owned", info["error"])
+        with patch.object(mod.shutil, "which", return_value=None), \
+                patch.object(mod.subprocess, "run") as query:
+            self.assertIn("not found", mod.tarpm_package_info()["error"])
+            query.assert_not_called()
+
+    def test_incomplete_metadata_retains_raw_output_and_avoids_false_identity(self):
+        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
+                patch.object(mod.subprocess, "run", return_value=Mock(
+                    returncode=0, stdout="Name : tarpm\n", stderr="")):
+            info = mod.tarpm_package_info()
+        self.assertIn("incomplete", info["error"])
+        self.assertEqual(info["rpm_info"], "Name : tarpm")
+        self.assertEqual(mod.package_label(info), "unknown")
+
+
+class ReportContentTests(RunnerTestCase):
+    def test_text_and_json_share_session_metadata_captured_before_tests(self):
+        events = []
+        info = {"executable": "/usr/bin/tarpm", "package": {
+            "name": "tarpm", "version": "0.1", "release": "gitabcdef.fc44",
+            "arch": "x86_64"}, "rpm_info": "Build Date : before testing", "error": None}
+
+        def package():
+            events.append("metadata")
+            return info
+
+        def process(nvr, args, counter):
+            events.append("test")
+            return mod.FetchResult(nvr, True), [
+                mod.TestResult("demo-1-1.src.rpm", nvr, "src", True),
+                mod.TestResult("demo-1-1.x86_64.rpm", nvr, "x86_64", True,
+                               warning="content-diff")]
+
+        json_path = self.root / "results.json"
+        with patch.object(mod.shutil, "which", return_value="/usr/bin/tarpm"), \
+                patch.object(mod, "tarpm_package_info", side_effect=package), \
+                patch.object(mod, "process_build", side_effect=process):
+            self.assertEqual(self.run_main("--json", str(json_path), "-j", "2"), 0)
+        self.assertEqual(events, ["metadata", "test"])
+        data = json.loads(json_path.read_text())
+        session = data["session"]
+        report = (self.root / "report.txt").read_text()
+        self.assertEqual(session["tarpm"], info)
+        self.assertIn("tarpm-0.1-gitabcdef.fc44.x86_64", report)
+        self.assertIn("Build Date : before testing", report)
+        self.assertIn("started:   " + session["started"], report)
+        self.assertIn("generated: " + session["finished"], report)
+        self.assertIn("runtime:   " + mod.fmt_duration(session["runtime_seconds"]), report)
+        self.assertGreaterEqual(session["runtime_seconds"], 0)
+        self.assertEqual(session["status"], "passed")
+        self.assertEqual(session["command"][2:], self.argv + ["--json", str(json_path), "-j", "2"])
+        self.assertEqual(session["settings"]["jobs"], 2)
+        self.assertEqual(data["summary"]["test"], {
+            "total": 2, "ok": 2, "failed": 0, "warnings": 1, "clean_passed": 1})
+        self.assertEqual(data["failure_types"], {"fetch": [], "test": []})
+
+    def test_ranked_groups_precede_logs_and_json_matches_text(self):
+        fetch = [mod.FetchResult("demo-1-1", False, 1, signature="download failed")]
+        tests = [mod.TestResult(f"demo-1-1.{arch}.rpm", "demo-1-1", arch,
+                               False, "repack", 1, signature="write payload failed")
+                 for arch in ("src", "x86_64", "noarch")]
+        tests.extend([
+            mod.TestResult("other-1-1.src.rpm", "other-1-1", "src", False,
+                           "unpack", 2, signature="bad header"),
+            # The same diagnostic with a different exit code remains distinct.
+            mod.TestResult("third-1-1.src.rpm", "third-1-1", "src", False,
+                           "repack", 2, signature="write payload failed")])
+        args = mod.parse_args(self.argv)
+        report = mod.write_report(args, fetch, tests, 3665).read_text()
+        self.assertIn("runtime:   1h 01m 05s", report)
+        self.assertLess(report.index("=== TEST FAILURES BY TYPE ==="),
+                        report.index("=== FETCH FAILURES ==="))
+        self.assertIn("3x (60.0% of test failures)", report)
+        self.assertIn("1x (100.0% of fetch failures)", report)
+        path = self.root / "groups.json"
+        mod.write_json(path, args, fetch, tests)
+        groups = json.loads(path.read_text())["failure_types"]
+        self.assertEqual(groups["test"][0]["count"], 3)
+        self.assertEqual(groups["test"][0]["percent_of_failures"], 60.0)
+        self.assertEqual(len(groups["test"]), 3)
+        self.assertEqual(groups["test"][0]["examples"], sorted(
+            ["demo-1-1.src", "demo-1-1.x86_64", "demo-1-1.noarch"]))
+        self.assertEqual(groups["fetch"][0]["count"], 1)
+
+    def test_exception_and_empty_output_groups_are_actionable(self):
+        tests = [mod.TestResult("demo-1-1.src.rpm", "demo-1-1", "src", False,
+                                "exception", error="OSError: failed at /tmp/a/file"),
+                 mod.TestResult("other-1-1.src.rpm", "other-1-1", "src", False,
+                                "exception", error="OSError: failed at /tmp/b/file"),
+                 mod.TestResult("third-1-1.src.rpm", "third-1-1", "src", False,
+                                "unpack", 1)]
+        groups = mod.failure_summary(None, tests, "test")
+        self.assertEqual(groups[0]["signature"], "OSError: failed at <path>")
+        self.assertEqual(groups[0]["count"], 2)
+        self.assertEqual(groups[1]["signature"], "(no diagnostic output)")
+        args = mod.parse_args(self.argv)
+        mod.write_failure_lists(args, None, tests)
+        self.assertIn("OSError: failed at <path>",
+                      (self.downloads / "logs/failed-index.tsv").read_text())
+
+    def test_fetch_only_skips_rpm_lookup_and_has_timing_and_empty_test_summary(self):
+        path = self.root / "fetch.json"
+        with patch.object(mod, "tarpm_package_info") as package, \
+                patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
+            self.assertEqual(self.run_main("--no-test", "--json", str(path)), 0)
+        package.assert_not_called()
+        data = json.loads(path.read_text())
+        self.assertIsNone(data["session"]["tarpm"])
+        self.assertEqual(data["session"]["mode"], "fetch-only")
+        self.assertNotIn("test", data["summary"])
 
 
 class ReportPathTests(unittest.TestCase):
@@ -1037,6 +1194,10 @@ class PoolInterruptTests(RunnerTestCase):
         data = json.loads(json_path.read_text())
         self.assertEqual(len(data["fetch"]), 1)
         self.assertEqual(len(data["test"]), 1)
+        self.assertEqual(data["session"]["status"], "interrupted")
+        self.assertTrue(data["session"]["interrupted"])
+        self.assertEqual(data["session"]["selected_builds"], 1)
+        self.assertGreaterEqual(data["session"]["runtime_seconds"], 0)
         latest = mod.read_journal(str(self.downloads / "journal.jsonl"))
         self.assertEqual(latest["demo-1-1"]["status"], "pass")
         self.assertEqual(signal.getsignal(signal.SIGINT), original_handler)
