@@ -15,7 +15,8 @@ tag: a single 1.5 GiB RPM can need over 10 GiB during its round-trip.
 
 Requires Python ≥ 3.9 (standard library only), a `koji` client configured for
 the Fedora hub, and `tarpm`. The runner uses `koji latest-pkg` to list builds
-and `koji download-build` to fetch RPMs; `fedpkg` is not required.
+and `koji download-build` to fetch RPMs.
+
 On Fedora with DNF5:
 
 ```bash
@@ -44,8 +45,8 @@ python tarpm-tag-runner.py --test-only -p hello -a x86_64
 To update the runner in place from this repository's latest `main` branch:
 
 ```bash
-python tarpm-tag-runner.py -u
 # Equivalent: python tarpm-tag-runner.py --update
+python tarpm-tag-runner.py -u
 ```
 
 Use the update option on its own. It requires network access and write
