@@ -1113,7 +1113,7 @@ class FetchProgressTests(RunnerTestCase):
         (self.downloads / "next.rpm").write_bytes(b"x" * 1024)
         output = "Downloading [2/2]: next.rpm\n"
         self.assertEqual(mod.fetch_progress_label("demo-1-1", output),
-                         "fetching next.rpm (RPM 2/2)")
+                         "fetching next.rpm (RPM 2/2, 100.0%)")
         self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
                          ", 1 KiB so far")
         self.assertEqual(mod.fetch_progress_label("demo-1-1", None), "fetching demo-1-1")
@@ -1126,6 +1126,14 @@ class FetchProgressTests(RunnerTestCase):
                          ", 913.00 MiB / 1.46 GiB so far")
         # Clients may emit only downloaded bytes, without the expected total.
         output = output.replace(" / 1.46 GiB", "")
+        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
+                         ", 913.00 MiB so far")
+        self.assertEqual(mod.fetch_progress_label("demo-1-1", output),
+                         "fetching demo.rpm")
+        # Batch position is available even when the RPM's byte progress isn't.
+        output = output.replace("Downloading:", "Downloading [2/3]:")
+        self.assertEqual(mod.fetch_progress_label("demo-1-1", output),
+                         "fetching demo.rpm (RPM 2/3, 66.7%)")
         self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
                          ", 913.00 MiB so far")
 
@@ -1153,12 +1161,12 @@ class FetchProgressTests(RunnerTestCase):
         self.assertEqual(popen.call_args.args[0], cmd)
         beats = [line for line in stdout.getvalue().splitlines() if "still fetching" in line]
         self.assertEqual(len(beats), 3)
-        self.assertIn("fetching first.rpm (RPM 1/2) (build 1/2)", beats[0])
+        self.assertIn("fetching first.rpm (RPM 1/2, 50.0%) (build 1/2)", beats[0])
         self.assertIn(", 913.00 MiB / 1.46 GiB, 61% so far)", beats[0])
-        self.assertIn("fetching next.rpm (RPM 2/2) (build 1/2)", beats[1])
+        self.assertIn("fetching next.rpm (RPM 2/2, 100.0%) (build 1/2)", beats[1])
         self.assertIn(", 1 KiB so far)", beats[1])
-        self.assertNotIn("%", beats[1])
-        self.assertIn("fetching next.rpm (RPM 2/2) (build 1/2)", beats[2])
+        self.assertNotIn("%", beats[1].rsplit("(", 1)[-1])
+        self.assertIn("fetching next.rpm (RPM 2/2, 100.0%) (build 1/2)", beats[2])
         self.assertIn(", 913.00 MiB / 1.46 GiB, 21% so far)", beats[2])
         self.assertEqual(result.log.read_bytes().decode(), final)
 
@@ -1359,17 +1367,17 @@ class TestProgressTests(RunnerTestCase):
         beats = [line for line in stdout.getvalue().splitlines() if "still testing" in line]
         self.assertEqual(len(beats), 6)
         for beat in beats:
-            self.assertIn("still testing demo-1-1.noarch (1/2, 50.0%; ", beat)
-        self.assertIn("; unpack, ", beats[0])
+            self.assertIn("still testing demo-1-1.noarch (RPM 1/2, 50.0%) (", beat)
+        self.assertIn("(unpack, ", beats[0])
         self.assertIn("; unpacked 4 KiB; RPM 2 KiB)", beats[0])
         self.assertNotIn("~", beats[0])
         for beat in beats[1:3]:
-            self.assertIn("; repack ~50.0%, ", beat)
+            self.assertIn("(repack ~50.0%, ", beat)
             self.assertIn("; payload 1/2 KiB; RPM 1.5 KiB; input 4 KiB)", beat)
-        self.assertIn("; unpack-repacked ~100.0%, ", beats[3])
+        self.assertIn("(unpack-repacked ~100.0%, ", beats[3])
         self.assertIn("; unpacked 4/4 KiB; RPM 1.5 KiB)", beats[3])
-        self.assertIn("; list-original, ", beats[4])
-        self.assertIn("; list-repacked, ", beats[5])
+        self.assertIn("(list-original, ", beats[4])
+        self.assertIn("(list-repacked, ", beats[5])
         # The completed input is measured once after unpacking, not repeatedly
         # during repack (the earlier scan is the unpack heartbeat).
         self.assertEqual(sum(call.args == (work / "ext",)

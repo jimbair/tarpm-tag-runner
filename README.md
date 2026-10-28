@@ -142,11 +142,12 @@ Other RPMs continue. A runner exception is a test failure at stage
 
 Stage details and size metrics appear on heartbeats only; fast RPM tests
 log one completion line. `--verbose` also prints each stage's command.
-Test heartbeats combine the RPM position, stage, elapsed test time, and
-compact size details:
+Test heartbeats group the RPM position and its percentage in one set of
+parentheses, followed by the stage, elapsed test time, and compact size
+details in another:
 
 ```text
-[2026-10-28 15:19:30 UTC] tarpm-tag-runner.py: still testing ghc-pandoc-devel-3.7.0.2-39.fc44.s390x (140/171, 81.9%; repack ~60.3%, 1m 00s; payload 11.1/18.4 MiB; RPM pending; input 239.5 MiB)
+[2026-10-28 15:19:30 UTC] tarpm-tag-runner.py: still testing ghc-pandoc-devel-3.7.0.2-39.fc44.s390x (RPM 140/171, 81.9%) (repack ~60.3%, 1m 00s; payload 11.1/18.4 MiB; RPM pending; input 239.5 MiB)
 ```
 
 The position percentage (`81.9%`) is the current RPM's index divided by the
@@ -386,13 +387,15 @@ completion lines include RPM count, size, and duration; test lines include progr
 duration. An unavailable run log does not stop the run.
 
 Fetch starts and completions identify the build. Heartbeats identify the
-current RPM, its position within the build, and the build's position in the
-run. Sizes and percentages both describe that RPM, using Koji's native
-output without extra metadata requests. Elapsed time is for the build's
-fetch, for example:
+current RPM, its position and position percentage within the build, and
+the build's position in the run. Like test heartbeats, the position
+percentage is the current RPM's index divided by the count of RPMs in the
+build. The separate download percentage and sizes describe bytes fetched
+for that RPM, using Koji's native output without extra metadata requests.
+Elapsed time is for the build's fetch, for example:
 
 ```text
-still fetching demo-1-1.noarch.rpm (RPM 1/2) (build 3/20) (5m 00s, 913.00 MiB / 1.46 GiB, 61% so far)
+still fetching demo-1-1.noarch.rpm (RPM 1/2, 50.0%) (build 3/20) (5m 00s, 913.00 MiB / 1.46 GiB, 61% so far)
 ```
 
 Each new RPM gets its own label and progress. Without a usable progress

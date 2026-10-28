@@ -618,7 +618,7 @@ def fetch_progress_label(nvr: str, output: bytes | str | None) -> str:
     label = f"fetching {progress.filename}"
     if progress.position:
         index, total = progress.position
-        label += f" (RPM {index}/{total})"
+        label += f" (RPM {index}/{total}, {100 * index / total:.1f}%)"
     return label
 
 
@@ -786,21 +786,22 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         return unpacked_size
 
     def timed_run(name: str, cmd: list, progress_fn=None) -> tuple:
+        position = ""
+        if progress:
+            n, total = progress
+            percent = f", {100 * n / total:.1f}%" if total > 0 else ""
+            position = f" (RPM {n}/{total}{percent})"
+
         def detail(output, pid, elapsed):
             estimate, sizes = progress_fn(output, pid) if progress_fn else ("", "")
-            position = ""
-            if progress:
-                n, total = progress
-                percent = f", {100 * n / total:.1f}%" if total > 0 else ""
-                position = f"{n}/{total}{percent}; "
-            return f"{position}{name}{estimate}, {fmt_duration(elapsed)}{sizes}"
+            return f"{name}{estimate}, {fmt_duration(elapsed)}{sizes}"
 
         if args.verbose:
             log("+ " + " ".join(str(c) for c in cmd))
         start = time.monotonic()
         rc, out = run(cmd, label=f"testing {base}",
                       heartbeat=args.heartbeat, start=test_t0,
-                      detail_fn=detail)
+                      counter_suffix=position, detail_fn=detail)
         stage_seconds[name] = time.monotonic() - start
         return rc, out
 
