@@ -14,32 +14,36 @@ tag: a single 1.5 GiB RPM can need over 10 GiB during its round-trip.
 ## Setup and quick start
 
 Requires Python ≥ 3.9 (standard library only), a `koji` client configured for
-the Fedora hub, and `tarpm`. On Fedora with DNF5:
+the Fedora hub, and `tarpm`. The runner uses `koji latest-pkg` to list builds
+and `koji download-build` to fetch RPMs; `fedpkg` is not required.
+On Fedora with DNF5:
 
 ```bash
-sudo dnf install python3 koji dnf5-plugins
+sudo dnf install koji dnf5-plugins
 sudo dnf copr enable dcantrell/tarpm
 sudo dnf install tarpm
 ```
 
+`dnf5-plugins` provides the `dnf copr` command used above.
+
 ```bash
 # Preview a small selection without downloading RPMs:
-python3 tarpm-tag-runner.py -t f44 -p hello --list
+python tarpm-tag-runner.py -t f44 -p hello --list
 
 # Fetch and test hello, including its source RPM; keep all artifacts:
-python3 tarpm-tag-runner.py -t f44 -p hello -a x86_64 --keep
+python tarpm-tag-runner.py -t f44 -p hello -a x86_64 --keep
 
 # Test two source-package selections, four builds at once:
-python3 tarpm-tag-runner.py -t f44 -p 7zip -p 389-ds-base -j 4 --json results.json
+python tarpm-tag-runner.py -t f44 -p 7zip -p 389-ds-base -j 4 --json results.json
 
 # Download only, then test the local RPMs separately:
-python3 tarpm-tag-runner.py -p hello -a x86_64 --no-test
-python3 tarpm-tag-runner.py --test-only -p hello -a x86_64
+python tarpm-tag-runner.py -p hello -a x86_64 --no-test
+python tarpm-tag-runner.py --test-only -p hello -a x86_64
 ```
 
 ## Options and build selection
 
-Run `python3 tarpm-tag-runner.py --help` for CLI help. Defaults: tag `f44`,
+Run `python tarpm-tag-runner.py --help` for CLI help. Defaults: tag `f44`,
 download directory `./rpms`, report `./report.txt`, one worker, all binary
 architectures plus source RPMs. Koji's default debuginfo exclusion applies.
 
@@ -184,10 +188,10 @@ all run IDs.
 
 ```bash
 # Continue an interrupted run; re-run failures and unfinished/fetched builds:
-python3 tarpm-tag-runner.py -t f44 -j 2 --resume
+python tarpm-tag-runner.py -t f44 -j 2 --resume
 
 # Re-run recorded failures after a tarpm update:
-python3 tarpm-tag-runner.py -t f44 -j 2 --retry-failed
+python tarpm-tag-runner.py -t f44 -j 2 --retry-failed
 ```
 
 Both modes clear each selected build directory before downloading. Normal
@@ -266,9 +270,9 @@ Use a saved JSON report as a baseline to see what changed after updating
 tarpm:
 
 ```bash
-python3 tarpm-tag-runner.py -t f44 -p hello -a x86_64 --json baseline.json
+python tarpm-tag-runner.py -t f44 -p hello -a x86_64 --json baseline.json
 # After updating tarpm, repeat the same selection:
-python3 tarpm-tag-runner.py -t f44 -p hello -a x86_64 \
+python tarpm-tag-runner.py -t f44 -p hello -a x86_64 \
     --compare baseline.json --json current.json
 ```
 
@@ -318,7 +322,7 @@ optionally followed by `  # detail`:
 
 ```bash
 # Re-run a failure list, including on a machine without the journal:
-python3 tarpm-tag-runner.py --from-file rpms/logs/failed-all.txt -j 4
+python tarpm-tag-runner.py --from-file rpms/logs/failed-all.txt -j 4
 ```
 
 Reports and failure lists describe only the invocation that wrote them.
@@ -359,7 +363,7 @@ RPM, it falls back to the build label and explicitly labels the build total.
 Run the unit and regression suite without external tools or network access:
 
 ```bash
-python3 -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
 GitHub Actions installs Koji and tarpm in Fedora 44, runs that suite, and
@@ -370,7 +374,7 @@ artifacts are uploaded as `hello-smoke` for seven days, including on failure.
 To run the same smoke tests locally after installing the tools:
 
 ```bash
-python3 tests/smoke_test.py --output /tmp/hello-smoke
+python tests/smoke_test.py --output /tmp/hello-smoke
 ```
 
 The output directory must be new. Smoke tests require network access;
