@@ -12,12 +12,13 @@ source RPM (maximum coverage by default):
   --test-only  skip fetching, test the RPMs already downloaded
   --no-src     skip .src.rpm; discard any sources fetched by Koji
 
+Only RPM builds are queried from the tag; image-only builds are excluded.
 The tag list is cached as <dir>/tag-<TAG>.txt and reused on later runs
 (--refresh re-fetches from Koji; --from-file reads an explicit list).
 Structured results, optional JSON report, threaded fetch/test.
 
 External commands (system level, matching the CLI workflow):
-  koji latest-pkg --all <tag>   list the latest build per package in a tag
+  koji latest-pkg --all --type=rpm <tag>   list latest RPM builds in a tag
   koji download-build <nvr>     fetch a build (all arches + src by default)
   tarpm -x / -c / -t            test round-trip per RPM
 
@@ -83,6 +84,7 @@ PROG = Path(sys.argv[0]).name or "tarpm-tag-runner"
 UPDATE_URL = ("https://raw.githubusercontent.com/jimbair/"
               "tarpm-tag-runner/main/tarpm-tag-runner.py")
 MAX_UPDATE_BYTES = 2 * 1024 * 1024
+RPM_TAG_CACHE_HEADER = "# tarpm-tag-runner: build-type=rpm\n"
 
 
 class UsageError(Exception):
@@ -467,8 +469,9 @@ def build_dir(directory: str, nvr: str) -> Path:
 def read_nvrs(args) -> tuple:
     """Return (NVR list, tag-list source) for the run.
 
-    The tag list is cached as <dir>/tag-<TAG>.txt (raw 'koji latest-pkg
-    --all' output) and reused on later runs; --refresh forces a re-fetch.
+    Query only RPM builds using Koji's build types, not NVR patterns.
+    Cache the output with a marker so old, unfiltered caches are refreshed
+    once. Explicit --from-file lists are used as supplied.
     """
     cache = None
     saved = None
@@ -480,24 +483,31 @@ def read_nvrs(args) -> tuple:
         source = f"from file ({args.from_file})"
     else:
         cache = Path(args.dir) / f"tag-{args.tag}.txt"
+        text = None
         if cache.is_file() and not args.refresh:
             try:
                 text = cache.read_text()
             except OSError as exc:
                 raise UsageError(f"cannot read cached tag list: {exc}")
-            try:
-                saved = datetime.fromtimestamp(
-                    cache.stat().st_mtime, timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%S UTC")
-            except OSError:
-                saved = "date unknown"
-            source = f"cached ({cache}, saved {saved})"
-        else:
+            if text.startswith(RPM_TAG_CACHE_HEADER):
+                try:
+                    saved = datetime.fromtimestamp(
+                        cache.stat().st_mtime, timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M:%S UTC")
+                except OSError:
+                    saved = "date unknown"
+                source = f"cached ({cache}, saved {saved})"
+            else:
+                log(f"{PROG}: refreshing cached tag list {cache}: "
+                    "RPM build-type filter missing", err=args.list)
+                text = None
+        if text is None:
             if shutil.which("koji") is None:
                 raise UsageError("koji client not found in PATH")
             log(f"{PROG}: fetching koji tag {args.tag}", err=args.list)
             t0 = time.monotonic()
-            rc, out = run(["koji", "latest-pkg", "--all", args.tag],
+            cmd = ["koji", "latest-pkg", "--all", "--type=rpm", args.tag]
+            rc, out = run(cmd,
                           label=f"fetching koji tag {args.tag}",
                           heartbeat=args.heartbeat, log_err=args.list)
             elapsed = time.monotonic() - t0
@@ -505,9 +515,9 @@ def read_nvrs(args) -> tuple:
                 log(f"{PROG}: tag {args.tag}: failed (after {elapsed:.1f}s)",
                     err=True)
                 raise UsageError(
-                    f"'koji latest-pkg --all {args.tag}' failed (exit {rc}):\n{out}")
+                    f"'{shlex.join(cmd)}' failed (exit {rc}):\n{out}")
             cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(out)
+            cache.write_text(RPM_TAG_CACHE_HEADER + out)
             source = f"fetched from Koji ({elapsed:.1f}s)"
             text = out
     nvrs = []
@@ -1804,7 +1814,7 @@ def parse_args(argv) -> argparse.Namespace:
     )
     # fetch
     ap.add_argument("-t", "--tag", default="f44",
-                    help="Koji tag to query (default: f44)")
+                    help="Koji tag to query for RPM builds (default: f44)")
     ap.add_argument("-p", "--pkg", action="append", metavar="PKG",
                     help="include builds whose NVR equals PKG or starts with "
                          "PKG- (repeatable; default: every package)")
@@ -1819,9 +1829,10 @@ def parse_args(argv) -> argparse.Namespace:
                          "without downloading (incompatible with --test-only)")
     ap.add_argument("--from-file", metavar="FILE",
                     help="read the NVR list from FILE (same format as "
-                         "'koji latest-pkg --all TAG'; blank lines and "
-                         "'#' comments ignored) instead of the cached "
-                         "list or Koji")
+                         "'koji latest-pkg --all --type=rpm TAG'; blank "
+                         "lines and '#' comments ignored) instead of the "
+                         "cached list or Koji; used as supplied without "
+                         "build-type filtering")
     ap.add_argument("--refresh", action="store_true",
                     help="re-fetch the tag list from Koji, even if a "
                          "cached copy (DIR/tag-<TAG>.txt) exists")

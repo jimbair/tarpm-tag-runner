@@ -491,6 +491,7 @@ class CliSelectionTests(RunnerTestCase):
     def test_cached_list_stdout_contains_only_nvrs(self):
         self.downloads.mkdir()
         (self.downloads / "tag-f44.txt").write_text(
+            mod.RPM_TAG_CACHE_HEADER +
             "Build Tag Built by\n------------------\ndemo-1-1 f44 user\n")
         self.argv = ["-d", str(self.downloads), "--no-run-log"]
         with patch.object(mod, "run") as command:
@@ -515,6 +516,93 @@ class CliSelectionTests(RunnerTestCase):
         self.assertEqual(stdout, "demo-1-1\n")
         self.assertIn("still fetching koji tag", stderr)
         self.assertIn("saved tag list", stderr)
+
+    def test_tag_query_filters_rpm_builds_and_cache_is_reused(self):
+        self.argv = ["-t", "f45", "-d", str(self.downloads), "--no-run-log"]
+        output = ("Build Tag Built by\n------------------\n"
+                  "Fedora-rpm-example-1-1 f45 user\nhello-2-1 f45 user\n")
+        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                patch.object(mod, "run", return_value=(0, output)) as command:
+            result, stdout, _ = self.list_output()
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "Fedora-rpm-example-1-1\nhello-2-1\n")
+        self.assertEqual(command.call_args.args[0],
+                         ["koji", "latest-pkg", "--all", "--type=rpm", "f45"])
+        self.assertEqual((self.downloads / "tag-f45.txt").read_text(),
+                         mod.RPM_TAG_CACHE_HEADER + output)
+        with patch.object(mod, "run") as command, \
+                patch.object(mod.shutil, "which", return_value=None):
+            result, cached_stdout, stderr = self.list_output()
+        self.assertEqual(result, 0)
+        self.assertEqual(cached_stdout, stdout)
+        self.assertIn("using cached list", stderr)
+        command.assert_not_called()
+
+    def test_legacy_cache_refreshes_before_package_filter_and_limit(self):
+        self.downloads.mkdir()
+        cache = self.downloads / "tag-f44.txt"
+        cache.write_text("Fedora-Games-Live-44-20260424.n.0 f44 user\n"
+                         "hello-1-1 f44 user\n")
+        self.argv = ["-d", str(self.downloads), "--no-run-log"]
+        output = "hello-2-1 f44 user\nhello-extra-2-1 f44 user\n"
+        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                patch.object(mod, "run", return_value=(0, output)) as command:
+            result, stdout, stderr = self.list_output("-p", "hello", "-n", "1")
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "hello-2-1\n")
+        self.assertIn("RPM build-type filter missing", stderr)
+        self.assertIn("--type=rpm", command.call_args.args[0])
+        self.assertEqual(cache.read_text(), mod.RPM_TAG_CACHE_HEADER + output)
+
+    def test_failed_filtered_query_preserves_existing_cache(self):
+        self.downloads.mkdir()
+        cache = self.downloads / "tag-f44.txt"
+        for content, options in (
+                ("Fedora-IoT-32-20191107.0 f44 user\n", []),
+                (mod.RPM_TAG_CACHE_HEADER + "hello-1-1 f44 user\n", ["--refresh"])):
+            with self.subTest(options=options):
+                cache.write_text(content)
+                self.argv = ["-d", str(self.downloads), "--no-run-log"]
+                with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                        patch.object(mod, "run", return_value=(1, "hub unavailable")):
+                    result, stdout, stderr = self.list_output(*options)
+                self.assertEqual(result, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn("--type=rpm", stderr)
+                self.assertIn("hub unavailable", stderr)
+                self.assertEqual(cache.read_text(), content)
+
+    def test_recovery_drops_image_failures_from_legacy_cache(self):
+        self.downloads.mkdir()
+        cache = self.downloads / "tag-f44.txt"
+        image = "Fedora-Games-Live-44-20260424.n.0"
+        records = [{"nvr": image, "status": "fetch-fail"},
+                   {"nvr": "hello-1-1", "status": "test-fail"}]
+        (self.downloads / "journal.jsonl").write_text(
+            "".join(json.dumps(record) + "\n" for record in records))
+        mod.write_run_manifest(self.downloads / "run.json",
+                               [image, "hello-1-1"], "old-run")
+        manifest = (self.downloads / "run.json").read_text()
+        self.argv = ["-d", str(self.downloads), "--no-run-log"]
+        for mode in ("--resume", "--retry-failed"):
+            with self.subTest(mode=mode):
+                cache.write_text(f"{image}\nhello-1-1\n")
+                with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                        patch.object(mod, "run", return_value=(0, "hello-1-1 f44 user\n")):
+                    result, stdout, _ = self.list_output(mode)
+                self.assertEqual(result, 0)
+                self.assertEqual(stdout, "hello-1-1\n")
+                self.assertEqual((self.downloads / "run.json").read_text(), manifest)
+
+    def test_explicit_file_keeps_supplied_builds_without_querying_koji(self):
+        self.listfile.write_text("Fedora-IoT-32-20191107.0\nhello-1-1\n")
+        with patch.object(mod, "run") as command, \
+                patch.object(mod.shutil, "which", return_value=None):
+            result, stdout, _ = self.list_output()
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, self.listfile.read_text())
+        command.assert_not_called()
+        self.assertFalse((self.downloads / "tag-f44.txt").exists())
 
     def test_resume_list_excludes_passed_and_warned_builds(self):
         self.listfile.write_text("pass-1-1\nwarn-1-1\nfail-1-1\nnew-1-1\n")

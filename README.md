@@ -14,8 +14,10 @@ tag: a single 1.5 GiB RPM can need over 10 GiB during its round-trip.
 ## Setup and quick start
 
 Requires Python ≥ 3.9 (standard library only), a `koji` client configured for
-the Fedora hub, and `tarpm`. The runner uses `koji latest-pkg` to list builds
-and `koji download-build` to fetch RPMs.
+the Fedora hub, and `tarpm`. The runner uses `koji latest-pkg --all --type=rpm`
+to list RPM builds and `koji download-build` to fetch RPMs. Koji's build-type
+metadata excludes image-only builds such as live spins, disk images, and
+container images automatically, without package-name exclusions.
 
 On Fedora with DNF5:
 
@@ -96,11 +98,19 @@ For example, `-p 7zip` selects `7zip` and source packages named `7zip-*`;
 `7zip-reduced` binaries within the selected build are included automatically.
 A full NVR such as `7zip-25.01-5.fc44` can select that exact build.
 
-Tag lists are cached as `DIR/tag-<TAG>.txt`, containing raw
-`koji latest-pkg --all TAG` output. Later runs reuse that snapshot until
-`--refresh`. `--from-file` accepts the same output or plain NVRs: the first
+Tag lists are cached as `DIR/tag-<TAG>.txt`, containing
+`koji latest-pkg --all --type=rpm TAG` output with a comment marking the RPM
+build-type filter. Later runs reuse that snapshot until `--refresh`. Older
+caches without the marker are refreshed automatically once, including on
+`--resume` and `--retry-failed`, so existing image entries are removed before
+package, limit, and journal filtering. This refresh requires Koji access;
+if it fails, the old cache is preserved and the run stops.
+
+`--from-file` accepts the same output or plain NVRs: the first
 whitespace-delimited token on each line is used; headers, blank lines, and
-`#` comments are ignored. Duplicate NVRs run once. `-n` is applied after
+`#` comments are ignored. Explicit files are used as supplied, without a
+Koji build-type query; generate them with the filtered command above to
+exclude image-only builds. Duplicate NVRs run once. `-n` is applied after
 package filtering and before journal filtering. In `--test-only`, it limits
 matching build directories in alphabetical order.
 
