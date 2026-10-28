@@ -184,18 +184,42 @@ def _tarpm_payload_bytes(pid: int | None) -> int | None:
     return max(sizes) if sizes else None
 
 
-def repack_progress_suffix(repacked: Path, pid: int | None,
-                           original_size: int | None, unpacked_size: int) -> str:
+def _estimated_percent(current: int | None, expected: int | None) -> str:
+    """Stage byte estimate; allow overruns rather than implying completion."""
+    if current is None or expected is None or expected <= 0:
+        return ""
+    return f" ~{100 * current / expected:.1f}%"
+
+
+def _size_pair(current: int, expected: int | None) -> str:
+    """Compact byte counts, sharing a unit when possible: '11.1/18.4 MiB'."""
+    amount = human(current)
+    if expected is None:
+        return amount
+    target = human(expected)
+    value, unit = amount.rsplit(" ", 1)
+    if target.endswith(" " + unit):
+        amount = value
+    return f"{amount}/{target}"
+
+
+def repack_progress(repacked: Path, pid: int | None,
+                    original_size: int | None, unpacked_size: int) -> tuple[str, str]:
+    """Estimated repack percentage and compact heartbeat size details."""
     parts = []
     payload = _tarpm_payload_bytes(pid)
     if payload is not None:
-        parts.append(f"{human(payload)} compressed payload")
+        parts.append(f"payload {_size_pair(payload, original_size)}")
     written = _file_bytes(repacked)
-    parts.append("RPM pending" if written is None else f"{human(written)} RPM written")
-    parts.append(f"{human(unpacked_size)} unpacked input")
-    if original_size is not None:
-        parts.append(f"{human(original_size)} original RPM")
-    return ", " + ", ".join(parts)
+    if written is None:
+        parts.append("RPM pending")
+    else:
+        parts.append(f"RPM {_size_pair(written, original_size if payload is None else None)}")
+    parts.append(f"input {human(unpacked_size)}")
+    if original_size is not None and payload is None and written is None:
+        parts.append(f"original {human(original_size)}")
+    estimate = _estimated_percent(payload if payload is not None else written, original_size)
+    return estimate, "; " + "; ".join(parts)
 
 
 def error_signature(text: str) -> str:
@@ -322,7 +346,8 @@ class Counter:
 
 def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         heartbeat: int = 0, counter_suffix: str = "", suffix_fn=None,
-        start: float | None = None, log_err: bool = False, label_fn=None) -> tuple:
+        start: float | None = None, log_err: bool = False, label_fn=None,
+        detail_fn=None) -> tuple:
     """Run an external command; return (exit_code, combined stdout+stderr).
 
     The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
@@ -343,6 +368,8 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     `log_err` routes heartbeat diagnostics to stderr for machine-readable
     stdout, such as --list output. `label_fn(output)` can replace `label`
     using cumulative partial output, such as the current RPM being fetched.
+    `detail_fn(output, pid, elapsed)` can replace the parenthesized elapsed
+    time and suffix with stage-specific progress details.
     """
     try:
         proc = subprocess.Popen(
@@ -370,9 +397,14 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
                 break
             except subprocess.TimeoutExpired as exc:
                 heartbeat_label = label_fn(exc.output) if label_fn else label
-                suffix = suffix_fn(exc.output, proc.pid) if suffix_fn else ""
+                elapsed = time.monotonic() - t0
+                if detail_fn:
+                    detail = detail_fn(exc.output, proc.pid, elapsed)
+                else:
+                    suffix = suffix_fn(exc.output, proc.pid) if suffix_fn else ""
+                    detail = fmt_duration(elapsed) + suffix
                 log(f"{PROG}: still {heartbeat_label}{counter_suffix} "
-                    f"({fmt_duration(time.monotonic() - t0)}{suffix})",
+                    f"({detail})",
                     err=log_err)
     except BaseException:
         proc.kill()
@@ -725,35 +757,46 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     repacked = work / f"{base}-repacked.rpm"
     original_size = _file_bytes(rpm)
 
-    def unpack_suffix(directory: Path, input_size: int | None) -> str:
-        suffix = f", {human(_tree_bytes(directory))} unpacked"
+    def unpack_progress(directory: Path, input_size: int | None,
+                        expected: int | None = None) -> tuple[str, str]:
+        extracted = _tree_bytes(directory)
+        details = f"; unpacked {_size_pair(extracted, expected)}"
         if input_size is not None:
-            suffix += f", {human(input_size)} input RPM"
-        return suffix
+            details += f"; RPM {human(input_size)}"
+        return _estimated_percent(extracted, expected), details
 
     unpacked_size = None
     stage_seconds = {}
 
-    def repack_suffix(output, pid) -> str:
+    def input_tree_size() -> int:
         nonlocal unpacked_size
-        # Only scan completed input if repacking runs long enough to heartbeat.
+        # Scan completed input once, and only when a heartbeat needs it.
         if unpacked_size is None:
             unpacked_size = _tree_bytes(work / "ext")
-        return repack_progress_suffix(repacked, pid, original_size, unpacked_size)
+        return unpacked_size
 
-    def timed_run(name: str, cmd: list, suffix_fn=None) -> tuple:
+    def timed_run(name: str, cmd: list, progress_fn=None) -> tuple:
+        def detail(output, pid, elapsed):
+            estimate, sizes = progress_fn(output, pid) if progress_fn else ("", "")
+            position = ""
+            if progress:
+                n, total = progress
+                percent = f", {100 * n / total:.1f}%" if total > 0 else ""
+                position = f"{n}/{total}{percent}; "
+            return f"{position}{name}{estimate}, {fmt_duration(elapsed)}{sizes}"
+
         if args.verbose:
             log("+ " + " ".join(str(c) for c in cmd))
         start = time.monotonic()
-        rc, out = run(cmd, label=f"testing {base} ({name})",
+        rc, out = run(cmd, label=f"testing {base}",
                       heartbeat=args.heartbeat, start=test_t0,
-                      counter_suffix=_progress(progress), suffix_fn=suffix_fn)
+                      detail_fn=detail)
         stage_seconds[name] = time.monotonic() - start
         return rc, out
 
-    def stage(name: str, cmd: list, suffix_fn=None) -> bool:
+    def stage(name: str, cmd: list, progress_fn=None) -> bool:
         nonlocal failed_stage, failed_rc, failed_out
-        rc, out = timed_run(name, cmd, suffix_fn)
+        rc, out = timed_run(name, cmd, progress_fn)
         buf.append("$ " + " ".join(str(c) for c in cmd))
         if out.strip():
             buf.append(out.rstrip("\n"))
@@ -765,15 +808,17 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         return True
 
     ok = stage("unpack", ["tarpm", "-x", "-f", str(rpm), "-O", str(work / "ext")],
-               suffix_fn=lambda output, pid: unpack_suffix(work / "ext", original_size))
+               progress_fn=lambda output, pid: unpack_progress(work / "ext", original_size))
     if ok:
         ok = stage("repack", ["tarpm", "-c", "-f", str(repacked), str(work / "ext")],
-                   suffix_fn=repack_suffix)
+                   progress_fn=lambda output, pid: repack_progress(
+                       repacked, pid, original_size, input_tree_size()))
     if ok:
         repacked_size = _file_bytes(repacked)
         ok = stage("unpack-repacked",
                    ["tarpm", "-x", "-f", str(repacked), "-O", str(work / "ext2")],
-                   suffix_fn=lambda output, pid: unpack_suffix(work / "ext2", repacked_size))
+                   progress_fn=lambda output, pid: unpack_progress(
+                       work / "ext2", repacked_size, input_tree_size()))
 
     # Extra check: file list of original vs repacked (warning only, in case
     # tarpm -t output is noisy). A listing that fails to generate is a

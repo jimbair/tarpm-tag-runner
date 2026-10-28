@@ -132,15 +132,35 @@ Other RPMs continue. A runner exception is a test failure at stage
 
 Stage details and size metrics appear on heartbeats only; fast RPM tests
 log one completion line. `--verbose` also prints each stage's command.
-Unpack heartbeats show extracted bytes and the input RPM size. Repack
-heartbeats show the compressed payload size (via Linux `/proc`, when
-accessible), RPM bytes written, and the unpacked/original input sizes.
-Tarpm builds its payload in an anonymous memory-backed file before writing
-the RPM, so the RPM can remain pending for most of repacking. These are
-sizes, not completion percentages: compression ratios vary, and checksum
-passes can continue while output sizes stay unchanged. Sizes count logical
-file bytes, without following symlinks or counting hardlinks twice; the
-repack input tree is measured once, on its first heartbeat.
+Test heartbeats combine the RPM position, stage, elapsed test time, and
+compact size details:
+
+```text
+[2026-10-28 15:19:30 UTC] tarpm-tag-runner.py: still testing ghc-pandoc-devel-3.7.0.2-39.fc44.s390x (140/171, 81.9%; repack ~60.3%, 1m 00s; payload 11.1/18.4 MiB; RPM pending; input 239.5 MiB)
+```
+
+The position percentage (`81.9%`) is the current RPM's index divided by the
+test count, not the number of completed tests; parallel tests receive their
+indices when they start. In the default pipeline, the count covers RPMs in
+the current build; in `--test-only`, it covers all selected RPMs.
+
+The stage estimate (`~60.3%`) compares the compressed payload size with the
+original RPM size as the expected repack size. The payload is read via
+Linux `/proc` when accessible; otherwise, the estimate uses RPM bytes
+written. Tarpm builds its payload in an anonymous memory-backed file before
+writing the RPM, so `RPM pending` can persist for most of repacking.
+`unpack-repacked` compares extracted bytes with the known original unpacked
+tree size. The initial `unpack` shows extracted bytes and input RPM size
+without an estimate because the unpacked total is not yet known. Listing
+stages show their name and elapsed test time without a byte estimate.
+
+Stage percentages are byte estimates, not whole-test or elapsed-time
+percentages. They may reach or exceed 100% while a command is still running:
+repacked sizes can differ, and checksum passes can continue while sizes stay
+unchanged. Missing or zero expected sizes omit the stage percentage. Sizes
+count logical file bytes, without following symlinks or counting hardlinks
+twice; the completed input tree is measured once, on the first heartbeat
+that needs it. Fast tests do not scan the tree for progress.
 
 The two listing outputs are compared with Python's `difflib`. A difference
 is a `content-diff` warning, not a failure; failure to generate a listing

@@ -1201,11 +1201,25 @@ class TestProgressTests(RunnerTestCase):
     def test_repack_falls_back_to_rpm_size_and_cached_input_sizes(self):
         repacked = self.root / "repacked.rpm"
         with patch.object(mod, "_tarpm_payload_bytes", return_value=None):
-            self.assertEqual(mod.repack_progress_suffix(repacked, 321, 2048, 4096),
-                             ", RPM pending, 4 KiB unpacked input, 2 KiB original RPM")
+            self.assertEqual(mod.repack_progress(repacked, 321, 2048, 4096),
+                             ("", "; RPM pending; input 4 KiB; original 2 KiB"))
             repacked.write_bytes(b"x" * 1024)
-            self.assertEqual(mod.repack_progress_suffix(repacked, 321, None, 4096),
-                             ", 1 KiB RPM written, 4 KiB unpacked input")
+            self.assertEqual(mod.repack_progress(repacked, 321, 2048, 4096),
+                             (" ~50.0%", "; RPM 1/2 KiB; input 4 KiB"))
+            self.assertEqual(mod.repack_progress(repacked, 321, None, 4096),
+                             ("", "; RPM 1 KiB; input 4 KiB"))
+
+    def test_repack_estimates_allow_growth_past_original_and_unknown_totals(self):
+        repacked = self.root / "repacked.rpm"
+        for payload, expected, estimate, size in (
+                (0, 2048, " ~0.0%", "0 B/2 KiB"),
+                (3072, 2048, " ~150.0%", "3/2 KiB"),
+                (1024, 0, "", "1 KiB/0 B"),
+                (1024, None, "", "1 KiB")):
+            with self.subTest(payload=payload, expected=expected), \
+                    patch.object(mod, "_tarpm_payload_bytes", return_value=payload):
+                self.assertEqual(mod.repack_progress(repacked, 321, expected, 4096),
+                                 (estimate, f"; payload {size}; RPM pending; input 4 KiB"))
 
     def test_only_heartbeats_show_stage_sizes(self):
         args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
@@ -1220,10 +1234,10 @@ class TestProgressTests(RunnerTestCase):
             directory.mkdir(parents=True)
             (directory / "data").write_bytes(b"x" * 4096)
 
-        def child(output="", write=None, heartbeats=1):
+        def child(output="", write=None, heartbeats=0):
             proc = Mock(pid=321, returncode=0)
             pending = write
-            remaining = heartbeats if write else 0
+            remaining = heartbeats
 
             def communicate(**kwargs):
                 nonlocal pending, remaining
@@ -1239,9 +1253,10 @@ class TestProgressTests(RunnerTestCase):
             return proc
 
         repack = child(write=lambda: repacked.write_bytes(b"x" * 1536), heartbeats=2)
-        children = [child(write=lambda: extract(work / "ext/payload")), repack,
-                    child(write=lambda: extract(work / "ext2/payload")),
-                    child("same listing\n"), child("same listing\n")]
+        children = [child(write=lambda: extract(work / "ext/payload"), heartbeats=1), repack,
+                    child(write=lambda: extract(work / "ext2/payload"), heartbeats=1),
+                    child("same listing\n", heartbeats=1),
+                    child("same listing\n", heartbeats=1)]
         with patch.object(mod.subprocess, "Popen", side_effect=children) as popen, \
                 patch.object(mod, "_tarpm_payload_bytes",
                              side_effect=lambda pid: 1024 if pid == 321 else None), \
@@ -1254,17 +1269,54 @@ class TestProgressTests(RunnerTestCase):
         starts = [line for line in stdout.getvalue().splitlines() if ": testing " in line]
         self.assertEqual(starts, [])
         beats = [line for line in stdout.getvalue().splitlines() if "still testing" in line]
-        self.assertEqual(len(beats), 4)
-        self.assertIn("4 KiB unpacked, 2 KiB input RPM", beats[0])
+        self.assertEqual(len(beats), 6)
+        for beat in beats:
+            self.assertIn("still testing demo-1-1.noarch (1/2, 50.0%; ", beat)
+        self.assertIn("; unpack, ", beats[0])
+        self.assertIn("; unpacked 4 KiB; RPM 2 KiB)", beats[0])
+        self.assertNotIn("~", beats[0])
         for beat in beats[1:3]:
-            self.assertIn("1 KiB compressed payload, 1.5 KiB RPM written", beat)
-            self.assertIn("4 KiB unpacked input, 2 KiB original RPM", beat)
-            self.assertNotIn("%", beat)
-        self.assertIn("4 KiB unpacked, 1.5 KiB input RPM", beats[3])
+            self.assertIn("; repack ~50.0%, ", beat)
+            self.assertIn("; payload 1/2 KiB; RPM 1.5 KiB; input 4 KiB)", beat)
+        self.assertIn("; unpack-repacked ~100.0%, ", beats[3])
+        self.assertIn("; unpacked 4/4 KiB; RPM 1.5 KiB)", beats[3])
+        self.assertIn("; list-original, ", beats[4])
+        self.assertIn("; list-repacked, ", beats[5])
         # The completed input is measured once after unpacking, not repeatedly
         # during repack (the earlier scan is the unpack heartbeat).
         self.assertEqual(sum(call.args == (work / "ext",)
                              for call in tree_bytes.call_args_list), 2)
+
+    def test_reunpack_estimates_without_batch_counter_or_repack_heartbeat(self):
+        args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_bytes(b"x" * 2048)
+        (self.downloads / "logs").mkdir()
+        work = rpm.parent / ".tarpm-demo-1-1.noarch"
+        details = []
+
+        def command(cmd, **kwargs):
+            if cmd[1] == "-x":
+                directory = Path(cmd[-1])
+                directory.mkdir()
+                size = 4096 if directory.name == "ext" else 1024
+                (directory / "data").write_bytes(b"x" * size)
+                if directory.name == "ext2":
+                    details.append(kwargs["detail_fn"](None, 321, 60))
+            elif cmd[1] == "-c":
+                Path(cmd[3]).write_bytes(b"x" * 2048)
+            return 0, ""
+
+        with patch.object(mod, "run", side_effect=command), \
+                patch.object(mod, "_tree_bytes", wraps=mod._tree_bytes) as tree_bytes, \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = mod.test_one(rpm, args)
+        self.assertTrue(result.ok)
+        self.assertEqual(details, ["unpack-repacked ~25.0%, 1m 00s; "
+                                   "unpacked 1/4 KiB; RPM 2 KiB"])
+        self.assertEqual(sum(call.args == (work / "ext",)
+                             for call in tree_bytes.call_args_list), 1)
 
     def test_fast_tests_only_log_completion_and_do_not_scan_tree(self):
         args = mod.parse_args(self.argv)
