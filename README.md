@@ -404,19 +404,23 @@ Run the unit and regression suite without external tools or network access:
 python -m unittest discover -s tests -v
 ```
 
-GitHub Actions installs Koji and tarpm in Fedora 44, runs that suite, and
-uses Fedora's `hello` build for real download/round-trip smoke tests. It
-checks fetch-only → resume, source and binary RPMs, `--keep`, test-only
-cleanup, and `--no-src` without an architecture filter. Reports, logs, and
-artifacts are uploaded as `hello-smoke` for seven days, including on failure.
-To run the same smoke tests locally after installing the tools:
+GitHub Actions runs independent jobs on native x86-64 and ARM64 Ubuntu VMs,
+each using a Fedora 44 container with Koji and tarpm. Both run that suite
+and use Fedora's `hello` build for real download/round-trip smoke tests with
+their native RPM architecture (`x86_64` or `aarch64`). They check fetch-only
+→ resume, source and binary RPMs, `--keep`, test-only cleanup, and `--no-src`
+without an architecture filter. Reports, logs, and artifacts are uploaded as
+`hello-smoke-x86_64` and `hello-smoke-aarch64` for seven days, including on
+failure. To run the same smoke tests locally after installing the tools:
 
 ```bash
 python tests/smoke_test.py --output /tmp/hello-smoke
 ```
 
-The output directory must be new. Smoke tests require network access;
-listing-difference warnings remain non-fatal, as in normal runs.
+The output directory must be new. The binary architecture defaults to the
+host architecture; use `--arch ARCH` to override it. Smoke tests require
+network access; listing-difference warnings remain non-fatal, as in normal
+runs.
 
 Future checks may make content differences fatal or compare headers;
 CentOS Stream/AlmaLinux backends are also planned.

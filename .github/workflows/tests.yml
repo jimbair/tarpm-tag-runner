@@ -11,7 +11,16 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: registry.fedoraproject.org/fedora:44
     timeout-minutes: 20
     env:
@@ -24,6 +33,7 @@ jobs:
           dnf -y install tarpm
           python3 --version
           rpm -q koji tarpm
+          test "$(rpm --eval '%{_arch}')" = "${{ matrix.arch }}"
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -33,13 +43,13 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Real hello RPM smoke tests
-        run: python3 tests/smoke_test.py --output "$RUNNER_TEMP/hello-smoke"
+        run: python3 tests/smoke_test.py --arch "${{ matrix.arch }}" --output "$RUNNER_TEMP/hello-smoke"
 
       - name: Upload smoke-test reports, logs, and RPM artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: hello-smoke
+          name: hello-smoke-${{ matrix.arch }}
           path: ${{ runner.temp }}/hello-smoke
           include-hidden-files: true
           if-no-files-found: ignore

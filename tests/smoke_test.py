@@ -6,6 +6,7 @@ artifacts remain under --output for inspection, including after failures.
 """
 import argparse
 import json
+import platform
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True,
                         help="new directory for reports and artifacts")
     parser.add_argument("--tag", default="f44")
+    parser.add_argument("--arch", default=platform.machine(),
+                        help="binary RPM architecture (default: host architecture)")
     args = parser.parse_args()
     for tool in ("koji", "tarpm"):
         require(shutil.which(tool), f"required tool not found: {tool}")
@@ -32,7 +35,7 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     downloads = output / "rpms"
 
-    def invoke(phase, *options, directory=downloads, arches=("x86_64",)):
+    def invoke(phase, *options, directory=downloads, arches=(args.arch,)):
         json_path = output / f"{phase}.json"
         command = [sys.executable, str(RUNNER), "-t", args.tag, "-p", "hello",
                    "-d", str(directory), "--heartbeat", "15",
@@ -88,7 +91,7 @@ def main():
                 and all(seconds > 0 for seconds in row["stage_seconds"].values())
                 and row["duration_seconds"] >= sum(row["stage_seconds"].values()),
                 "each passed RPM must retain all stage timings and its duration")
-    require({"src", "x86_64"} <= {row["arch"] for row in resumed["test"]},
+    require({"src", args.arch} <= {row["arch"] for row in resumed["test"]},
             "resume must test source and binary RPMs")
     require(all(not sentinel.exists() for sentinel in sentinels),
             "resume reused a stale build directory")
