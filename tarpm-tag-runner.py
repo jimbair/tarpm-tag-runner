@@ -53,10 +53,12 @@ Python 3.9+ (standard library only).
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import dataclasses
 import difflib
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -71,11 +73,16 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROG = Path(sys.argv[0]).name or "tarpm-tag-runner"
+UPDATE_URL = ("https://raw.githubusercontent.com/jimbair/"
+              "tarpm-tag-runner/main/tarpm-tag-runner.py")
+MAX_UPDATE_BYTES = 2 * 1024 * 1024
 
 
 class UsageError(Exception):
@@ -1686,6 +1693,56 @@ def write_failure_lists(args, fetch: list | None, test: list | None) -> None:
 # main
 # ---------------------------------------------------------------------------
 
+def update_self() -> int:
+    """Validate and atomically replace this script with GitHub's main copy."""
+    temporary = None
+    try:
+        target = Path(__file__).resolve(strict=True)
+        mode = stat.S_IMODE(target.stat().st_mode)
+        print(f"{PROG}: downloading update from {UPDATE_URL}")
+        with urllib.request.urlopen(UPDATE_URL, timeout=30) as response:
+            source = response.read(MAX_UPDATE_BYTES + 1)
+            if len(source) > MAX_UPDATE_BYTES:
+                raise ValueError("download exceeds the 2 MiB size limit")
+            length = response.headers.get("Content-Length")
+            if length is not None and len(source) != int(length):
+                raise ValueError("incomplete download (Content-Length mismatch)")
+        tree = ast.parse(source, filename=str(target))
+        compile(tree, str(target), "exec")
+        functions = {node.name for node in tree.body
+                     if isinstance(node, ast.FunctionDef)}
+        if not {"main", "parse_args"}.issubset(functions):
+            raise ValueError("download is not a tarpm-tag-runner script")
+        if source == target.read_bytes():
+            print(f"{PROG}: already up to date")
+            return 0
+        # Keep the temporary file beside the target so replacement is atomic.
+        # Resolving __file__ above preserves symlinks used to launch the runner.
+        with tempfile.NamedTemporaryFile(
+                dir=target.parent, prefix=f".{target.name}.",
+                suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(source)
+            output.flush()
+            os.fchmod(output.fileno(), mode)
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        print(f"{PROG}: updated {target}; use the new version on your next run")
+        return 0
+    except (OSError, urllib.error.URLError, http.client.HTTPException,
+            SyntaxError, ValueError) as exc:
+        print(f"{PROG}: update failed: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"{PROG}: could not remove temporary update "
+                      f"{temporary}: {exc}", file=sys.stderr)
+
+
 def parse_args(argv) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         prog=PROG,
@@ -1736,6 +1793,9 @@ def parse_args(argv) -> argparse.Namespace:
                          "even for passing RPMs (default: passing RPMs and "
                          "work dirs removed; warning logs retained)")
     # common
+    ap.add_argument("-u", "--update", action="store_true",
+                    help="replace this script with the latest version from "
+                         "GitHub main and exit; use on its own")
     ap.add_argument("-d", "--dir", default="rpms",
                     help="download directory (default: ./rpms)")
     ap.add_argument("-r", "--report",
@@ -1767,7 +1827,10 @@ def parse_args(argv) -> argparse.Namespace:
                          "omitted cases are not treated as resolved")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="echo each external command")
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = ap.parse_args(argv)
+    if args.update and len(argv) != 1:
+        ap.error("-u/--update must be used on its own")
     args.pkg = args.pkg or []
     args.arch = args.arch or []
     if args.jobs < 1:
@@ -1811,6 +1874,8 @@ def main(argv=None) -> int:
     t0 = time.monotonic()
     started = datetime.now(timezone.utc).isoformat()
     args = parse_args(argv)
+    if args.update:
+        return update_self()
     try:
         baseline = read_comparison_report(Path(args.compare)) if args.compare else None
     except UsageError as exc:

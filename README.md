@@ -41,6 +41,22 @@ python tarpm-tag-runner.py -p hello -a x86_64 --no-test
 python tarpm-tag-runner.py --test-only -p hello -a x86_64
 ```
 
+To update the runner in place from this repository's latest `main` branch:
+
+```bash
+python tarpm-tag-runner.py -u
+# Equivalent: python tarpm-tag-runner.py --update
+```
+
+Use the update option on its own. It requires network access and write
+access to the script's directory, but no Koji or tarpm installation. The
+download is checked for valid Python and expected runner functions before
+atomically replacing the script, preserving its permissions. If launched
+through a symlink, the target script is updated. Updates overwrite local
+edits to the script; other repository files are not updated. The command
+exits after updating, and the next invocation uses the new version. An
+identical download reports that the runner is already up to date.
+
 ## Options and build selection
 
 Run `python tarpm-tag-runner.py --help` for CLI help. Defaults: tag `f44`,
@@ -49,6 +65,7 @@ architectures plus source RPMs. Koji's default debuginfo exclusion applies.
 
 | Option | Effect |
 | --- | --- |
+| `-u`, `--update` | Update this script from GitHub's `main` branch and exit; use on its own. |
 | `-t TAG` | Koji tag to query. |
 | `-p PKG` | Select NVRs equal to `PKG` or starting with `PKG-`; repeatable. |
 | `-a ARCH` | Select this arch plus `noarch` and `src` (unless `--no-src`); repeatable. |
