@@ -184,6 +184,35 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), self.original)
 
 
+class CommandOutputTests(unittest.TestCase):
+    def test_real_child_preserves_exit_status_with_invalid_utf8(self):
+        for code in (0, 7):
+            for heartbeat in (0, 1):
+                with self.subTest(code=code, heartbeat=heartbeat):
+                    rc, output = mod.run([
+                        sys.executable, "-c",
+                        "import os, sys; os.write(1, b'diagnostic\\xff\\n'); "
+                        f"sys.exit({code})"], heartbeat=heartbeat)
+                    self.assertEqual(rc, code)
+                    self.assertEqual(output, "diagnostic\\xff\n")
+
+    def test_binary_output_preserves_invalid_bytes_and_line_endings(self):
+        for code in (0, 7):
+            with self.subTest(code=code):
+                rc, output = mod.run([
+                    sys.executable, "-c",
+                    "import os, sys; os.write(1, b'listing\\xff\\r\\n'); "
+                    f"sys.exit({code})"], binary_output=True)
+                self.assertEqual(rc, code)
+                self.assertEqual(output, b"listing\xff\r\n")
+
+    def test_missing_command_respects_binary_output(self):
+        with patch.object(mod.subprocess, "Popen", side_effect=FileNotFoundError):
+            rc, output = mod.run(["missing-tarpm"], binary_output=True)
+        self.assertEqual(rc, 127)
+        self.assertEqual(output, b"command not found: missing-tarpm")
+
+
 class RunnerTestCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ttr-test-")
@@ -1610,6 +1639,52 @@ class TestProgressTests(RunnerTestCase):
         self.assertEqual(result.stage, "unpack")
         starts = [line for line in stdout.getvalue().splitlines() if ": testing " in line]
         self.assertEqual(starts, [])
+
+
+class ListingEncodingTests(RunnerTestCase):
+    def test_listings_are_compared_and_saved_without_lossy_decoding(self):
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("original rpm")
+        (self.downloads / "logs").mkdir()
+        work = rpm.parent / ".tarpm-demo-1-1.noarch"
+        for original, repacked in ((b"name-\xff\n", b"name-\xff\n"),
+                                   (b"name-\xff\n", b"name-\xfe\n"),
+                                   (b"name-\\xff\n", b"name-\xff\n")):
+            with self.subTest(original=original, repacked=repacked):
+                listings = iter((original, repacked))
+
+                def command(cmd, **kwargs):
+                    return (0, next(listings)) if cmd[1] == "-t" else (0, "")
+
+                with patch.object(mod, "run", side_effect=command), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = mod.test_one(rpm, mod.parse_args(self.argv + ["--keep"]))
+                self.assertTrue(result.ok)
+                self.assertEqual(result.warning, "content-diff" if original != repacked else None)
+                self.assertEqual((work / "list-orig.txt").read_bytes(), original)
+                self.assertEqual((work / "list-repacked.txt").read_bytes(), repacked)
+                if original != repacked:
+                    self.assertIn("\\xff", result.log.read_text())
+
+    def test_failed_binary_listing_keeps_stage_exit_code_and_diagnostic(self):
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("original rpm")
+        (self.downloads / "logs").mkdir()
+
+        def command(cmd, **kwargs):
+            return (9, b"tarpm: invalid \xff\n") if cmd[1] == "-t" else (0, "")
+
+        with patch.object(mod, "run", side_effect=command), \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = mod.test_one(rpm, mod.parse_args(self.argv))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.stage, "list-original")
+        self.assertEqual(result.exit_code, 9)
+        self.assertEqual(result.signature, "invalid \\xff")
+        self.assertIn("invalid \\xff", result.log.read_text())
+        self.assertTrue(rpm.exists())
 
 
 class ArtifactRetentionTests(RunnerTestCase):

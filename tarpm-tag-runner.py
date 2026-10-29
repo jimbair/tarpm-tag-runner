@@ -350,7 +350,7 @@ class Counter:
 def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         heartbeat: int = 0, counter_suffix: str = "", suffix_fn=None,
         start: float | None = None, log_err: bool = False, label_fn=None,
-        detail_fn=None) -> tuple:
+        detail_fn=None, binary_output: bool = False) -> tuple:
     """Run an external command; return (exit_code, combined stdout+stderr).
 
     The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
@@ -373,6 +373,8 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     using cumulative partial output, such as the current RPM being fetched.
     `detail_fn(output, pid, elapsed)` can replace the parenthesized elapsed
     time and suffix with stage-specific progress details.
+    Text output uses UTF-8 with undecodable bytes escaped for diagnostics.
+    `binary_output` preserves the original bytes for listing comparisons.
     """
     try:
         proc = subprocess.Popen(
@@ -380,11 +382,14 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
             cwd=str(cwd) if cwd else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            text=not binary_output,
+            encoding=None if binary_output else "utf-8",
+            errors=None if binary_output else "backslashreplace",
             start_new_session=True,
         )
     except FileNotFoundError:
-        return 127, f"command not found: {cmd[0]}"
+        message = f"command not found: {cmd[0]}"
+        return 127, message.encode("utf-8") if binary_output else message
     t0 = start if start is not None else time.monotonic()
     try:
         while True:
@@ -413,7 +418,7 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         proc.kill()
         proc.wait()
         raise
-    return proc.returncode, out or ""
+    return proc.returncode, out or (b"" if binary_output else "")
 
 
 @dataclasses.dataclass
@@ -845,7 +850,8 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             unpacked_size = _tree_bytes(work / "ext")
         return unpacked_size
 
-    def timed_run(name: str, cmd: list, progress_fn=None) -> tuple:
+    def timed_run(name: str, cmd: list, progress_fn=None,
+                  binary_output: bool = False) -> tuple:
         position = ""
         if progress:
             n, total = progress
@@ -861,8 +867,11 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         start = time.monotonic()
         rc, out = run(cmd, label=f"testing {base}",
                       heartbeat=args.heartbeat, start=test_t0,
-                      counter_suffix=position, detail_fn=detail)
+                      counter_suffix=position, detail_fn=detail,
+                      binary_output=binary_output)
         stage_seconds[name] = time.monotonic() - start
+        if binary_output and isinstance(out, str):
+            out = out.encode("utf-8")
         return rc, out
 
     def stage(name: str, cmd: list, progress_fn=None) -> bool:
@@ -896,31 +905,34 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     # failed stage, not a diff to compare.
     warning = None
     if ok:
-        rc, list_orig = timed_run("list-original", ["tarpm", "-t", "-f", str(rpm)])
-        (work / "list-orig.txt").write_text(list_orig)
+        rc, list_orig = timed_run("list-original", ["tarpm", "-t", "-f", str(rpm)],
+                                 binary_output=True)
+        (work / "list-orig.txt").write_bytes(list_orig)
         if rc != 0:
             ok = False
             failed_stage = "list-original"
             failed_rc = rc
-            failed_out = list_orig
+            failed_out = list_orig.decode("utf-8", errors="backslashreplace")
             buf.append("$ tarpm -t -f " + str(rpm))
-            buf.append(list_orig.strip() or "(no output)")
+            buf.append(failed_out.strip() or "(no output)")
     if ok:
-        rc, list_repacked = timed_run("list-repacked", ["tarpm", "-t", "-f", str(repacked)])
-        (work / "list-repacked.txt").write_text(list_repacked)
+        rc, list_repacked = timed_run("list-repacked", ["tarpm", "-t", "-f", str(repacked)],
+                                     binary_output=True)
+        (work / "list-repacked.txt").write_bytes(list_repacked)
         if rc != 0:
             ok = False
             failed_stage = "list-repacked"
             failed_rc = rc
-            failed_out = list_repacked
+            failed_out = list_repacked.decode("utf-8", errors="backslashreplace")
             buf.append("$ tarpm -t -f " + str(repacked))
-            buf.append(list_repacked.strip() or "(no output)")
+            buf.append(failed_out.strip() or "(no output)")
     if ok and list_orig != list_repacked:
         warning = "content-diff"
         buf.append("content check: file lists differ (warning only)")
-        buf.append("\n".join(difflib.unified_diff(
+        difference = b"\n".join(difflib.diff_bytes(difflib.unified_diff,
             list_orig.splitlines(), list_repacked.splitlines(),
-            fromfile="original", tofile="repacked", lineterm="")))
+            fromfile=b"original", tofile=b"repacked", lineterm=b""))
+        buf.append(difference.decode("utf-8", errors="backslashreplace"))
 
     duration = time.monotonic() - test_t0
     buf.append("timings: " + ", ".join(f"{name}={seconds:.3f}s"

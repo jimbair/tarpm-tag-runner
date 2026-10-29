@@ -181,6 +181,9 @@ that needs it. Fast tests do not scan the tree for progress.
 The two listing outputs are compared with Python's `difflib`. A difference
 is a `content-diff` warning, not a failure; failure to generate a listing
 is a failed stage. This compares listings, not file bytes or all metadata.
+Listings are saved and compared as raw bytes, including non-UTF-8 filenames.
+Diagnostic logs and displayed diffs escape invalid UTF-8 bytes as `\xff`
+instead of failing to decode command output.
 
 | Result | Original RPM and work directory | Test log |
 | --- | --- | --- |
