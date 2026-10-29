@@ -773,13 +773,42 @@ def collect_test_units(args) -> list:
     return units
 
 
+def remove_tree(path: Path) -> None:
+    """Remove an owned artifact tree, repairing read-only directories once.
+
+    Keep the usual cleanup fast. If permissions prevent it, make only
+    directories within the remaining tree accessible to their owner,
+    without chmodding symlink targets, then retry. Persistent errors reach
+    the caller instead of silently leaving large extracted payloads.
+    """
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        def make_writable(directory):
+            info = directory.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                mode = stat.S_IMODE(info.st_mode)
+                if mode & stat.S_IRWXU != stat.S_IRWXU:
+                    directory.chmod(mode | stat.S_IRWXU)
+
+        def walk_error(exc):
+            raise exc
+
+        make_writable(path)
+        for directory, subdirs, _ in os.walk(path, followlinks=False,
+                                             onerror=walk_error):
+            for name in subdirs:
+                make_writable(Path(directory) / name)
+        shutil.rmtree(path)
+
+
 def test_one(rpm: Path, args, progress=None) -> TestResult:
     base = rpm.name[:-4] if rpm.name.endswith(".rpm") else rpm.name
     nvr = rpm.parent.name
     arch = base.rsplit(".", 1)[-1]
     work = rpm.parent / f".tarpm-{base}"
     if work.exists():
-        shutil.rmtree(work, ignore_errors=True)
+        remove_tree(work)
     work.mkdir(parents=True)
     test_t0 = time.monotonic()
 
@@ -898,9 +927,24 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
                                        for name, seconds in stage_seconds.items()))
     logfile.write_text("\n".join(buf) + "\n")
 
+    cleanup_error = None
+    if ok and not args.keep:
+        try:
+            remove_tree(work)
+        except OSError as exc:
+            # Keep the original and its log so recovery can retry cleanup
+            # and the build cannot be journaled as a completed pass.
+            ok = False
+            failed_stage = "cleanup"
+            failed_out = f"cannot remove test work directory {work}: {exc}"
+            cleanup_error = repr(exc)
+            buf.append(failed_out)
+            logfile.write_text("\n".join(buf) + "\n")
+
     res = TestResult(rpm=str(rpm), nvr=nvr, arch=arch, ok=ok,
                      stage=failed_stage, exit_code=failed_rc,
                      warning=warning, log=logfile,
+                     error=cleanup_error,
                      signature="" if ok else error_signature(failed_out),
                      duration_seconds=duration, stage_seconds=stage_seconds)
     tail = _test_tail(progress, duration)
@@ -917,10 +961,9 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     # when it records something to investigate — a failure (commands and
     # output) or a warning (the only copy of the content diff).
     if ok and not args.keep:
+        rpm.unlink(missing_ok=True)
         if not warning:
             logfile.unlink(missing_ok=True)
-        shutil.rmtree(work, ignore_errors=True)
-        rpm.unlink(missing_ok=True)
     return res
 
 
@@ -2109,7 +2152,7 @@ def main(argv=None) -> int:
                 if args.retry_failed or args.resume:
                     bdir = build_dir(args.dir, nvr)
                     if bdir.exists():
-                        shutil.rmtree(bdir)
+                        remove_tree(bdir)
                 fetch, tests = process_build(nvr, args, fetch_counter)
                 # Journal the build as it finishes, so a run that is
                 # interrupted or crashes still records what completed.

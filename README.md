@@ -194,6 +194,11 @@ on every attempt; retained artifacts show only the last attempt. Empty
 build directories are removed. To retest successful RPMs after updating
 tarpm, use `--keep` on the original run or download them again.
 
+Cleanup retries read-only artifact directories with owner access restored,
+without following symlinks. If a passed test's work directory still cannot
+be removed, the result fails at stage `cleanup` and retains the original
+RPM and log for recovery; it is not journaled as a pass.
+
 ```text
 rpms/
 ├── tag-f44.txt                      # cached tag list

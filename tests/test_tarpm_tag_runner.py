@@ -1613,6 +1613,87 @@ class TestProgressTests(RunnerTestCase):
 
 
 class ArtifactRetentionTests(RunnerTestCase):
+    def test_passing_test_removes_readonly_payload_directories(self):
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("original rpm")
+        (self.downloads / "logs").mkdir()
+        work = rpm.parent / ".tarpm-demo-1-1.noarch"
+
+        def command(cmd, **kwargs):
+            if cmd[1] == "-x":
+                directory = Path(cmd[-1]) / "readonly"
+                directory.mkdir(parents=True)
+                (directory / "data").write_text("payload")
+                directory.chmod(0o500)
+            return 0, "same listing\n"
+
+        with patch.object(mod, "run", side_effect=command), \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = mod.test_one(rpm, mod.parse_args(self.argv))
+        self.assertTrue(result.ok)
+        self.assertFalse(work.exists())
+        self.assertFalse(rpm.exists())
+        self.assertFalse(result.log.exists())
+
+    def test_permission_retry_repairs_nested_dirs_without_following_symlinks(self):
+        tree = self.root / "tree"
+        nested = tree / "locked/nested"
+        nested.mkdir(parents=True)
+        (nested / "data").write_text("payload")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("external data")
+        outside.chmod(0o555)
+        self.addCleanup(lambda: outside.chmod(0o755))
+        (tree / "link").symlink_to(outside, target_is_directory=True)
+        (tree / "locked").chmod(0o000)
+        real_rmtree = mod.shutil.rmtree
+        calls = 0
+
+        def remove(path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PermissionError("read-only payload")
+            self.assertEqual((tree / "locked").stat().st_mode & 0o700, 0o700)
+            return real_rmtree(path)
+
+        with patch.object(mod.shutil, "rmtree", side_effect=remove):
+            mod.remove_tree(tree)
+        self.assertEqual(calls, 2)
+        self.assertFalse(tree.exists())
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o555)
+        self.assertEqual((outside / "keep").read_text(), "external data")
+
+    def test_persistent_cleanup_failure_retains_rpm_log_and_test_timings(self):
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_text("original rpm")
+        for mode in ([], ["--test-only"]):
+            work = rpm.parent / ".tarpm-demo-1-1.noarch"
+            if work.exists():
+                shutil.rmtree(work)
+            with self.subTest(mode=mode), \
+                    patch.object(mod.shutil, "which", return_value="/fake/tool"), \
+                    patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)), \
+                    patch.object(mod, "run", return_value=(0, "listing\n")), \
+                    patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")):
+                # Each attempt starts without an old work dir so the failure
+                # occurs after all tarpm commands, during final cleanup.
+                path = self.root / "cleanup.json"
+                self.assertEqual(self.run_main(*mode, "--json", str(path)), 1)
+                result = json.loads(path.read_text())["test"][0]
+                self.assertEqual(result["stage"], "cleanup")
+                self.assertEqual(len(result["stage_seconds"]), 5)
+                self.assertIn("cannot remove test work directory", result["signature"])
+                self.assertTrue(rpm.exists())
+                self.assertIn("denied", Path(result["log"]).read_text())
+                if not mode:
+                    record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
+                    self.assertEqual(record["status"], "test-fail")
+                    self.assertEqual(record["stage"], "cleanup")
+
     def test_warning_retains_only_log_unless_keep(self):
         for keep in (False, True):
             with self.subTest(keep=keep):
