@@ -1308,30 +1308,23 @@ class FetchProgressTests(RunnerTestCase):
         (self.downloads / "first.rpm").write_bytes(b"x" * 2048)
         (self.downloads / "next.rpm").write_bytes(b"x" * 1024)
         output = "Downloading [2/2]: next.rpm\n"
-        self.assertEqual(mod.fetch_progress_label("demo-1-1", output),
-                         "fetching next.rpm (RPM 2/2, 100.0%)")
-        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
-                         ", 1 KiB so far")
-        self.assertEqual(mod.fetch_progress_label("demo-1-1", None), "fetching demo-1-1")
-        self.assertEqual(mod.fetch_progress_suffix(self.downloads, None),
-                         ", 3 KiB build total so far")
+        self.assertEqual(mod.fetch_progress("demo-1-1", self.downloads, output, 60),
+                         ("fetching next.rpm (RPM 2/2, 100.0%)", "1m 00s, 1 KiB so far"))
+        self.assertEqual(mod.fetch_progress("demo-1-1", self.downloads, None, 60),
+                         ("fetching demo-1-1", "1m 00s, 3 KiB build total so far"))
 
     def test_unknown_percentage_retains_native_rpm_size(self):
         output = "Downloading: demo.rpm\n" + self.bar("???%")
-        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
-                         ", 913.00 MiB / 1.46 GiB so far")
+        self.assertEqual(mod.fetch_progress("demo-1-1", self.downloads, output, 60),
+                         ("fetching demo.rpm", "1m 00s, 913.00 MiB / 1.46 GiB so far"))
         # Clients may emit only downloaded bytes, without the expected total.
         output = output.replace(" / 1.46 GiB", "")
-        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
-                         ", 913.00 MiB so far")
-        self.assertEqual(mod.fetch_progress_label("demo-1-1", output),
-                         "fetching demo.rpm")
+        self.assertEqual(mod.fetch_progress("demo-1-1", self.downloads, output, 60),
+                         ("fetching demo.rpm", "1m 00s, 913.00 MiB so far"))
         # Batch position is available even when the RPM's byte progress isn't.
         output = output.replace("Downloading:", "Downloading [2/3]:")
-        self.assertEqual(mod.fetch_progress_label("demo-1-1", output),
-                         "fetching demo.rpm (RPM 2/3, 66.7%)")
-        self.assertEqual(mod.fetch_progress_suffix(self.downloads, output),
-                         ", 913.00 MiB so far")
+        self.assertEqual(mod.fetch_progress("demo-1-1", self.downloads, output, 60),
+                         ("fetching demo.rpm (RPM 2/3, 66.7%)", "1m 00s, 913.00 MiB so far"))
 
     def test_fetch_heartbeat_uses_native_progress_and_keeps_full_output(self):
         args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
@@ -1349,6 +1342,7 @@ class FetchProgressTests(RunnerTestCase):
             (final, None),
         ]
         with patch.object(mod.subprocess, "Popen", return_value=proc) as popen, \
+                patch.object(mod, "koji_download_progress", wraps=mod.koji_download_progress) as parse, \
                 patch.object(mod, "_file_bytes", return_value=1024), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
             result = mod.fetch_one("demo-1-1", args, mod.Counter(2))
@@ -1357,6 +1351,7 @@ class FetchProgressTests(RunnerTestCase):
         self.assertEqual(popen.call_args.args[0], cmd)
         beats = [line for line in stdout.getvalue().splitlines() if "still fetching" in line]
         self.assertEqual(len(beats), 3)
+        self.assertEqual(parse.call_count, len(beats))
         self.assertIn("fetching first.rpm (RPM 1/2, 50.0%) (build 1/2)", beats[0])
         self.assertIn(", 913.00 MiB / 1.46 GiB, 61% so far)", beats[0])
         self.assertIn("fetching next.rpm (RPM 2/2, 100.0%) (build 1/2)", beats[1])
@@ -1365,6 +1360,18 @@ class FetchProgressTests(RunnerTestCase):
         self.assertIn("fetching next.rpm (RPM 2/2, 100.0%) (build 1/2)", beats[2])
         self.assertIn(", 913.00 MiB / 1.46 GiB, 21% so far)", beats[2])
         self.assertEqual(result.log.read_bytes().decode(), final)
+
+    def test_fast_fetch_does_not_parse_progress(self):
+        args = mod.parse_args(self.argv + ["--keep"])
+        (self.downloads / "logs").mkdir(parents=True)
+        proc = Mock(returncode=0)
+        proc.communicate.return_value = ("downloaded\n", None)
+        with patch.object(mod.subprocess, "Popen", return_value=proc), \
+                patch.object(mod, "koji_download_progress") as parse, \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = mod.fetch_one("demo-1-1", args)
+        self.assertTrue(result.ok)
+        parse.assert_not_called()
 
 
 class FetchRecoveryTests(RunnerTestCase):

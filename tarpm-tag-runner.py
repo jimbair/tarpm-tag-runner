@@ -348,9 +348,9 @@ class Counter:
 
 
 def run(cmd: list, cwd: Path | None = None, label: str | None = None,
-        heartbeat: int = 0, counter_suffix: str = "", suffix_fn=None,
-        start: float | None = None, log_err: bool = False, label_fn=None,
-        detail_fn=None, binary_output: bool = False) -> tuple:
+        heartbeat: int = 0, counter_suffix: str = "",
+        start: float | None = None, log_err: bool = False,
+        detail_fn=None, binary_output: bool = False, progress_fn=None) -> tuple:
     """Run an external command; return (exit_code, combined stdout+stderr).
 
     The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
@@ -362,15 +362,14 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     If `heartbeat` > 0 and `label` is set, a line is logged every
     `heartbeat` seconds while the command is still running, so a slow
     command does not look stuck:
-        still <label><counter_suffix> (<fmt_duration><suffix_fn(output, pid)>)
-    `counter_suffix` is the '(n/total)' fetch progress; `suffix_fn(output, pid)`
-    receives cumulative partial output (bytes, str, or None) and returns
-    extra progress text using the child PID if needed. `start` (a monotonic
+        still <label><counter_suffix> (<detail>)
+    `counter_suffix` is the '(n/total)' fetch progress. `start` (a monotonic
     timestamp) is the reference for the elapsed time (e.g. the start of a
     multi-stage test); it defaults to now.
     `log_err` routes heartbeat diagnostics to stderr for machine-readable
-    stdout, such as --list output. `label_fn(output)` can replace `label`
-    using cumulative partial output, such as the current RPM being fetched.
+    stdout, such as --list output. `progress_fn(output, pid, elapsed)` returns
+    (label, detail) together so both share one parsed output snapshot.
+    Output is cumulative partial output (bytes, str, or None).
     `detail_fn(output, pid, elapsed)` can replace the parenthesized elapsed
     time and suffix with stage-specific progress details.
     Text output uses UTF-8 with undecodable bytes escaped for diagnostics.
@@ -404,13 +403,14 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
                           if heartbeat > 0 else proc.communicate())
                 break
             except subprocess.TimeoutExpired as exc:
-                heartbeat_label = label_fn(exc.output) if label_fn else label
                 elapsed = time.monotonic() - t0
-                if detail_fn:
+                heartbeat_label = label
+                if progress_fn:
+                    heartbeat_label, detail = progress_fn(exc.output, proc.pid, elapsed)
+                elif detail_fn:
                     detail = detail_fn(exc.output, proc.pid, elapsed)
                 else:
-                    suffix = suffix_fn(exc.output, proc.pid) if suffix_fn else ""
-                    detail = fmt_duration(elapsed) + suffix
+                    detail = fmt_duration(elapsed)
                 log(f"{PROG}: still {heartbeat_label}{counter_suffix} "
                     f"({detail})",
                     err=log_err)
@@ -640,21 +640,17 @@ def koji_download_progress(output: bytes | str | None) -> KojiDownloadProgress |
     return KojiDownloadProgress(heading.group(3), position, percent, size_text)
 
 
-def fetch_progress_label(nvr: str, output: bytes | str | None) -> str:
+def fetch_progress(nvr: str, pdir: Path, output: bytes | str | None,
+                   elapsed: float) -> tuple[str, str]:
+    """Format a fetch heartbeat from one parse of the cumulative output."""
     progress = koji_download_progress(output)
     if progress is None:
-        return f"fetching {nvr}"
+        return (f"fetching {nvr}",
+                f"{fmt_duration(elapsed)}, {human(_dir_bytes(pdir))} build total so far")
     label = f"fetching {progress.filename}"
     if progress.position:
         index, total = progress.position
         label += f" (RPM {index}/{total}, {100 * index / total:.1f}%)"
-    return label
-
-
-def fetch_progress_suffix(pdir: Path, output: bytes | str | None) -> str:
-    progress = koji_download_progress(output)
-    if progress is None:
-        return f", {human(_dir_bytes(pdir))} build total so far"
     size = progress.size_text
     if size is None:
         size_bytes = _file_bytes(pdir / progress.filename)
@@ -663,7 +659,8 @@ def fetch_progress_suffix(pdir: Path, output: bytes | str | None) -> str:
     parts = [size] if size is not None else []
     if progress.percent is not None:
         parts.append(f"{progress.percent}%")
-    return ", " + ", ".join(parts) + " so far" if parts else ""
+    suffix = ", " + ", ".join(parts) + " so far" if parts else ""
+    return label, fmt_duration(elapsed) + suffix
 
 
 def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
@@ -694,8 +691,8 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
                   label=f"fetching {nvr}",
                   heartbeat=args.heartbeat,
                   counter_suffix=(f" (build {idx}/{counter.total})" if counter else ""),
-                  label_fn=lambda output: fetch_progress_label(nvr, output),
-                  suffix_fn=lambda output, pid: fetch_progress_suffix(pdir, output))
+                  progress_fn=lambda output, pid, elapsed:
+                  fetch_progress(nvr, pdir, output, elapsed))
     elapsed = time.monotonic() - t0
     logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
     logfile.write_text(out)
