@@ -105,6 +105,8 @@ caches without the marker are refreshed automatically once, including on
 `--resume` and `--retry-failed`, so existing image entries are removed before
 package, limit, and journal filtering. This refresh requires Koji access;
 if it fails, the old cache is preserved and the run stops.
+Fresh query output is validated and the cache is replaced atomically;
+interrupted or failed cache writes preserve the previous snapshot.
 
 `--from-file` accepts the same output or plain NVRs: the first
 whitespace-delimited token on each line is used; headers, blank lines, and

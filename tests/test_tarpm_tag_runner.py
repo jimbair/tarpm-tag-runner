@@ -610,6 +610,71 @@ class CliSelectionTests(RunnerTestCase):
                 self.assertIn("hub unavailable", stderr)
                 self.assertEqual(cache.read_text(), content)
 
+    def test_failed_cache_write_preserves_previous_snapshot(self):
+        self.downloads.mkdir()
+        cache = self.downloads / "tag-f44.txt"
+        previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\nother-1-1\n"
+        self.argv = ["-d", str(self.downloads), "--no-run-log"]
+        for operation in ("fsync", "replace"):
+            with self.subTest(operation=operation):
+                cache.write_text(previous)
+                with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                        patch.object(mod, "run", return_value=(0, "new-1-1\n")), \
+                        patch.object(mod.os, operation, side_effect=OSError("disk full")):
+                    result, stdout, stderr = self.list_output("--refresh")
+                self.assertEqual(result, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn("cannot save cached tag list", stderr)
+                self.assertEqual(cache.read_text(), previous)
+                self.assertEqual(list(self.downloads.glob(".tag-*.tmp")), [])
+                with patch.object(mod, "run") as query:
+                    result, stdout, _ = self.list_output()
+                self.assertEqual(result, 0)
+                self.assertEqual(stdout, "old-1-1\nother-1-1\n")
+                query.assert_not_called()
+
+    def test_interrupted_partial_cache_write_never_replaces_snapshot(self):
+        self.downloads.mkdir()
+        cache = self.downloads / "tag-f44.txt"
+        previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\nother-1-1\n"
+        cache.write_text(previous)
+        real_temporary = mod.tempfile.NamedTemporaryFile
+
+        def partial_file(**kwargs):
+            stream = real_temporary(**kwargs)
+            write = stream.write
+
+            def interrupted_write(text):
+                write(text[:len(mod.RPM_TAG_CACHE_HEADER) + len("new-1-1\n")])
+                stream.flush()
+                raise KeyboardInterrupt
+
+            stream.write = interrupted_write
+            return stream
+
+        self.argv = ["-d", str(self.downloads), "--no-run-log"]
+        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                patch.object(mod, "run", return_value=(0, "new-1-1\nother-1-1\n")), \
+                patch.object(mod.tempfile, "NamedTemporaryFile", side_effect=partial_file), \
+                self.assertRaises(KeyboardInterrupt):
+            self.list_output("--refresh")
+        self.assertEqual(cache.read_text(), previous)
+        self.assertEqual(list(self.downloads.glob(".tag-*.tmp")), [])
+
+    def test_invalid_query_output_does_not_replace_cache(self):
+        self.downloads.mkdir()
+        cache = self.downloads / "tag-f44.txt"
+        previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\n"
+        cache.write_text(previous)
+        self.argv = ["-d", str(self.downloads), "--no-run-log"]
+        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                patch.object(mod, "run", return_value=(0, "new-1-1\ninvalid\n")):
+            result, stdout, stderr = self.list_output("--refresh")
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("invalid build NVR", stderr)
+        self.assertEqual(cache.read_text(), previous)
+
     def test_recovery_drops_image_failures_from_legacy_cache(self):
         self.downloads.mkdir()
         cache = self.downloads / "tag-f44.txt"

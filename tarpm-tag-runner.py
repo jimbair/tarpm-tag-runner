@@ -467,6 +467,24 @@ def build_dir(directory: str, nvr: str) -> Path:
     return path
 
 
+def write_tag_cache(path: Path, text: str) -> None:
+    """Replace a tag snapshot only after its complete contents reach disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=path.parent, prefix=f".{path.name}.",
+                                         suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(RPM_TAG_CACHE_HEADER + text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def read_nvrs(args) -> tuple:
     """Return (NVR list, tag-list source) for the run.
 
@@ -517,8 +535,6 @@ def read_nvrs(args) -> tuple:
                     err=True)
                 raise UsageError(
                     f"'{shlex.join(cmd)}' failed (exit {rc}):\n{out}")
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(RPM_TAG_CACHE_HEADER + out)
             source = f"fetched from Koji ({elapsed:.1f}s)"
             text = out
     nvrs = []
@@ -535,6 +551,13 @@ def read_nvrs(args) -> tuple:
     # Input files can repeat NVRs. Each build must have exactly one worker:
     # duplicate workers share and delete the same RPMs and work directories.
     nvrs = list(dict.fromkeys(nvrs))
+    if source.startswith("fetched"):
+        # Validate every NVR before replacing a usable snapshot. A failed
+        # write or interrupt must never leave a trusted partial cache.
+        try:
+            write_tag_cache(cache, text)
+        except OSError as exc:
+            raise UsageError(f"cannot save cached tag list {cache}: {exc}") from exc
     if source.startswith("cached"):
         log(f"{PROG}: tag {args.tag}: using cached list ({len(nvrs)} packages, "
             f"saved {saved})", err=args.list)
