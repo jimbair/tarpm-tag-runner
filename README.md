@@ -123,7 +123,8 @@ diagnostics to stderr, so stdout can be saved and reused with `--from-file`.
 Koji matches architectures exactly, so the runner adds `noarch` and `src`
 when `-a` is supplied. Without `-a`, `--no-src` may still download source
 RPMs because Koji has no source-exclusion option; they are deleted after a
-successful fetch, even with `--keep`. Failed downloads retain partial files.
+successful fetch, even with `--keep`. Failed downloads retain partial files
+and fetch logs; empty build directories are removed unless `--keep` is set.
 In `--test-only`, source RPMs are simply skipped and left on disk.
 
 ## Test cycle and retained files

@@ -684,6 +684,13 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
             logfile.unlink(missing_ok=True)
     else:
         log(f"[fetch]  {nvr} FAIL (exit {rc}; log: {logfile})")
+        if not args.keep:
+            try:
+                # rmdir preserves all partial downloads, hidden files,
+                # and subdirectories. Cleanup must not mask the failure.
+                pdir.rmdir()
+            except OSError:
+                pass
     return FetchResult(nvr=nvr, ok=(rc == 0), exit_code=rc, log=logfile,
                        signature="" if rc == 0 else error_signature(out),
                        duration_seconds=elapsed)

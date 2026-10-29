@@ -1172,6 +1172,68 @@ class FetchProgressTests(RunnerTestCase):
 
 
 class FetchRecoveryTests(RunnerTestCase):
+    def test_failed_fetch_removes_empty_directory_and_keeps_failure_records(self):
+        for options in (["--no-test"], []):
+            with self.subTest(options=options), \
+                    patch.object(mod.shutil, "which", return_value="/fake/tool"), \
+                    patch.object(mod, "run", return_value=(7, "download failed")):
+                self.assertEqual(self.run_main(*options), 1)
+                self.assertFalse((self.downloads / "demo-1-1").exists())
+                logfile = self.downloads / "logs/demo-1-1.fetch.log"
+                self.assertEqual(logfile.read_text(), "download failed")
+                record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
+                self.assertEqual(record["status"], "fetch-fail")
+                self.assertEqual(record["exit_code"], 7)
+                self.assertEqual(record["signature"], "download failed")
+
+        # Recovery uses the journal, even after the empty directory is gone.
+        with patch.object(mod.shutil, "which", return_value="/fake/tool"), \
+                patch.object(mod, "run", return_value=(0, "downloaded")) as command:
+            self.assertEqual(self.run_main("--retry-failed"), 0)
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0][-1], "demo-1-1")
+
+    def test_failed_fetch_keep_retains_empty_directory(self):
+        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                patch.object(mod, "run", return_value=(1, "download failed")):
+            self.assertEqual(self.run_main("--no-test", "--keep"), 1)
+        bdir = self.downloads / "demo-1-1"
+        self.assertTrue(bdir.is_dir())
+        self.assertEqual(list(bdir.iterdir()), [])
+
+    def test_failed_fetch_preserves_all_directory_contents(self):
+        args = mod.parse_args(self.argv)
+        (self.downloads / "logs").mkdir(parents=True)
+        bdir = self.downloads / "demo-1-1"
+        bdir.mkdir()
+        for name in ("partial.rpm", ".download", "nested"):
+            with self.subTest(name=name):
+                item = bdir / name
+                if name == "nested":
+                    item.mkdir()
+                else:
+                    item.write_text("partial download")
+                with patch.object(mod, "run", return_value=(1, "download failed")), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = mod.fetch_one("demo-1-1", args)
+                self.assertFalse(result.ok)
+                self.assertTrue(item.exists())
+                if item.is_dir():
+                    item.rmdir()
+                else:
+                    self.assertEqual(item.read_text(), "partial download")
+                    item.unlink()
+
+    def test_failed_fetch_cleanup_error_preserves_original_failure(self):
+        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
+                patch.object(mod, "run", return_value=(7, "download failed")), \
+                patch.object(Path, "rmdir", side_effect=PermissionError("denied")):
+            self.assertEqual(self.run_main("--no-test"), 1)
+        self.assertTrue((self.downloads / "demo-1-1").is_dir())
+        record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
+        self.assertEqual(record["exit_code"], 7)
+        self.assertEqual(record["signature"], "download failed")
+
     def test_duplicate_nvrs_are_processed_once(self):
         self.listfile.write_text("demo-1-1\ndemo-1-1  # repeated\n")
         with patch.object(mod, "fetch_one", return_value=mod.FetchResult(
