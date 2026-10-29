@@ -229,6 +229,11 @@ class RunnerTestCase(unittest.TestCase):
         self.enter_patch.start()
         self.addCleanup(self.enter_patch.stop)
         self.addCleanup(lambda: journal._fh.close() if journal._fh else None)
+        # Main-loop command stubs must not depend on installed clients.
+        which_patch = patch.object(mod.shutil, "which",
+                                   side_effect=lambda name: f"/fake/{name}")
+        which_patch.start()
+        self.addCleanup(which_patch.stop)
         # Main-loop tests must not query the host's RPM database.
         package_patch = patch.object(mod, "tarpm_package_info", return_value={
             "executable": "/fake/tarpm", "package": {}, "rpm_info": None,
@@ -240,6 +245,66 @@ class RunnerTestCase(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             return mod.main(self.argv + list(extra))
+
+
+class MissingKojiTests(RunnerTestCase):
+    def test_missing_koji_preserves_run_state_for_cached_and_explicit_lists(self):
+        manifest = self.downloads / "run.json"
+        mod.write_run_manifest(manifest, ["demo-1-1"], "previous-run")
+        before_manifest = manifest.read_bytes()
+        journal = self.downloads / "journal.jsonl"
+        journal.write_text(json.dumps({"nvr": "demo-1-1", "status": "test-fail",
+                                       "run_id": "previous-run"}) + "\n")
+        before_journal = journal.read_bytes()
+        sentinel = self.downloads / "demo-1-1/partial.rpm"
+        sentinel.parent.mkdir()
+        sentinel.write_text("retained download")
+        (self.downloads / "tag-f44.txt").write_text(
+            mod.RPM_TAG_CACHE_HEADER + "demo-1-1\n")
+        for cached in (False, True):
+            argv = self.argv[2:] if cached else self.argv
+            for options in ([], ["--no-test"], ["--resume"], ["--retry-failed"]):
+                with self.subTest(cached=cached, options=options), \
+                        patch.object(mod.shutil, "which", side_effect=lambda name:
+                                     None if name == "koji" else "/fake/tarpm"), \
+                        patch.object(mod, "run") as command, \
+                        patch.object(mod, "process_build") as process, \
+                        patch.object(mod, "fetch_one") as fetch, \
+                        patch.object(mod.JOURNAL, "open") as open_journal, \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(mod.main(argv + options), 2)
+                self.assertIn("koji client not found", stderr.getvalue())
+                command.assert_not_called()
+                process.assert_not_called()
+                fetch.assert_not_called()
+                open_journal.assert_not_called()
+                self.assertEqual(manifest.read_bytes(), before_manifest)
+                self.assertEqual(journal.read_bytes(), before_journal)
+                self.assertEqual(sentinel.read_text(), "retained download")
+
+    def test_empty_recovery_does_not_require_koji_or_open_journal(self):
+        mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "finished")
+        (self.downloads / "journal.jsonl").write_text(json.dumps(
+            {"nvr": "demo-1-1", "status": "pass", "run_id": "finished"}) + "\n")
+        with patch.object(mod.shutil, "which", side_effect=lambda name:
+                          None if name == "koji" else "/fake/tarpm"), \
+                patch.object(mod.JOURNAL, "open") as open_journal:
+            for option in ("--resume", "--retry-failed"):
+                with self.subTest(option=option):
+                    self.assertEqual(self.run_main(option), 0)
+        open_journal.assert_not_called()
+
+    def test_cli_missing_koji_exits_two_without_creating_run_state(self):
+        empty_path = self.root / "empty-path"
+        empty_path.mkdir()
+        result = subprocess.run(
+            [sys.executable, str(_ROOT / "tarpm-tag-runner.py"),
+             *self.argv, "--no-test"], capture_output=True, text=True,
+            env={**os.environ, "PATH": str(empty_path)}, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("koji client not found", result.stderr)
+        self.assertFalse(self.downloads.exists())
 
 
 class JournalRecoveryTests(RunnerTestCase):
@@ -761,7 +826,6 @@ class CliSelectionTests(RunnerTestCase):
                 self.assertEqual(result, 0)
                 self.assertEqual(stdout, "")
                 self.assertIn("nothing to do", stderr)
-                mod.JOURNAL._fh.close()
 
 
 class PackageMetadataTests(unittest.TestCase):

@@ -2032,10 +2032,6 @@ def main(argv=None) -> int:
     do_fetch = not args.test_only
     # The tarpm test is the default; opt out with --no-test.
     do_test = args.test_only or (not args.no_test)
-    if do_fetch:
-        # One record per finished build; --test-only records nothing.
-        JOURNAL.open(str(Path(args.dir) / "journal.jsonl"))
-
     if args.test_only and not Path(args.dir).is_dir():
         log(f"{PROG}: error: --test-only: no download directory to test: "
               f"{args.dir}", err=True)
@@ -2130,6 +2126,13 @@ def main(argv=None) -> int:
                   f"{args.tag}", err=True)
             return 0
 
+        # Cached and explicit build lists bypass read_nvrs' query-time
+        # executable check. Fail once before changing the active run or
+        # journal, while still allowing offline lists and empty recovery.
+        if shutil.which("koji") is None:
+            log(f"{PROG}: error: koji client not found in PATH", err=True)
+            return 2
+
         if manifest is None:
             run_id = uuid.uuid4().hex
             try:
@@ -2139,6 +2142,8 @@ def main(argv=None) -> int:
                 return 2
 
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
+        # One record per finished build; --test-only records nothing.
+        JOURNAL.open(journal_path)
         total_selected = len(selected)
 
         def fail(nvr, exc):
