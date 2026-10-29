@@ -119,6 +119,8 @@ recovery, and local testing reject paths and symlinked build directories.
 
 `--list` applies resume/retry journal filters before printing and sends
 diagnostics to stderr, so stdout can be saved and reused with `--from-file`.
+If a pager such as `more` exits early, the runner exits quietly with status
+1 when it detects the closed stdout pipe.
 
 Koji matches architectures exactly, so the runner adds `noarch` and `src`
 when `-a` is supplied. Without `-a`, `--no-src` may still download source
@@ -406,7 +408,7 @@ RPM, it falls back to the build label and explicitly labels the build total.
 | Exit | Meaning |
 | --- | --- |
 | `0` | All fetches/tests succeeded (possibly with warnings), or nothing to resume/retry. |
-| `1` | A fetch or test failed; see the report. |
+| `1` | A fetch or test failed (see the report), or the stdout pipe closed early. |
 | `2` | Invalid arguments or setup/selection error, such as missing tarpm or nothing to test. |
 | `130` | Ctrl+C; takes precedence over failures. A force-quit has no new report. |
 

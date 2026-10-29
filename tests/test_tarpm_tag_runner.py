@@ -466,6 +466,44 @@ class CliSelectionTests(RunnerTestCase):
             result = mod.main(self.argv + ["--list"] + list(options))
         return result, stdout.getvalue(), stderr.getvalue()
 
+    def test_resume_list_closed_pipe_exits_without_tracebacks(self):
+        self.downloads.mkdir()
+        journal = self.downloads / "journal.jsonl"
+        journal.write_text(json.dumps({"nvr": "demo-0-1", "status": "test-fail",
+                                       "run_id": "pipe-test"}) + "\n")
+        before = journal.read_bytes()
+        manifest = self.downloads / "run.json"
+        runlog = self.root / "pipe-run.log"
+        env = os.environ.copy()
+        env.pop("PYTHONUNBUFFERED", None)
+        # Small output fails at the final flush; large output fails while
+        # printing. Both must avoid the interpreter's shutdown traceback.
+        for count in (1, 5000):
+            with self.subTest(count=count):
+                nvrs = [f"demo-{i}-1" for i in range(count)]
+                self.listfile.write_text("\n".join(nvrs) + "\n")
+                mod.write_run_manifest(manifest, nvrs, "pipe-test")
+                saved_manifest = manifest.read_bytes()
+                reader, writer = os.pipe()
+                os.close(reader)
+                try:
+                    result = subprocess.run(
+                        [sys.executable, str(_ROOT / "tarpm-tag-runner.py"),
+                         *self.argv[:-1], "--run-log", str(runlog),
+                         "--resume", "--list"],
+                        stdout=writer, stderr=subprocess.PIPE, text=True,
+                        env=env, timeout=10)
+                finally:
+                    os.close(writer)
+                self.assertEqual(result.returncode, 1)
+                for output in (result.stderr, runlog.read_text()):
+                    self.assertNotIn("BrokenPipeError", output)
+                    self.assertNotIn("Traceback", output)
+                    self.assertNotIn("Exception ignored", output)
+                self.assertEqual(journal.read_bytes(), before)
+                self.assertEqual(manifest.read_bytes(), saved_manifest)
+                self.assertFalse((self.root / "report.txt").exists())
+
     def test_test_only_list_is_rejected_without_touching_rpms(self):
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)

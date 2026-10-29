@@ -45,7 +45,8 @@ trust files from a force-quit run (continue with --resume, which also
 re-downloads builds with no journal record, or delete their DIR/<NVR>/
 directories before re-running).
 
-Exit status: 0 all ok, 1 some fetches/tests failed, 2 usage/environment,
+Exit status: 0 all ok, 1 some fetches/tests failed or stdout pipe closed,
+2 usage/environment,
 130 interrupted by Ctrl+C (partial results reported; takes precedence
 over 1).
 
@@ -2217,7 +2218,16 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        exit_code = main()
+        # Catch buffered output failures here rather than during shutdown.
+        sys.stdout.flush()
+        sys.exit(exit_code)
+    except BrokenPipeError:
+        # A pager may exit before consuming the full list. Redirect the
+        # descriptor so shutdown cannot flush into the closed pipe again.
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), sys.stdout.fileno())
+        sys.exit(1)
     except KeyboardInterrupt:
         log(f"{PROG}: interrupted (Ctrl+C)", err=True)
         sys.exit(130)
