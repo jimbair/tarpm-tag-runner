@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import ast
 import concurrent.futures
+import contextlib
 import dataclasses
 import difflib
 import hashlib
@@ -78,6 +79,8 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
+import xmlrpc.client
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,6 +89,10 @@ UPDATE_URL = ("https://raw.githubusercontent.com/jimbair/"
               "tarpm-tag-runner/main/tarpm-tag-runner.py")
 MAX_UPDATE_BYTES = 2 * 1024 * 1024
 RPM_TAG_CACHE_HEADER = "# tarpm-tag-runner: build-type=rpm\n"
+SIZE_HUB = "https://koji.fedoraproject.org/kojihub"
+SIZE_CACHE_VERSION = 1
+SIZE_BATCH = 50
+SIZE_BULK_MIN = 1000
 
 
 class UsageError(Exception):
@@ -589,6 +596,244 @@ def select_nvrs(nvrs: list, pkgs: list) -> list:
     return out
 
 
+def read_size_cache(path: Path, args) -> dict:
+    """Load usable exact-NVR totals; incompatible snapshots are rebuilt."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"cannot read build size cache {path}: {exc}") from exc
+    if (not isinstance(payload, dict)
+            or type(payload.get("schema_version")) is not int
+            or payload["schema_version"] != SIZE_CACHE_VERSION
+            or payload.get("hub") != SIZE_HUB
+            or payload.get("exclude_debuginfo") is not True
+            or not isinstance(payload.get("builds"), dict)):
+        log(f"{PROG}: ignoring incompatible build size cache {path}", err=args.list)
+        return {}
+    builds = {}
+    for nvr, row in payload["builds"].items():
+        try:
+            validate_nvr(nvr)
+        except UsageError:
+            continue
+        if (isinstance(row, dict) and type(row.get("build_id")) is int
+                and row["build_id"] > 0 and isinstance(row.get("bytes_by_arch"), dict)
+                and row["bytes_by_arch"]
+                and all(isinstance(arch, str) and arch
+                        and type(size) is int and size >= 0
+                        for arch, size in row["bytes_by_arch"].items())):
+            builds[nvr] = row
+    return builds
+
+
+def write_size_cache(path: Path, builds: dict, tag: str) -> None:
+    """Commit complete lookup batches without damaging an earlier snapshot."""
+    payload = {"schema_version": SIZE_CACHE_VERSION, "hub": SIZE_HUB,
+               "exclude_debuginfo": True, "generated": now_utc(),
+               "origin_tag": tag, "builds": builds}
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=path.parent, prefix=".build-sizes-",
+                                         suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise UsageError(f"cannot save build size cache {path}: {exc}") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _size_records(stream):
+    """Stream XML-RPC record structs, including records inside multicalls.
+
+    Discard completed records from the parent tree: a full tag response can
+    be hundreds of megabytes. Decode only fields needed for size totals.
+    """
+    fields = {"name", "nvr", "arch", "size", "id", "build_id", "state",
+              "faultCode", "faultString"}
+    stack = []
+    depth = 0
+    record_value = None
+    for event, element in ET.iterparse(stream, events=("start", "end")):
+        if event == "start":
+            stack.append(element)
+            depth += element.tag == "struct"
+            continue
+        if element.tag == "struct":
+            if depth == 1:
+                row = {}
+                for member in element.findall("member"):
+                    name = member.findtext("name")
+                    if name not in fields:
+                        continue
+                    value = member.find("value")
+                    if value is None:
+                        raise ValueError("missing XML-RPC value")
+                    child = value[0] if len(value) else value
+                    text = child.text or ""
+                    if child.tag in ("int", "i4", "i8", "biginteger"):
+                        row[name] = int(text)
+                    elif child.tag == "boolean":
+                        row[name] = text == "1"
+                    elif child.tag == "nil":
+                        row[name] = None
+                    else:
+                        row[name] = text
+                if "faultCode" in row:
+                    raise UsageError(f"Koji size lookup failed: {row.get('faultString', row)}")
+                yield row
+                record_value = stack[-2]
+                record_value.clear()
+            depth -= 1
+        if element is record_value:
+            stack[-2].remove(element)
+            record_value = None
+        stack.pop()
+
+
+def fetch_size_metadata(method: str, *params, **kwargs) -> tuple:
+    """Read-only Fedora RPC with bounded retries and streaming aggregation."""
+    if kwargs:
+        params += ({**kwargs, "__starstar": True},)
+    request = urllib.request.Request(
+        SIZE_HUB, data=xmlrpc.client.dumps(params, methodname=method,
+                                          allow_none=True).encode("utf-8"),
+        headers={"Content-Type": "text/xml", "User-Agent": "tarpm-tag-runner"})
+    for attempt in range(3):
+        # Each retry starts with fresh totals; partial responses cannot
+        # double-count RPMs or become a complete cached build.
+        builds, totals = {}, {}
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                for row in _size_records(response):
+                    if "arch" in row and "size" in row:
+                        name, arch = row.get("name"), row["arch"]
+                        build_id, size = row.get("build_id"), row["size"]
+                        if (not isinstance(name, str) or not name
+                                or not isinstance(arch, str) or not arch
+                                or type(build_id) is not int or build_id <= 0
+                                or type(size) not in (int, str)
+                                or (isinstance(size, str) and not size.isdecimal())
+                                or int(size) < 0):
+                            raise ValueError("invalid RPM size metadata")
+                        if (name.endswith(("-debuginfo", "-debugsource"))
+                                or "-debuginfo-" in name):
+                            continue
+                        by_arch = totals.setdefault(build_id, {})
+                        by_arch[arch] = by_arch.get(arch, 0) + int(size)
+                    elif "nvr" in row:
+                        nvr = row["nvr"]
+                        if not isinstance(nvr, str):
+                            raise ValueError("invalid build NVR metadata")
+                        validate_nvr(nvr)
+                        build_id = row.get("build_id", row.get("id"))
+                        if (type(build_id) is not int or build_id <= 0
+                                or ("state" in row and row["state"] != 1)):
+                            raise ValueError(f"build is not complete: {nvr}")
+                        builds[nvr] = build_id
+                    else:
+                        raise ValueError("unrecognized Koji size record")
+            return builds, totals
+        except (OSError, urllib.error.URLError, http.client.HTTPException,
+                ET.ParseError) as exc:
+            if attempt == 2:
+                raise UsageError(f"cannot fetch build sizes: {exc}") from exc
+            log(f"{PROG}: build size lookup failed; retrying "
+                f"({attempt + 2}/3): {exc}", err=True)
+            time.sleep(attempt + 1)
+        except ValueError as exc:
+            raise UsageError(f"invalid Koji size metadata: {exc}") from exc
+
+
+@contextlib.contextmanager
+def size_progress(args, verb: str, total: int):
+    """Keep both network waits and metadata parsing visible on heartbeats."""
+    start = time.monotonic()
+    done = [0]
+    stop = threading.Event()
+    log(f"{PROG}: {verb.capitalize()} build sizes for {total} build(s)", err=args.list)
+
+    def heartbeat():
+        while not stop.wait(args.size_heartbeat):
+            try:
+                log(f"{PROG}: still {verb} build sizes "
+                    f"({fmt_duration(time.monotonic() - start)}; "
+                    f"{done[0]}/{total} ready)", err=args.list)
+            except OSError:
+                return  # Let the main thread handle a closed output pipe.
+
+    thread = None
+    try:
+        if args.size_heartbeat:
+            thread = threading.Thread(target=heartbeat, daemon=True)
+            thread.start()
+        yield done
+    finally:
+        stop.set()
+        if thread is not None and thread.ident is not None:
+            thread.join()
+
+
+def sort_nvrs_by_size(nvrs: list, args) -> list:
+    """Enrich the existing selection; never replace it with current tag membership."""
+    path = Path(args.dir) / "build-sizes.json"
+    cache = read_size_cache(path, args)
+    missing = [nvr for nvr in nvrs if nvr not in cache]
+    if missing:
+        verb = "updating" if cache else "generating"
+        start = time.monotonic()
+        with size_progress(args, verb, len(missing)) as done:
+            if not args.from_file and len(missing) >= SIZE_BULK_MIN:
+                builds, totals = fetch_size_metadata(
+                    "listTaggedRPMS", args.tag, inherit=True, latest=True,
+                    type="rpm", extra=False)
+                cache.update({nvr: {"build_id": build_id, "bytes_by_arch": totals[build_id]}
+                              for nvr, build_id in builds.items() if build_id in totals})
+                write_size_cache(path, cache, args.tag)
+                done[0] = sum(nvr in cache for nvr in missing)
+            # Cached snapshots and explicit files may include builds no
+            # longer latest in the tag. Resolve those exact NVRs directly.
+            pending = [nvr for nvr in missing if nvr not in cache]
+            for offset in range(0, len(pending), SIZE_BATCH):
+                batch = pending[offset:offset + SIZE_BATCH]
+                calls = [{"methodName": "getBuild", "params": [nvr]} for nvr in batch]
+                builds, _ = fetch_size_metadata("multiCall", calls)
+                if any(nvr not in builds for nvr in batch):
+                    raise UsageError("cannot find exact build sizes for: " +
+                                     ", ".join(nvr for nvr in batch if nvr not in builds))
+                calls = [{"methodName": "listRPMs",
+                          "params": [{"buildID": builds[nvr], "__starstar": True}]}
+                         for nvr in batch]
+                _, totals = fetch_size_metadata("multiCall", calls)
+                if any(builds[nvr] not in totals for nvr in batch):
+                    raise UsageError("no RPM size metadata for: " + ", ".join(
+                        nvr for nvr in batch if builds[nvr] not in totals))
+                cache.update({nvr: {"build_id": builds[nvr],
+                                    "bytes_by_arch": totals[builds[nvr]]} for nvr in batch})
+                write_size_cache(path, cache, args.tag)
+                done[0] += len(batch)
+        log(f"{PROG}: build sizes ready ({len(nvrs)} build(s), "
+            f"{fmt_duration(time.monotonic() - start)}; cache: {path})", err=args.list)
+    else:
+        log(f"{PROG}: using cached build sizes for {len(nvrs)} build(s)", err=args.list)
+
+    def key(nvr):
+        size = sum(size for arch, size in cache[nvr]["bytes_by_arch"].items()
+                   if arch_selected(arch, args.arch) and not (args.no_src and arch == "src"))
+        return (-size if args.sort == "desc" else size), nvr
+
+    return sorted(nvrs, key=key)
+
+
 @dataclasses.dataclass(frozen=True)
 class KojiDownloadProgress:
     filename: str
@@ -761,6 +1006,23 @@ def collect_test_units(args) -> list:
     units = []
     if not root.is_dir():
         return units
+    if args.sort:
+        ranked = []
+        try:
+            for d in root.iterdir():
+                if not d.is_dir() or d.name == "logs":
+                    continue
+                if args.pkg and not select_nvrs([d.name], args.pkg):
+                    continue
+                local = build_units(build_dir(args.dir, d.name), args)
+                size = sum(rpm.stat().st_size for rpm in local)
+                ranked.append(((-size if args.sort == "desc" else size), d.name, local))
+        except OSError as exc:
+            raise UsageError(f"cannot measure local build sizes: {exc}") from exc
+        ranked.sort(key=lambda row: (row[0], row[1]))
+        if args.limit:
+            ranked = ranked[:args.limit]
+        return [rpm for _, _, local in ranked for rpm in local]
     builds = 0
     for d in sorted(root.iterdir(), key=lambda p: p.name):
         if not d.is_dir() or d.name == "logs":
@@ -1368,6 +1630,8 @@ def write_report(args, fetch: list | None, test: list | None,
           f"(includes noarch; source RPMs {'excluded' if args.no_src else 'included'})")
         A(f"filters:   packages={', '.join(args.pkg) or 'all'}; limit={args.limit or 'none'}; "
           f"resume={args.resume}; retry-failed={args.retry_failed}; keep={args.keep}")
+        if args.sort:
+            A(f"sort:      {args.sort} (selected RPM bytes per build)")
         system = session['system']
         A(f"system:    {system['system']} {system['release']} {system['machine']}; "
           f"Python {system['python']}")
@@ -1908,6 +2172,9 @@ def parse_args(argv) -> argparse.Namespace:
                          "for ARCH (plus noarch and src). Repeatable.")
     ap.add_argument("-n", "--limit", type=int, default=0,
                     help="only process the first N builds (smoke test)")
+    ap.add_argument("--sort", choices=("asc", "desc"),
+                    help="sort builds by selected RPM size before -n: "
+                         "asc for smallest first, desc for largest first")
     ap.add_argument("--list", action="store_true",
                     help="print the NVRs that would be fetched and exit "
                          "without downloading (incompatible with --test-only)")
@@ -1948,10 +2215,10 @@ def parse_args(argv) -> argparse.Namespace:
                     help="do not write a run log")
     ap.add_argument("-j", "--jobs", type=int, default=1,
                     help="number of parallel fetches/tests (default: 1)")
-    ap.add_argument("--heartbeat", type=int, default=60,
+    ap.add_argument("--heartbeat", type=int,
                     help="while a command runs longer than this, log a "
                          "progress line every N seconds (0 disables; "
-                         "default: 60)")
+                         "default: 60, or 15 for build size lookups)")
     ap.add_argument("--resume", action="store_true",
                     help="continue DIR/run.json, skipping that run's test "
                          "passes/warnings (legacy journal fallback if absent)")
@@ -1973,6 +2240,8 @@ def parse_args(argv) -> argparse.Namespace:
         ap.error("-u/--update must be used on its own")
     args.pkg = args.pkg or []
     args.arch = args.arch or []
+    args.size_heartbeat = 15 if args.heartbeat is None else args.heartbeat
+    args.heartbeat = 60 if args.heartbeat is None else args.heartbeat
     if args.jobs < 1:
         ap.error("-j/--jobs expects a positive integer")
     if args.limit < 0:
@@ -2046,7 +2315,8 @@ def main(argv=None) -> int:
         "mode": "test-only" if args.test_only else "fetch-and-test" if do_test else "fetch-only",
         "settings": {"jobs": args.jobs, "architectures": args.arch,
                      "include_source": not args.no_src, "packages": args.pkg,
-                     "limit": args.limit, "keep": args.keep, "resume": args.resume,
+                     "limit": args.limit, "sort": args.sort,
+                     "keep": args.keep, "resume": args.resume,
                      "retry_failed": args.retry_failed},
         "system": {"system": platform.system(), "release": platform.release(),
                    "machine": platform.machine(), "python": platform.python_version()},
@@ -2075,14 +2345,45 @@ def main(argv=None) -> int:
             log(f"{PROG}: error: no builds matched the -p filters: "
                   f"{' '.join(args.pkg)}", err=True)
             return 2
+        journal_path = str(Path(args.dir) / "journal.jsonl")
+        latest = {}
+        if args.resume:
+            try:
+                manifest = read_run_manifest(Path(args.dir) / "run.json")
+            except UsageError as exc:
+                log(f"{PROG}: error: {exc}", err=True)
+                return 2
+            if manifest is not None:
+                run_id = manifest["run_id"]
+            latest = read_journal(journal_path, run_id=run_id)
+        elif args.retry_failed:
+            latest = read_journal(journal_path)
+
+        # Avoid all size-cache/network work when recovery has nothing left.
+        # Sorting otherwise precedes -n, which still precedes journal filters.
+        eligible = selected
+        if args.resume:
+            active = set(manifest["nvrs"]) if manifest is not None else set(selected)
+            eligible = [n for n in selected if n in active
+                        and latest.get(n, {}).get("status") not in ("pass", "warn")]
+        elif args.retry_failed:
+            eligible = [n for n in selected
+                        if latest.get(n, {}).get("status") in ("fetch-fail", "test-fail")]
+        if args.sort and eligible:
+            if not args.list and shutil.which("koji") is None:
+                log(f"{PROG}: error: koji client not found in PATH", err=True)
+                return 2
+            try:
+                selected = sort_nvrs_by_size(selected, args)
+            except UsageError as exc:
+                log(f"{PROG}: error: {exc}", err=True)
+                return 2
         if args.limit > 0:
             selected = selected[:args.limit]
 
-        journal_path = str(Path(args.dir) / "journal.jsonl")
         if args.retry_failed:
             # Select the builds whose latest journal record is a failure;
             # -p and -n above have already shaped the candidate list.
-            latest = read_journal(journal_path)
             failed = {n for n, r in latest.items()
                       if r.get("status") in ("fetch-fail", "test-fail")}
             selected = [n for n in selected if n in failed]
@@ -2094,16 +2395,9 @@ def main(argv=None) -> int:
         if args.resume:
             # Only passes from this run can satisfy its selection. Older
             # successes must not hide unfinished or queued re-test attempts.
-            try:
-                manifest = read_run_manifest(Path(args.dir) / "run.json")
-            except UsageError as exc:
-                log(f"{PROG}: error: {exc}", err=True)
-                return 2
             if manifest is not None:
-                run_id = manifest["run_id"]
                 run_builds = set(manifest["nvrs"])
                 selected = [n for n in selected if n in run_builds]
-            latest = read_journal(journal_path, run_id=run_id)
             before = len(selected)
             selected = [n for n in selected
                         if latest.get(n, {}).get("status")

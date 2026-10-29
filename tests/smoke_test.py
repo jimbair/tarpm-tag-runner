@@ -52,7 +52,7 @@ def main():
                    (downloads / "journal.jsonl").read_text().splitlines()]
         return {record["nvr"]: record for record in records}
 
-    fetched = invoke("fetch-only", "--no-test")
+    fetched = invoke("fetch-only", "--no-test", "--sort", "asc")
     require(fetched and fetched["fetch"] and not fetched["test"],
             "fetch-only must download builds without testing")
     require(all(row["ok"] for row in fetched["fetch"]), "hello download failed")
@@ -64,6 +64,15 @@ def main():
     require(all(row.get("run_id") == manifest["run_id"] for row in journal().values()),
             "journal records must belong to the active run")
     require(list(downloads.glob("*/*.src.rpm")), "source RPM was not fetched")
+    size_path = downloads / "build-sizes.json"
+    size_snapshot = size_path.read_bytes()
+    sizes = json.loads(size_snapshot)
+    require(sizes["schema_version"] == 1 and sizes["exclude_debuginfo"]
+            and all(row["nvr"] in sizes["builds"] for row in fetched["fetch"]),
+            "size sorting must cache metadata for every selected build")
+    require(all({"src", args.arch} <= sizes["builds"][row["nvr"]]["bytes_by_arch"].keys()
+                for row in fetched["fetch"]),
+            "size cache must retain source and binary architecture totals")
 
     # A resumed build must discard everything left by an earlier attempt.
     sentinels = []
@@ -71,7 +80,9 @@ def main():
         sentinel = downloads / row["nvr"] / "stale-from-interrupt"
         sentinel.write_text("must be removed before fetching")
         sentinels.append(sentinel)
-    resumed = invoke("resume-and-test", "--resume", "--keep")
+    resumed = invoke("resume-and-test", "--resume", "--keep", "--sort", "desc")
+    require(size_path.read_bytes() == size_snapshot,
+            "fully cached size sorting must not rewrite the snapshot")
     require(resumed and resumed["test"] and all(row["ok"] for row in resumed["test"]),
             "resume must round-trip the fetched hello RPMs")
     session = resumed["session"]
@@ -117,7 +128,7 @@ def main():
     require(skipped is None and journal() == before,
             "resume should skip tested builds without writing new results")
 
-    local = invoke("test-only", "--test-only", "--no-src", "-j", "2",
+    local = invoke("test-only", "--test-only", "--no-src", "-j", "2", "--sort", "asc",
                    "--compare", str(output / "resume-and-test.json"))
     require(local and not local["fetch"] and local["test"],
             "test-only must test downloaded binaries")

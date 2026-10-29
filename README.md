@@ -33,6 +33,9 @@ sudo dnf install tarpm
 # Preview a small selection without downloading RPMs:
 python tarpm-tag-runner.py -t f44 -p hello --list
 
+# Preview the ten smallest builds for x86_64, including noarch and src:
+python tarpm-tag-runner.py -t f44 -a x86_64 --sort asc -n 10 --list
+
 # Fetch and test hello, including its source RPM; keep all artifacts:
 python tarpm-tag-runner.py -t f44 -p hello -a x86_64 --keep
 
@@ -74,6 +77,7 @@ architectures plus source RPMs. Koji's default debuginfo exclusion applies.
 | `-a ARCH` | Select this arch plus `noarch` and `src` (unless `--no-src`); repeatable. |
 | `-d DIR` | Put each build in `DIR/<NVR>/`. |
 | `-n NUM` | Process the first NUM builds; `0` means no limit. |
+| `--sort asc\|desc` | Order builds by selected RPM bytes, smallest/largest first, before `-n`. |
 | `--list` | Print selected NVRs and exit without downloading RPMs; incompatible with `--test-only`. |
 | `--from-file FILE` | Read a build list instead of querying Koji or using the cache. |
 | `--refresh` | Replace the cached tag list with a fresh Koji query. |
@@ -87,7 +91,7 @@ architectures plus source RPMs. Koji's default debuginfo exclusion applies.
 | `--compare FILE` | Compare outcomes with a previous JSON report; incompatible with `--list`. |
 | `--run-log FILE` | Append runner log lines to FILE; default `DIR/run.log`. |
 | `--no-run-log` | Disable the run log. |
-| `--heartbeat N` | Log progress every N seconds during external commands; default 60, `0` disables. |
+| `--heartbeat N` | Log progress every N seconds; default 60 for commands and 15 for size lookups. An explicit value overrides both; `0` disables. |
 | `--resume` | Continue the active run, skipping its test passes/warnings; download and test the rest afresh. |
 | `--retry-failed` | Download and test only journaled failures, starting from clean build directories. |
 | `-v` | Echo external commands. |
@@ -115,11 +119,58 @@ recovery selections with nothing pending do not require Koji.
 
 `--from-file` accepts the same output or plain NVRs: the first
 whitespace-delimited token on each line is used; headers, blank lines, and
-`#` comments are ignored. Explicit files are used as supplied, without a
+`#` comments are ignored. Explicit files supply the candidate NVRs, without a
 Koji build-type query; generate them with the filtered command above to
 exclude image-only builds. Duplicate NVRs run once. `-n` is applied after
-package filtering and before journal filtering. In `--test-only`, it limits
-matching build directories in alphabetical order.
+package filtering and optional size sorting, before journal filtering. In
+`--test-only`, it limits matching build directories in alphabetical order
+unless `--sort` is supplied.
+
+### Size ordering
+
+`--sort asc` processes the smallest builds first; `--sort desc` processes
+the largest first. Size is the sum of compressed RPM bytes selected by
+`-a` and `--no-src`, including the automatic noarch/source selections and
+excluding Koji's default debuginfo/debugsource packages. Equal sizes use
+ascending NVR order. These are input sizes, not estimates of unpacked disk
+space or test duration. Parallel workers may finish in a different order.
+
+Size sorting augments the existing tag/file selection. Without `--sort`,
+the runner does not read the size cache or query size metadata. `--list`
+prints the chosen NVR order with diagnostics on stderr. Sorting precedes
+`-n`; resume/retry journal filters still follow `-n`, so a limited selection
+whose builds already passed may have nothing pending.
+
+Metadata is cached as `DIR/build-sizes.json`: a JSON snapshot containing
+the Fedora hub URL, schema version, debug-exclusion policy, generation
+time, and a `builds` map keyed by exact NVR. Entries store the build ID and
+`bytes_by_arch`, allowing architecture/source filters to change without a
+new lookup. Tag membership remains in the existing tag snapshot; the size
+cache can contain builds from several tags and retained older builds.
+It is a lookup snapshot, separate from the append-only JSONL journal.
+
+Large uncached tag selections use Fedora's `listTaggedRPMS` API. Small
+selections, explicit files, and missing older NVRs use bounded batches of
+exact-build lookups. The standard-library metadata reader queries
+`https://koji.fedoraproject.org/kojihub` directly and streams the XML
+response, retaining totals rather than all RPM records in memory.
+These queries do not download RPMs or change which builds were selected.
+
+The runner logs `Generating build sizes` for a new cache, `Updating build
+sizes` for missing entries, or `using cached build sizes` when all entries
+are available. Generation and updates emit a heartbeat every 15 seconds by
+default, covering both network waits and aggregation; `--heartbeat` can
+override or disable it. Completion reports elapsed time and the cache path.
+Complete lookup batches are saved atomically, so interrupted updates keep
+earlier batches and preserve the previous snapshot. Network retries are
+bounded; an unresolved size is an error, never an assumed zero.
+
+`--refresh` refreshes tag membership; sizes already cached for exact NVRs
+remain reusable, and only missing entries need updating. A corrupt cache
+is a setup error; remove it to rebuild. An incompatible hub/schema/policy
+is reported and rebuilt when sizes are needed. Fully cached selections can
+be listed offline. In `--test-only`, sorting uses selected local RPM file
+sizes per build, with no metadata queries or size-cache access.
 
 Build lists must contain plain `name-version-release` values. Fetch,
 recovery, and local testing reject paths and symlinked build directories.
@@ -210,6 +261,7 @@ RPM and log for recovery; it is not journaled as a pass.
 ```text
 rpms/
 ├── tag-f44.txt                      # cached tag list
+├── build-sizes.json                 # optional per-NVR size cache (--sort)
 ├── journal.jsonl                    # finished-build records
 ├── run.json                         # active run ID and full build selection
 ├── run.log                          # append-only runner log
