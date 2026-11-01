@@ -62,7 +62,9 @@ import dataclasses
 import difflib
 import hashlib
 import http.client
+import itertools
 import json
+import math
 import os
 import platform
 import re
@@ -453,6 +455,14 @@ class TestResult:
     signature: str = ""             # error_signature of the failing output
     duration_seconds: float | None = None  # test wall time, before cleanup
     stage_seconds: dict = dataclasses.field(default_factory=dict)
+
+
+def result_record(result) -> dict:
+    """JSON-safe result, retained even when successful RPMs/logs are removed."""
+    row = dataclasses.asdict(result)
+    if result.log is not None:
+        row['log'] = str(result.log.resolve())
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -1606,10 +1616,36 @@ def compare_results(baseline: dict, fetch: list | None, test: list | None) -> di
     return comparison
 
 
+def preserve_legacy_report(path: Path, marker: bytes) -> Path | None:
+    """Preserve pre-upgrade reports whose RPM detail the old journal lacks."""
+    try:
+        previous = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    if marker in previous:
+        return None
+    backup = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent,
+                                         prefix=path.name + '.before-resume-',
+                                         suffix='.bak', delete=False) as stream:
+            backup = Path(stream.name)
+            stream.write(previous)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+        raise
+    log(f"{PROG}: preserved previous report with legacy RPM totals: {backup}")
+    return backup
+
+
 def write_report(args, fetch: list | None, test: list | None,
                  runtime: float, tag_source: str | None = None,
                  interrupted: bool = False, total_selected: int = 0,
-                 session: dict | None = None, comparison: dict | None = None) -> Path:
+                 session: dict | None = None, comparison: dict | None = None,
+                 run: dict | None = None) -> Path:
     report = Path(args.report)
     fetch_failed = [r for r in (fetch or []) if not r.ok]
     test_failed = [r for r in (test or []) if not r.ok]
@@ -1620,10 +1656,10 @@ def write_report(args, fetch: list | None, test: list | None,
     A(f"=== {PROG} report ===")
     A(f"generated: {session['finished'] if session else now_utc()}")
     A(f"tag:       {args.tag}")
-    A(f"runtime:   {fmt_duration(runtime)}")
+    A(f"runtime:   {fmt_duration(runtime)}" + (" (this invocation)" if run else ""))
     if session:
         A(f"started:   {session['started']}")
-        A(f"status:    {session['status']}")
+        A(f"status:    {session['status']}" + (" (this invocation)" if run else ""))
         A(f"command:   {shlex.join(session['command'])}")
         A(f"mode:      {session['mode']}; workers: {args.jobs}")
         A(f"arches:    {', '.join(args.arch) if args.arch else 'all'} "
@@ -1637,20 +1673,36 @@ def write_report(args, fetch: list | None, test: list | None,
           f"Python {system['python']}")
         info = session['tarpm']
         if info is None:
-            A("tarpm:     not used (fetch only)")
+            A("tarpm:     not used (" +
+              ("fetch only)" if args.no_test else "no tests this invocation)"))
         else:
-            A(f"tarpm:     {package_label(info)} (RPM package)")
+            A(f"tarpm:     {package_label(info)} (RPM package" +
+              ("; this invocation)" if run else ")"))
             A(f"binary:    {info['executable']}")
             if info['error']:
                 A(f"RPM query: {info['error']}")
     if interrupted:
         A("interrupted: yes (Ctrl+C; partial results)")
+    if run:
+        A(f"scope:     cumulative run {run['id']} (latest outcome per build)")
+        A(f"run start: {run['started']}")
+        A(f"run status: {run['status']}; {run['pending_builds']} build(s) pending")
+        A("builds:    " + ", ".join(f"{status}={count}" for status, count in
+                                      sorted(run['build_statuses'].items())))
+        if run['command']:
+            A(f"original command: {shlex.join(run['command'])}")
+        if run['tarpm_versions']:
+            A("saved test versions: " + ", ".join(run['tarpm_versions']))
+        if run['summary_only_builds']:
+            A(f"WARNING: {len(run['summary_only_builds'])} build(s) have summary-only journal records.")
+            A("RPM totals, failure rates, diagnostics, and timings cover detailed records only;")
+            A("older RPM results cannot be reconstructed. Build statuses above include those records.")
     if fetch is not None:
         A("--- fetch ---")
         if tag_source:
             A(f"tag list: {tag_source}")
         A(f"selected: {total_selected or len(fetch)} build(s)")
-        if interrupted:
+        if interrupted or (run and len(fetch) != total_selected):
             A(f"completed: {len(fetch)} build(s)")
         A(f"ok:       {len(fetch) - len(fetch_failed)}")
         A(f"failed:   {len(fetch_failed)}")
@@ -1666,8 +1718,10 @@ def write_report(args, fetch: list | None, test: list | None,
         if session and 'selected_rpms' in session:
             A(f"selected: {session['selected_rpms']} RPM(s); completed: {len(test)}")
         if not args.keep:
-            A(f"removed:  {len(test) - len(test_failed)} passed RPM(s) "
-              f"(failures kept)")
+            removed = (session['summary']['test']['ok'] if run and session
+                       else len(test) - len(test_failed))
+            A(f"removed:  {removed} passed RPM(s) "
+              f"({'this invocation; ' if run else ''}failures kept)")
     A(f"downloads: {args.dir}")
     A(f"run log:   {args.run_log if args.run_log else '- (disabled)'}")
 
@@ -1692,6 +1746,8 @@ def write_report(args, fetch: list | None, test: list | None,
         if isinstance(previous_tarpm, dict):
             A(f"previous tarpm: {package_label(previous_tarpm)}")
         A("Only exact build/RPM matches can regress or resolve; omitted cases are not resolved.")
+        if run:
+            A("Comparison covers this invocation; carried-over results are not counted as rechecked.")
         for phase in ("fetch", "test"):
             changes = comparison[phase]
             A(f"{phase}: {changes['rechecked']} rechecked, {changes['new_cases']} new cases, "
@@ -1772,17 +1828,49 @@ def write_report(args, fetch: list | None, test: list | None,
         for r in test_warn:
             A(f"- {rpm_label(r.rpm)}: {r.warning} (see {r.log})")
 
+    if run and run['legacy_test_failures']:
+        A("")
+        A("=== BUILD TEST FAILURES WITH INCOMPLETE RPM DETAILS ===")
+        for rec in run['legacy_test_failures']:
+            A(f"- {rec['nvr']}: first failure stage {rec['stage']}, exit {rec['exit_code']}: "
+              f"{rec['signature'] or '(no diagnostic output)'}")
+
+    if run and (run['attempts'] or run['untracked_attempt_records']):
+        A("")
+        A("=== RUN ATTEMPTS ===")
+        A("History covers this download directory; cumulative totals above cover only the active run.")
+        A("Each attempt lists its own failures, including failures fixed by later attempts.")
+        if run['untracked_attempt_records']:
+            A("Older journal records lack attempt/version metadata; their attempt history is unavailable.")
+        for attempt in run['attempts']:
+            A(f"- {attempt['started']} (run {attempt['run_id']}, attempt {attempt['id']}): "
+              f"tarpm {attempt['tarpm'] or 'not used'}; "
+              f"{attempt['build_count']}/{attempt['selected_builds']} build(s) completed, "
+              f"{attempt['passed_builds']} passed, "
+              f"{len(attempt['fetch_failed'])} fetch-failed, {len(attempt['test_failed'])} test-failed")
+            if attempt['fetched_builds']:
+                A(f"    fetched without tests: {attempt['fetched_builds']} build(s)")
+            for key, label in (('fetch_failed', 'fetch failures'), ('test_failed', 'test failures')):
+                for nvr in attempt[key]:
+                    A(f"    {label}: {nvr}")
+
     if session and session['tarpm'] and session['tarpm']['rpm_info']:
         A("")
         A("=== TARPM RPM METADATA (rpm -qi --file <binary>, captured before testing) ===")
         A(session['tarpm']['rpm_info'])
 
+    if run and run['summary_only_builds'] and args.resume:
+        backup = preserve_legacy_report(report, b'\nscope:     cumulative run ')
+        if backup is not None:
+            A("")
+            A(f"Previous report (including older RPM totals) preserved at: {backup}")
     report.write_text("\n".join(L) + "\n")
     return report
 
 
 def write_json(path: Path, args, fetch: list | None, test: list | None,
-              session: dict | None = None, comparison: dict | None = None) -> None:
+              session: dict | None = None, comparison: dict | None = None,
+              run: dict | None = None) -> None:
     def ser(results):
         return [dataclasses.asdict(r) for r in (results or [])]
 
@@ -1798,7 +1886,10 @@ def write_json(path: Path, args, fetch: list | None, test: list | None,
                           for phase in ("fetch", "test")},
         "timings": timing_summary(fetch, test),
         "comparison": comparison,
+        "run": run,
     }
+    if run and run['summary_only_builds'] and args.resume:
+        preserve_legacy_report(path, b'"run": {')
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
 
 
@@ -1823,12 +1914,26 @@ def read_run_manifest(path: Path) -> dict | None:
         raise UsageError(f"invalid run manifest: {path}")
     for nvr in manifest["nvrs"]:
         validate_nvr(nvr)
+    context = manifest.get('context')
+    if context is not None:
+        if (not isinstance(context, dict)
+                or not isinstance(context.get('started'), str)
+                or not isinstance(context.get('command'), list)
+                or not all(isinstance(arg, str) for arg in context['command'])
+                or not isinstance(context.get('settings'), dict)
+                or not isinstance(context['settings'].get('architectures'), list)
+                or not all(isinstance(arch, str) for arch in context['settings']['architectures'])
+                or not isinstance(context['settings'].get('include_source'), bool)):
+            raise UsageError(f"invalid run context: {path}")
     return manifest
 
 
-def write_run_manifest(path: Path, nvrs: list, run_id: str) -> None:
+def write_run_manifest(path: Path, nvrs: list, run_id: str,
+                       context: dict | None = None) -> dict:
     """Atomically replace run state before any worker can modify build files."""
     manifest = {"run_id": run_id, "nvrs": nvrs, "ts": now_utc()}
+    if context is not None:
+        manifest['context'] = context
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -1844,6 +1949,7 @@ def write_run_manifest(path: Path, nvrs: list, run_id: str) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+    return manifest
 
 
 class Journal:
@@ -1923,14 +2029,8 @@ class Journal:
 JOURNAL = Journal()
 
 
-def read_journal(path: str, run_id: str | None = None) -> dict:
-    """Latest journal record per NVR.
-
-    Lines are processed in file order, so the last valid record for an
-    NVR wins; torn or invalid lines (e.g. a truncated final line) are
-    skipped. With run_id, only records belonging to that run are considered.
-    """
-    latest = {}
+def journal_records(path: str, run_id: str | None = None):
+    """Read valid records in append order, optionally scoped to one run."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -1945,14 +2045,21 @@ def read_journal(path: str, run_id: str | None = None) -> dict:
                     continue
                 if run_id is not None and rec.get("run_id") != run_id:
                     continue
-                latest[rec["nvr"]] = rec
+                yield rec
     except OSError:
         pass
+
+
+def read_journal(path: str, run_id: str | None = None) -> dict:
+    """Latest valid record per NVR; torn lines and other runs are ignored."""
+    latest = {}
+    for rec in journal_records(path, run_id):
+        latest[rec['nvr']] = rec
     return latest
 
 
 def journal_record(nvr: str, fetch: "FetchResult | None", tests: list,
-                   run_id: str | None = None) -> dict:
+                   run_id: str | None = None, attempt: dict | None = None) -> dict:
     """One journal line for a finished build.
 
     status is fetched, pass, warn, fetch-fail, or test-fail; stage/exit_code/
@@ -1969,9 +2076,14 @@ def journal_record(nvr: str, fetch: "FetchResult | None", tests: list,
         "signature": "",
         "rpms": [],
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "results": {"version": 1,
+                    "fetch": result_record(fetch) if fetch is not None else None,
+                    "test": [result_record(test) for test in tests]},
     }
     if run_id is not None:
         rec["run_id"] = run_id
+    if attempt is not None:
+        rec['attempt'] = attempt
     if fetch is not None and not fetch.ok:
         rec.update(status="fetch-fail", stage="fetch",
                    exit_code=fetch.exit_code, signature=fetch.signature)
@@ -1988,6 +2100,145 @@ def journal_record(nvr: str, fetch: "FetchResult | None", tests: list,
         rec.update(status="warn",
                    rpms=sorted({rpm_label(t.rpm) for t in warned}))
     return rec
+
+
+def saved_build_results(rec: dict) -> tuple | None:
+    """Decode detailed records; old/damaged details never invent RPM passes."""
+    saved = rec.get('results')
+    if not isinstance(saved, dict) or saved.get('version') != 1:
+        return None
+    try:
+        fetch, tests = saved['fetch'], saved['test']
+        if not isinstance(tests, list):
+            return None
+        comparison_cases([fetch], 'fetch')
+        comparison_cases(tests, 'test')
+        results = []
+        for cls, rows in ((FetchResult, [fetch]), (TestResult, tests)):
+            decoded = []
+            fields = {field.name for field in dataclasses.fields(cls)}
+            for row in rows:
+                if row['nvr'] != rec['nvr']:
+                    return None
+                row = {key: value for key, value in row.items() if key in fields}
+                if row.get('log') is not None:
+                    if not isinstance(row['log'], str):
+                        return None
+                    row['log'] = Path(row['log'])
+                seconds = row.get('duration_seconds')
+                times = row.get('stage_seconds', {})
+                if (not isinstance(times, dict)
+                        or any(not isinstance(key, str) for key in times)):
+                    return None
+                for value in ([seconds] if seconds is not None else []) + list(times.values()):
+                    if (type(value) not in (int, float)
+                            or not math.isfinite(value) or value < 0):
+                        return None
+                if cls is TestResult and not isinstance(row.get('arch'), str):
+                    return None
+                decoded.append(cls(**row))
+            results.append(decoded)
+        # Do not let a stale details block contradict the journal's outcome.
+        check = journal_record(rec['nvr'], results[0][0], results[1])
+        if check['status'] != rec.get('status'):
+            return None
+        return results[0][0], results[1]
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def journal_attempt(rec: dict) -> dict | None:
+    attempt = rec.get('attempt')
+    if (not isinstance(attempt, dict) or not isinstance(attempt.get('id'), str)
+            or not attempt['id'] or not isinstance(attempt.get('started'), str)
+            or (attempt.get('tarpm') is not None and not isinstance(attempt['tarpm'], str))
+            or (attempt.get('selected_builds') is not None
+                and type(attempt['selected_builds']) is not int)):
+        return None
+    return attempt
+
+
+def attempt_history(records) -> tuple[list, int]:
+    """Compact per-invocation outcomes, including failures later fixed by resume."""
+    attempts = {}
+    untracked = 0
+    for rec in records:
+        attempt = journal_attempt(rec)
+        if attempt is None:
+            untracked += 1
+            continue
+        entry = attempts.setdefault(attempt['id'], {
+            'id': attempt['id'], 'started': attempt.get('started'),
+            'run_id': rec.get('run_id'), 'tarpm': attempt.get('tarpm'),
+            'selected_builds': attempt.get('selected_builds'),
+            'settings': attempt.get('settings'), 'tag': attempt.get('tag'), 'builds': {}})
+        entry['builds'][rec['nvr']] = rec.get('status')
+    history = []
+    for entry in attempts.values():
+        builds = entry.pop('builds')
+        if entry['selected_builds'] is None:
+            entry['selected_builds'] = len(builds)
+        entry.update(build_count=len(builds),
+                     passed_builds=sum(status in ('pass', 'warn') for status in builds.values()),
+                     fetched_builds=sum(status == 'fetched' for status in builds.values()),
+                     fetch_failed=sorted(nvr for nvr, status in builds.items() if status == 'fetch-fail'),
+                     test_failed=sorted(nvr for nvr, status in builds.items() if status == 'test-fail'))
+        history.append(entry)
+    history.sort(key=lambda entry: (entry['started'] or '', entry['id']))
+    return history, untracked
+
+
+def cumulative_results(manifest: dict, latest: dict, current: list,
+                       history) -> tuple[list, list, dict]:
+    """Replace whole-build outcomes, retaining untouched builds from this run."""
+    latest = dict(latest)
+    latest.update((rec['nvr'], rec) for rec in current)
+    nvrs = list(dict.fromkeys(manifest['nvrs']))
+    fetch, tests, summary_only, legacy_failures = [], [], [], []
+    counts = {}
+    versions = set()
+    for nvr in nvrs:
+        rec = latest.get(nvr, {})
+        status = rec.get('status', 'unattempted')
+        if not isinstance(status, str):
+            status = 'unknown'
+        counts[status] = counts.get(status, 0) + 1
+        if not rec:
+            continue
+        saved = saved_build_results(rec)
+        if saved is not None:
+            fetched, tested = saved
+            fetch.append(fetched)
+            tests.extend(tested)
+            if tested:
+                attempt = journal_attempt(rec)
+                versions.add(attempt.get('tarpm') or 'unknown (not recorded)'
+                             if isinstance(attempt, dict) else 'unknown (not recorded)')
+        else:
+            summary_only.append(nvr)
+            # Every recognized finished-build status establishes the fetch outcome.
+            if status in ('pass', 'warn', 'fetched', 'test-fail', 'fetch-fail'):
+                failed = status == 'fetch-fail'
+                fetch.append(FetchResult(nvr, not failed,
+                                         exit_code=rec.get('exit_code') if failed else None,
+                                         signature=(rec.get('signature') or '') if failed else ''))
+            if status == 'test-fail':
+                legacy_failures.append({key: rec.get(key) for key in
+                                        ('nvr', 'stage', 'exit_code', 'signature', 'rpms')})
+            if status in ('pass', 'warn', 'test-fail'):
+                versions.add('unknown (not recorded)')
+    pending = len(nvrs) - counts.get('pass', 0) - counts.get('warn', 0)
+    failed = counts.get('fetch-fail', 0) + counts.get('test-fail', 0)
+    context = manifest.get('context') or {}
+    attempts, untracked = attempt_history(itertools.chain(history, current))
+    run = {'id': manifest['run_id'], 'started': context.get('started', manifest.get('ts')),
+           'command': context.get('command'), 'settings': context.get('settings'),
+           'selected_builds': len(nvrs), 'build_statuses': counts,
+           'pending_builds': pending, 'status': 'failed' if failed else 'incomplete' if pending else 'passed',
+           'summary_only_builds': summary_only, 'legacy_test_failures': legacy_failures,
+           'tarpm_versions': sorted(versions), 'attempts': attempts,
+           'untracked_attempt_records': untracked}
+    return fetch, tests, run
 
 
 # ---------------------------------------------------------------------------
@@ -2021,7 +2272,8 @@ def failure_rows(fetch: list | None, test: list | None) -> list:
     return rows
 
 
-def write_failure_lists(args, fetch: list | None, test: list | None) -> None:
+def write_failure_lists(args, fetch: list | None, test: list | None,
+                        run: dict | None = None) -> None:
     """Write the run's failure lists to DIR/logs (or remove stale ones).
 
     Called whenever the report is written. Each list is one build NVR
@@ -2044,6 +2296,12 @@ def write_failure_lists(args, fetch: list | None, test: list | None) -> None:
                 if p.is_file():
                     p.unlink(missing_ok=True)
         rows = failure_rows(fetch, test)
+        if run:
+            # Old journals retain only a build's first failing stage. Keep
+            # that build retryable without attributing it to invented RPMs.
+            rows.extend((rec['stage'] or 'unknown', rec['signature'] or '',
+                         rec['nvr'], '', rec['exit_code'])
+                        for rec in run['legacy_test_failures'])
         if not rows:
             return
         logdir.mkdir(parents=True, exist_ok=True)
@@ -2221,7 +2479,8 @@ def parse_args(argv) -> argparse.Namespace:
                          "default: 60, or 15 for build size lookups)")
     ap.add_argument("--resume", action="store_true",
                     help="continue DIR/run.json, skipping that run's test "
-                         "passes/warnings (legacy journal fallback if absent)")
+                         "passes/warnings and rebuilding cumulative reports "
+                         "(legacy journal fallback if absent)")
     ap.add_argument("--retry-failed", action="store_true",
                     help="re-run only the builds whose latest journal "
                          "record is fetch-fail or test-fail; each starts "
@@ -2303,12 +2562,13 @@ def main(argv=None) -> int:
               f"{args.dir}", err=True)
         return 2
 
-    if do_test and not args.list and shutil.which("tarpm") is None:
+    if args.test_only and shutil.which("tarpm") is None:
         log(f"{PROG}: error: tarpm not found in PATH (needed for the "
               f"test phase; use --no-test to fetch only)", err=True)
         return 2
 
     session = {
+        "id": uuid.uuid4().hex,
         "started": started,
         "command": [sys.executable, str(Path(__file__).resolve()),
                     *(argv if argv is not None else sys.argv[1:])],
@@ -2330,6 +2590,10 @@ def main(argv=None) -> int:
     total_selected = 0
     manifest = None
     run_id = None
+    latest = {}
+    current_records = []
+    legacy_records = []
+    run = None
     if do_fetch:
         try:
             nvrs, tag_source = read_nvrs(args)
@@ -2355,6 +2619,15 @@ def main(argv=None) -> int:
                 return 2
             if manifest is not None:
                 run_id = manifest["run_id"]
+                context = manifest.get('context') or {}
+                settings = context.get('settings') or {}
+                if ((context.get('tag', args.tag) != args.tag)
+                        or (settings and (
+                            sorted(settings['architectures']) != sorted(args.arch)
+                            or settings['include_source'] != (not args.no_src)))):
+                    log(f"{PROG}: error: resume requires the original tag, architecture, "
+                        "and source settings; start a fresh run to change them", err=True)
+                    return 2
             latest = read_journal(journal_path, run_id=run_id)
         elif args.retry_failed:
             latest = read_journal(journal_path)
@@ -2380,6 +2653,7 @@ def main(argv=None) -> int:
                 return 2
         if args.limit > 0:
             selected = selected[:args.limit]
+        run_selection = list(selected)
 
         if args.retry_failed:
             # Select the builds whose latest journal record is a failure;
@@ -2408,7 +2682,6 @@ def main(argv=None) -> int:
             if not selected:
                 log(f"{PROG}: nothing to do: no pending builds in this selection "
                       f"(journal: {journal_path})", err=args.list)
-                return 0
 
         if args.list:
             for nvr in selected:
@@ -2420,33 +2693,62 @@ def main(argv=None) -> int:
         # Cached and explicit build lists bypass read_nvrs' query-time
         # executable check. Fail once before changing the active run or
         # journal, while still allowing offline lists and empty recovery.
-        if shutil.which("koji") is None:
+        if selected and shutil.which("koji") is None:
             log(f"{PROG}: error: koji client not found in PATH", err=True)
             return 2
+        if selected and do_test:
+            if shutil.which('tarpm') is None:
+                log(f"{PROG}: error: tarpm not found in PATH (needed for the "
+                    "test phase; use --no-test to fetch only)", err=True)
+                return 2
+            session['tarpm'] = tarpm_package_info()
+
+        attempt = {'id': session['id'], 'started': session['started'],
+                   'tarpm': package_label(session['tarpm']) if session['tarpm'] else None,
+                   'selected_builds': len(selected), 'tag': args.tag,
+                   'settings': {'architectures': args.arch, 'include_source': not args.no_src}}
 
         if manifest is None:
             run_id = uuid.uuid4().hex
             try:
-                write_run_manifest(Path(args.dir) / "run.json", selected, run_id)
+                # A first resume of a legacy journal must keep its already
+                # completed builds as well as the pending selection.
+                manifest = write_run_manifest(
+                    Path(args.dir) / "run.json",
+                    run_selection if args.resume else selected, run_id,
+                    context={**session, 'tag': args.tag})
             except OSError as exc:
                 log(f"{PROG}: error: cannot save run manifest: {exc}", err=True)
                 return 2
 
-        (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
-        # One record per finished build; --test-only records nothing.
-        JOURNAL.open(journal_path)
+            if args.resume:
+                # Adopt the legacy snapshot once. Subsequent resumes must
+                # not consult unrelated runs for their skipped successes.
+                latest = {nvr: {**latest[nvr], 'run_id': run_id}
+                          for nvr in run_selection if nvr in latest}
+                legacy_records = list(latest.values())
+        if selected or legacy_records:
+            (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
+            # One detailed record per finished build; --test-only records nothing.
+            JOURNAL.open(journal_path)
+            for rec in legacy_records:
+                JOURNAL.append(rec)
         total_selected = len(selected)
+
+        def record(fetch, tests):
+            rec = journal_record(fetch.nvr, fetch, tests, run_id=run_id, attempt=attempt)
+            JOURNAL.append(rec)
+            return rec
 
         def fail(nvr, exc):
             # A worker exception is journaled like a fetch failure so
             # --retry-failed can pick the build up again.
             fetch = FetchResult(nvr=nvr, ok=False, error=repr(exc),
                                 signature=error_signature(repr(exc)))
-            JOURNAL.append(journal_record(nvr, fetch, [], run_id=run_id))
+            record(fetch, [])
             return fetch
 
-        if do_test:
-            session['tarpm'] = tarpm_package_info()
+        if do_test and selected:
             # Default: pipeline per build — fetch, test, clean up — with
             # -j builds in flight, so disk use stays bounded to the builds
             # in flight plus the failures.
@@ -2464,7 +2766,7 @@ def main(argv=None) -> int:
                 fetch, tests = process_build(nvr, args, fetch_counter)
                 # Journal the build as it finishes, so a run that is
                 # interrupted or crashes still records what completed.
-                JOURNAL.append(journal_record(fetch.nvr, fetch, tests, run_id=run_id))
+                record(fetch, tests)
                 return fetch, tests
 
             results, interrupted = run_pool(
@@ -2473,20 +2775,26 @@ def main(argv=None) -> int:
             for fetch, tests in results:
                 fetch_results.append(fetch)
                 test_results.extend(tests)
-        else:
+        elif selected:
             log(f"{PROG}: fetching {len(selected)} build(s) from tag "
                   f"{args.tag} (parallelism: {args.jobs})")
             fetch_counter = Counter(len(selected))
 
             def fetch_worker(nvr):
                 result = fetch_one(nvr, args, fetch_counter)
-                JOURNAL.append(journal_record(nvr, result, [], run_id=run_id))
+                record(result, [])
                 return result
 
             results, interrupted = run_pool(
                 fetch_worker, selected, args.jobs, on_error=fail)
             for r in results:
                 fetch_results.append(r)
+        tests_by_build = {}
+        for tested in test_results:
+            tests_by_build.setdefault(tested.nvr, []).append(tested)
+        current_records.extend(journal_record(
+            fetched.nvr, fetched, tests_by_build.get(fetched.nvr, []),
+            run_id=run_id, attempt=attempt) for fetched in fetch_results)
     elif do_test:
         # --test-only: test the RPMs already under DIR.
         (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
@@ -2525,22 +2833,31 @@ def main(argv=None) -> int:
 
     fetch_for_report = fetch_results if do_fetch else None
     test_for_report = test_results if do_test else None
-    comparison = (compare_results(baseline, fetch_for_report, test_for_report)
+    if do_fetch:
+        fetch_for_report, saved_tests, run = cumulative_results(
+            manifest, latest if args.resume else {}, current_records,
+            journal_records(journal_path))
+        test_for_report = saved_tests if do_test else None
+    comparison = (compare_results(baseline, fetch_results if do_fetch else None,
+                                  test_results if do_test else None)
                   if baseline is not None else None)
     any_failed = any(not r.ok for r in fetch_results + test_results)
     session.update(finished=datetime.now(timezone.utc).isoformat(),
                    runtime_seconds=time.monotonic() - t0,
                    interrupted=interrupted, selected_builds=total_selected if do_fetch else None,
+                   summary=result_summary(fetch_results if do_fetch else None,
+                                          test_results if do_test else None),
                    tag_source=tag_source,
                    status="interrupted" if interrupted else "failed" if any_failed else "passed")
     report = write_report(args, fetch_for_report, test_for_report,
                           session['runtime_seconds'], tag_source,
                           interrupted=interrupted,
-                          total_selected=total_selected, session=session, comparison=comparison)
-    write_failure_lists(args, fetch_for_report, test_for_report)
+                          total_selected=run['selected_builds'] if run else total_selected,
+                          session=session, comparison=comparison, run=run)
+    write_failure_lists(args, fetch_for_report, test_for_report, run=run)
     if args.json:
         write_json(Path(args.json), args, fetch_for_report, test_for_report,
-                   session=session, comparison=comparison)
+                   session=session, comparison=comparison, run=run)
 
     if comparison:
         for phase in ("fetch", "test"):
@@ -2569,6 +2886,9 @@ def main(argv=None) -> int:
             log(f"{PROG}: removed {len(test_results) - nt} passed RPM(s) "
                   f"from {args.dir} (failures kept)")
     log(f"{PROG}: report: {report}")
+    if run:
+        log(f"{PROG}: cumulative run: {run['selected_builds']} build(s), "
+            f"{run['pending_builds']} pending; status: {run['status']}")
 
     if any_failed:
         for r in fetch_for_report or []:

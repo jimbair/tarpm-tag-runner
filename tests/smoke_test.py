@@ -125,8 +125,12 @@ def main():
 
     before = journal()
     skipped = invoke("resume-skip", "--resume")
-    require(skipped is None and journal() == before,
-            "resume should skip tested builds without writing new results")
+    require(skipped and skipped['summary'] == resumed['summary']
+            and skipped['run']['id'] == resumed['run']['id']
+            and skipped['run']['attempts'] == resumed['run']['attempts']
+            and skipped['session']['selected_builds'] == 0
+            and journal() == before,
+            "resume should rebuild cumulative reports without retesting or changing the journal")
 
     local = invoke("test-only", "--test-only", "--no-src", "-j", "2", "--sort", "asc",
                    "--compare", str(output / "resume-and-test.json"))

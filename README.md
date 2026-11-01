@@ -281,9 +281,10 @@ rpms/
 
 ## Resume, retry, and interrupts
 
-Before workers start, each fetch invocation atomically saves its run ID and
-full build selection in `DIR/run.json`. Resume reuses that manifest and
-skips only passes/warnings recorded for its run ID. Older successes cannot
+Before workers start, a fresh fetch invocation atomically saves its run ID,
+full build selection, and original invocation context in `DIR/run.json`.
+Resume reuses that manifest and skips only passes/warnings recorded for
+its run ID. Older successes cannot
 hide unfinished or queued re-tests. A new normal or retry run replaces the
 manifest; use separate directories for simultaneous runs. `--list` and
 `--test-only` leave it unchanged.
@@ -291,17 +292,24 @@ manifest; use separate directories for simultaneous runs. `--list` and
 Finished builds append records to `DIR/journal.jsonl` immediately, so a
 process crash preserves completed work. Records contain `run_id`, `nvr`,
 `status`, `stage`, `exit_code`, `signature`, `rpms` (failed or warned RPM
-basenames), and `ts`
-(UTC). The latest record per NVR wins; invalid lines are ignored, and an
-incomplete tail is separated before new records are appended.
+basenames), and `ts` (UTC). New records also contain full fetch/per-RPM
+`results`, including warnings, errors, log paths, and timings. Their
+`attempt` metadata identifies the invocation, tarpm RPM version, tag, and
+architecture/source settings. This records which version passed or failed
+each NVR without adding separate journal lines. The latest record per NVR
+wins for cumulative results; earlier attempts remain available for history.
+Invalid lines are ignored, and an incomplete tail is separated before new
+records are appended.
 Short writes are retried; failed appends are rolled back with a warning.
 If rollback fails, further journal writes are disabled to prevent corruption.
 
 Statuses are `fetched` (download succeeded without completed tests), `pass`,
 `warn`, `fetch-fail`, and `test-fail`. `--test-only` does not update the
-journal. Resume with the same architecture/source settings: records are per
-build and do not identify the test configuration. Without a manifest, resume
-uses legacy journal history and creates a manifest before doing new work;
+journal. Resume requires the original tag and architecture/source settings
+when the manifest records them. A different tarpm version is allowed;
+already passed builds keep their earlier results and version attribution.
+Without a manifest, resume uses legacy journal history and creates a
+manifest including the already completed builds before doing new work;
 an invalid manifest is an error. Retry selects the latest failures across
 all run IDs.
 
@@ -317,7 +325,11 @@ Both modes clear each selected build directory before downloading. Normal
 tag/file selection, `-p`, and `-n` still apply; resume also restricts work to
 the manifest's selection, preserving pending builds outside a temporary
 filter. They test every selected RPM of a build, not just its previously
-failing RPMs. Nothing to do exits 0.
+failing RPMs. A resume with nothing pending rebuilds the cumulative reports
+without downloading, testing, or adding journal records. Nothing to do
+exits 0. Exit status and console work counts describe the current invocation;
+a filtered resume can succeed while other builds remain pending in the
+cumulative report.
 `--retry-failed` defaults to `report-retry-YYYYmmdd-HHMMSS.txt` unless `-r`
 is supplied. The two modes are mutually exclusive and cannot be combined
 with `--test-only`, `--refresh`, or `--no-test`. `--refresh` also conflicts
@@ -335,7 +347,14 @@ to trust as test inputs.
 ## Reports, logs, and failure lists
 
 The text report defaults to `./report.txt`, **outside** the download
-directory. Its opening summary records UTC session start/end times,
+directory. Fetch runs and their resumes rebuild this report from the latest
+completed attempt for each build in the active run. A successful retry
+replaces that build's previous results, including all its RPMs; other
+builds' passes, warnings, and failures remain in the totals. This also applies
+to JSON output and failure lists. A fresh normal or `--retry-failed` run
+starts separate cumulative totals. `--test-only` reports just its invocation.
+
+The opening summary records UTC session start/end times,
 wall-clock runtime, completion/interruption status, the invocation command,
 mode, worker count, architecture/source selections, package filters, and
 system/Python versions. Runtime covers the current invocation through worker
@@ -343,6 +362,22 @@ completion, including setup and downloads; it is not cumulative across
 `--resume` or retry invocations and does not sum parallel worker times.
 Test counts distinguish clean passes, passes with warnings, and failures,
 and include the percentage of tested RPMs that failed.
+
+The cumulative section identifies the original run start/command, build
+statuses, pending count, and tarpm versions used by its saved tests. Passing
+a resumed tag does not mean every build was retested with the latest tarpm:
+start a fresh run for that validation. The **RUN ATTEMPTS** addendum lists
+completed/selected build counts and failed NVRs for each recorded invocation
+and tarpm version in the download directory, including earlier fresh runs.
+Download failures and test failures are listed separately. Past failures
+remain in this history after they have been fixed in the cumulative totals.
+
+Older journal entries lack passing RPM counts and complete diagnostics.
+Resuming them preserves build statuses and labels RPM statistics as partial;
+it does not invent missing RPM results or tarpm versions. When overwriting
+a pre-upgrade report with incomplete cumulative detail, the runner first
+backs it up beside the report as `<report>.before-resume-<unique>.bak`
+(also for JSON output). Keep these backups for the original RPM totals.
 
 Before testing, the runner identifies the `tarpm` executable selected from
 `PATH` and queries its owning RPM with `rpm -qi --file <resolved-binary>`.
@@ -366,7 +401,8 @@ run-log path, and retained warning logs.
 
 | Field | Contents |
 | --- | --- |
-| `session` | Start/end, numeric `runtime_seconds`, status, interruption flag, command argument list, settings, system details, and `tarpm` package fields/full `rpm_info`/query error (`tarpm` is null for fetch-only). |
+| `session` | Current invocation ID, start/end, numeric `runtime_seconds`, status, counts in `summary`, interruption flag, command argument list, settings, system details, and `tarpm` package fields/full `rpm_info`/query error (`tarpm` is null for fetch-only and report-only invocations). |
+| `run` | Active run ID, original start/command/settings, build statuses, pending count, cumulative status, versions used, summary-only builds, and per-invocation `attempts` history; null for `--test-only`. |
 | `summary` | Counts for each enabled phase; test counts include `clean_passed` and `warnings` (`ok` includes warnings). |
 | `failure_types` | Ranked `fetch` and `test` groups with stage, exit code, signature, count, `percent_of_failures`, and examples. |
 | `timings` | Per-command-stage counts, total/mean/max seconds, and up to five slowest builds or RPMs. |
@@ -381,8 +417,9 @@ Unreached stages have no entry; results without a completed measurement
 (such as runner exceptions) have a null duration and an empty stage map.
 The text report ranks stages by total command time and names the five
 slowest inputs for each. Totals sum parallel workers and can exceed session
-runtime; averages include only measured commands. Per-test logs also retain
-stage timings when the log is kept. Subsecond command times display in
+runtime; averages include only measured commands. Cumulative timings retain
+each build's latest attempt, excluding superseded attempts. Per-test logs
+also retain stage timings when the log is kept. Subsecond command times display in
 milliseconds in the text summary.
 
 Use a saved JSON report as a baseline to see what changed after updating
@@ -396,6 +433,8 @@ python tarpm-tag-runner.py -t f44 -p hello -a x86_64 \
 ```
 
 Comparison works in text reports without requiring a new `--json` output.
+It compares only work performed in the current invocation; cumulative
+results carried over from earlier attempts are not counted as rechecked.
 It identifies a fetch by exact build NVR, and a test by exact build NVR and
 RPM filename, regardless of download directory. Its summary separates:
 
@@ -444,10 +483,13 @@ optionally followed by `  # detail`:
 python tarpm-tag-runner.py --from-file rpms/logs/failed-all.txt -j 4
 ```
 
-Reports and failure lists describe only the invocation that wrote them.
-Warnings skipped by `--resume` remain in the journal and old test logs,
-not in the resumed report. Invocations that exit without writing a report
-leave the prior report/lists intact.
+Reports and failure lists cover the active run's latest build outcomes,
+including warnings skipped by `--resume`. The attempt addendum retains
+historical failures without putting resolved failures back into the failure
+lists. Legacy test-failed builds with incomplete RPM details still appear
+in failure lists, with an empty RPM field and their first recorded failing
+stage. Invocations that exit before writing a report leave the prior
+report/lists intact.
 
 The run log appends a UTC start/argv header and timestamped runner lines
 for each invocation, including heartbeats and uncaught tracebacks. A
