@@ -549,3 +549,12 @@ runs.
 
 Future checks may make content differences fatal or compare headers;
 CentOS Stream/AlmaLinux backends are also planned.
+
+## Commit conventions
+
+Sign off every commit with `git commit -s`.
+
+Follow the active client's native AI-attribution defaults unchanged. Do not
+override its trailer format or identity, add a second credit trailer, or
+add model names or reasoning-effort labels unless the client includes them
+by default.
