@@ -465,6 +465,19 @@ def result_record(result) -> dict:
     return row
 
 
+def diagnostic_log(args, nvr: str, name: str) -> Path:
+    directory = Path(args.dir) / "logs"
+    attempt_id = getattr(args, "attempt_id", None)
+    if attempt_id is not None:
+        directory = directory / attempt_id / nvr
+    return directory / name
+
+
+def write_diagnostic_log(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
 # ---------------------------------------------------------------------------
 # fetch phase
 # ---------------------------------------------------------------------------
@@ -949,8 +962,9 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
                   progress_fn=lambda output, pid, elapsed:
                   fetch_progress(nvr, pdir, output, elapsed))
     elapsed = time.monotonic() - t0
-    logfile = Path(args.dir) / "logs" / f"{nvr}.fetch.log"
-    logfile.write_text(out)
+    logfile = diagnostic_log(args, nvr, f"{nvr}.fetch.log")
+    if rc != 0 or args.keep:
+        write_diagnostic_log(logfile, out)
     if rc == 0:
         # Koji has no exclude-source switch. Without an explicit arch
         # filter it downloads src along with all binary arches; discard
@@ -1088,7 +1102,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
 
     # Key the log name on the RPM basename so subpackages of one build
     # (7zip, 7zip-reduced, ...) get separate logs.
-    logfile = Path(args.dir) / "logs" / f"{base}.test.log"
+    logfile = diagnostic_log(args, nvr, f"{base}.test.log")
     buf = [
         f"rpm:     {rpm}",
         f"tarpm:   {shutil.which('tarpm') or 'tarpm'}",
@@ -1206,7 +1220,8 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     duration = time.monotonic() - test_t0
     buf.append("timings: " + ", ".join(f"{name}={seconds:.3f}s"
                                        for name, seconds in stage_seconds.items()))
-    logfile.write_text("\n".join(buf) + "\n")
+    if not ok or warning or args.keep:
+        write_diagnostic_log(logfile, "\n".join(buf) + "\n")
 
     cleanup_error = None
     if ok and not args.keep:
@@ -1220,7 +1235,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
             failed_out = f"cannot remove test work directory {work}: {exc}"
             cleanup_error = repr(exc)
             buf.append(failed_out)
-            logfile.write_text("\n".join(buf) + "\n")
+            write_diagnostic_log(logfile, "\n".join(buf) + "\n")
 
     res = TestResult(rpm=str(rpm), nvr=nvr, arch=arch, ok=ok,
                      stage=failed_stage, exit_code=failed_rc,
@@ -2662,6 +2677,7 @@ def main(argv=None) -> int:
                    "machine": platform.machine(), "python": platform.python_version()},
         "tarpm": None,
     }
+    args.attempt_id = session["id"]
 
     tag_source = None
     fetch_results: list = []

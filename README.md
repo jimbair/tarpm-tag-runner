@@ -249,10 +249,12 @@ instead of failing to decode command output.
 | Failure | Kept | Kept when available |
 | Any result with `--keep` | Kept | Kept |
 
-Original downloads are never modified. Test work directories are rebuilt
-on every attempt; retained artifacts show only the last attempt. Empty
-build directories are removed. To retest successful RPMs after updating
-tarpm, use `--keep` on the original run or download them again.
+Original downloads are never modified by testing. Test work directories
+are rebuilt on each attempt. Retained diagnostics have separate paths for
+each invocation and build, so cumulative reports can find the logs from
+their recorded attempt. Empty build directories are removed. To retest
+successful RPMs after updating tarpm, use `--keep` on the original run or
+download them again.
 
 Cleanup retries read-only artifact directories with owner access restored,
 without following symlinks. If a passed test's work directory still cannot
@@ -275,8 +277,9 @@ rpms/
 │       ├── list-orig.txt
 │       └── list-repacked.txt
 └── logs/
-    ├── <NVR>.fetch.log              # kept on fetch failure or --keep
-    ├── <base>.test.log              # kept on failure, warning, or --keep
+    ├── <invocation ID>/<NVR>/
+    │   ├── <NVR>.fetch.log          # kept on fetch failure or --keep
+    │   └── <base>.test.log          # kept on failure, warning, or --keep
     └── failed-*                     # failure lists described below
 ```
 

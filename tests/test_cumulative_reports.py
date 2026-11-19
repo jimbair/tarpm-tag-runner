@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 from test_tarpm_tag_runner import RunnerTestCase, _ROOT, mod
@@ -113,6 +114,35 @@ class CumulativeReportTests(RunnerTestCase):
         self.assertEqual(data['summary']['test']['total'], 3)
         self.assertIn('ccc-1-1', (self.downloads / 'logs/failed-all.txt').read_text())
         self.assertNotIn('bbb-1-1', (self.downloads / 'logs/failed-all.txt').read_text())
+
+    def test_local_retest_preserves_diagnostics_for_the_journaled_attempt(self):
+        def command(diagnostic):
+            def run(cmd, cwd=None, binary_output=False, **kwargs):
+                if cmd[1] == "download-build":
+                    (cwd / f"{cmd[-1]}.noarch.rpm").write_bytes(b"RPM")
+                elif cmd[1] == "-x" and cmd[3].endswith("aaa-1-1.noarch.rpm"):
+                    return 1, f"tarpm: {diagnostic}"
+                return 0, b"" if binary_output else ""
+            return run
+
+        with patch.object(mod, "run", side_effect=command("first attempt diagnostic")):
+            self.assertEqual(self.run_main(), 1)
+        saved = self.data()["test"][0]
+        saved_log = Path(saved["log"])
+        with patch.object(mod, "run", side_effect=command("local retest diagnostic")):
+            self.assertEqual(self.run_main("--test-only", "-p", "aaa"), 1)
+        current_log = Path(self.data()["test"][0]["log"])
+        self.assertNotEqual(current_log, saved_log)
+        self.assertIn("tarpm: local retest diagnostic", current_log.read_text())
+        self.assertIn("tarpm: first attempt diagnostic", saved_log.read_text())
+
+        with patch.object(mod, "run") as run:
+            self.assertEqual(self.run_main("--resume", "-p", "bbb"), 0)
+        run.assert_not_called()
+        self.assertEqual(self.data()["test"][0]["log"], str(saved_log))
+        report = (self.root / "report.txt").read_text()
+        self.assertIn("tarpm: first attempt diagnostic", report)
+        self.assertNotIn("tarpm: local retest diagnostic", report)
 
     def test_no_pending_resume_rebuilds_reports_without_tools_or_journal_changes(self):
         self.attempt({nvr: self.build(nvr) for nvr in self.nvrs})

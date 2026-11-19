@@ -1477,9 +1477,9 @@ class FetchRecoveryTests(RunnerTestCase):
                     patch.object(mod, "run", return_value=(7, "download failed")):
                 self.assertEqual(self.run_main(*options), 1)
                 self.assertFalse((self.downloads / "demo-1-1").exists())
-                logfile = self.downloads / "logs/demo-1-1.fetch.log"
-                self.assertEqual(logfile.read_text(), "download failed")
                 record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
+                logfile = Path(record["results"]["fetch"]["log"])
+                self.assertEqual(logfile.read_text(), "download failed")
                 self.assertEqual(record["status"], "fetch-fail")
                 self.assertEqual(record["exit_code"], 7)
                 self.assertEqual(record["signature"], "download failed")
