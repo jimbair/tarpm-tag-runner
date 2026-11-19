@@ -306,6 +306,20 @@ class MissingKojiTests(RunnerTestCase):
         self.assertIn("koji client not found", result.stderr)
         self.assertFalse(self.downloads.exists())
 
+    def test_cli_download_resolves_koji_from_relative_path(self):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        koji = bin_dir / "koji"
+        koji.write_text('#!/bin/sh\nprintf "downloaded" > "$2.noarch.rpm"\n')
+        koji.chmod(0o755)
+        result = subprocess.run(
+            [sys.executable, str(_ROOT / "tarpm-tag-runner.py"),
+             *self.argv, "--no-test"], cwd=self.root, capture_output=True, text=True,
+            env={**os.environ, "PATH": "bin"}, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rpm = self.downloads / "demo-1-1" / "demo-1-1.noarch.rpm"
+        self.assertEqual(rpm.read_text(), "downloaded")
+
 
 class JournalRecoveryTests(RunnerTestCase):
     def test_fetch_only_does_not_make_resume_skip_tests(self):

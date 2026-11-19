@@ -116,7 +116,9 @@ interrupted or failed cache writes preserve the previous snapshot.
 Before downloads start, the runner checks for Koji even with a cached or
 explicit build list. A missing client exits `2` before replacing the run
 manifest or writing the journal. Cached/explicit `--list` output and
-recovery selections with nothing pending do not require Koji.
+recovery selections with nothing pending do not require Koji. Relative
+`PATH` entries are resolved from the invocation directory before a
+download changes its working directory.
 
 `--from-file` accepts the same output or plain NVRs: the first
 whitespace-delimited token on each line is used; headers, blank lines, and

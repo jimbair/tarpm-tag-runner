@@ -385,8 +385,17 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     `binary_output` preserves the original bytes for listing comparisons.
     """
     try:
+        executable = None
+        if cwd is not None:
+            # Resolve relative PATH entries from the invocation directory
+            # before the child changes to its download directory.
+            executable = shutil.which(cmd[0])
+            if executable is None:
+                raise FileNotFoundError(cmd[0])
+            executable = os.path.abspath(executable)
         proc = subprocess.Popen(
             cmd,
+            executable=executable,
             cwd=str(cwd) if cwd else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
