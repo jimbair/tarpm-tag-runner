@@ -347,7 +347,11 @@ to trust as test inputs.
 ## Reports, logs, and failure lists
 
 The text report defaults to `./report.txt`, **outside** the download
-directory. Fetch runs and their resumes rebuild this report from the latest
+directory. Create custom report directories in advance. The runner checks
+report destinations before starting work and rejects paths that overlap
+run state, other outputs, or the build-list input.
+
+Fetch runs and their resumes rebuild the report from the latest
 completed attempt for each build in the active run. A successful retry
 replaces that build's previous results, including all its RPMs; other
 builds' passes, warnings, and failures remain in the totals. This also applies

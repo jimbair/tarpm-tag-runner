@@ -979,7 +979,7 @@ class ReportContentTests(RunnerTestCase):
         self.assertNotIn("test", data["summary"])
 
 
-class ReportPathTests(unittest.TestCase):
+class ReportPathTests(RunnerTestCase):
     def test_retry_default_matches_cli_and_explicit_argv(self):
         fixed = datetime(2026, 10, 21, 12, 30, 45, tzinfo=timezone.utc)
         with patch.object(mod, "datetime") as clock:
@@ -997,6 +997,47 @@ class ReportPathTests(unittest.TestCase):
                     args = mod.parse_args(mode + ["-r", report])
                     self.assertEqual(args.report, report)
         self.assertEqual(mod.parse_args([]).report, "report.txt")
+
+    def test_output_aliases_are_rejected_before_changing_run_state(self):
+        manifest = mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+        journal = self.downloads / "journal.jsonl"
+        journal.write_text('{"nvr":"demo-1-1","run_id":"active","status":"pass"}\n')
+        original_journal = journal.read_bytes()
+        alias = self.root / "journal-copy.json"
+        os.link(journal, alias)
+        symlink = self.root / "manifest-link.txt"
+        symlink.symlink_to(self.downloads / "run.json")
+        for options in (
+                ["--json", str(self.downloads / "run.json")],
+                ["--json", str(journal)],
+                ["--json", str(alias)],
+                ["-r", str(symlink)],
+                ["--json", str(self.root / "report.txt")]):
+            with self.subTest(options=options), patch.object(mod, "fetch_one") as fetch:
+                self.assertEqual(self.run_main("--no-test", *options), 2)
+                fetch.assert_not_called()
+                self.assertEqual(json.loads((self.downloads / "run.json").read_text()), manifest)
+                self.assertEqual(journal.read_bytes(), original_journal)
+
+    def test_missing_report_parent_preserves_local_rpm(self):
+        rpm = self.downloads / "demo-1-1" / "demo-1-1.src.rpm"
+        rpm.parent.mkdir(parents=True)
+        rpm.write_bytes(b"original RPM")
+        for option in ("-r", "--json"):
+            with self.subTest(option=option), patch.object(mod, "test_one") as test:
+                self.assertEqual(self.run_main("--test-only", option,
+                                               str(self.root / "missing" / "report")), 2)
+                test.assert_not_called()
+                self.assertEqual(rpm.read_bytes(), b"original RPM")
+
+    def test_reports_can_use_download_directories_created_by_the_runner(self):
+        report = self.downloads / "logs" / "report.txt"
+        json_path = self.downloads / "results.json"
+        with patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
+            self.assertEqual(self.run_main("--no-test", "-r", str(report),
+                                           "--json", str(json_path)), 0)
+        self.assertTrue(report.is_file())
+        self.assertTrue(json_path.is_file())
 
 
 class TimingTests(RunnerTestCase):

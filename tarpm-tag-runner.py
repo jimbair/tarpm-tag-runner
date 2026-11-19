@@ -2538,6 +2538,63 @@ def parse_args(argv) -> argparse.Namespace:
     return args
 
 
+def validate_output_paths(args) -> None:
+    """Catch aliases and unusable report destinations before starting work."""
+    root = Path(args.dir)
+    reports = [] if args.list else [("--report", Path(args.report))]
+    if not args.list and args.json:
+        reports.append(("--json", Path(args.json)))
+    outputs = list(reports)
+    if args.run_log:
+        outputs.append(("--run-log", Path(args.run_log)))
+
+    def path_keys(path):
+        try:
+            canonical = path.resolve()
+        except (OSError, RuntimeError):
+            canonical = path.absolute()
+        try:
+            info = path.stat()
+        except OSError:
+            return (canonical,)
+        return canonical, (info.st_dev, info.st_ino)
+
+    protected = [root / name for name in ("run.json", "journal.jsonl", "build-sizes.json",
+                                          f"tag-{args.tag}.txt")]
+    if args.from_file:
+        protected.append(Path(args.from_file))
+    used = {key: path for path in protected for key in path_keys(path)}
+    for option, path in outputs:
+        keys = path_keys(path)
+        for key in keys:
+            if key in used:
+                raise UsageError(f"{option} destination {path} overlaps {used[key]}")
+        used.update((key, path) for key in keys)
+
+    managed_dirs = [root / "logs"]
+    if args.run_log:
+        managed_dirs.append(Path(args.run_log).parent)
+    for option, path in reports:
+        try:
+            target = path.resolve()
+            parent = target.parent
+            if not parent.is_dir():
+                # These directories were already created during run setup.
+                if any(parent == d.resolve() or parent in d.resolve().parents
+                       for d in managed_dirs):
+                    parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    raise UsageError(f"{option} directory does not exist: {parent}")
+            if target.is_dir():
+                raise UsageError(f"{option} destination is a directory: {path}")
+            writable = (os.access(target, os.W_OK) if target.exists()
+                        else os.access(parent, os.W_OK | os.X_OK))
+            if not writable:
+                raise UsageError(f"{option} destination is not writable: {path}")
+        except (OSError, RuntimeError) as exc:
+            raise UsageError(f"cannot use {option} destination {path}: {exc}") from exc
+
+
 def main(argv=None) -> int:
     t0 = time.monotonic()
     started = datetime.now(timezone.utc).isoformat()
@@ -2546,6 +2603,7 @@ def main(argv=None) -> int:
         return update_self()
     try:
         baseline = read_comparison_report(Path(args.compare)) if args.compare else None
+        validate_output_paths(args)
     except UsageError as exc:
         log(f"{PROG}: error: {exc}", err=True)
         return 2
