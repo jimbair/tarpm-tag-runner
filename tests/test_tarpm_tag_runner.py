@@ -1539,6 +1539,55 @@ class FetchRecoveryTests(RunnerTestCase):
             self.assertEqual(self.run_main("--no-test", "-j", "2"), 0)
         fetch.assert_called_once()
 
+    def test_normal_run_tests_only_rpms_from_current_download(self):
+        build = self.downloads / "demo-1-1"
+        build.mkdir(parents=True)
+        current = build / "demo-1-1.x86_64.rpm"
+        current.write_bytes(b"old main RPM")
+        extra = build / "demo-debuginfo-1-1.x86_64.rpm"
+        extra.write_bytes(b"retained debug RPM")
+        tested = []
+
+        def command(cmd, cwd=None, binary_output=False, **kwargs):
+            if cmd[1] == "download-build":
+                self.assertEqual(list(cwd.iterdir()), [])
+                (cwd / current.name).write_bytes(b"current download")
+            elif cmd[1] == "-x" and not tested:
+                rpm = Path(cmd[3])
+                self.assertEqual(rpm.read_bytes(), b"current download")
+                tested.append(rpm)
+            return 0, b"" if binary_output else ""
+
+        report = self.root / "downloads.json"
+        with patch.object(mod, "run", side_effect=command):
+            self.assertEqual(self.run_main("--keep", "--json", str(report)), 0)
+        self.assertEqual(tested, [current])
+        self.assertEqual([row["rpm"] for row in json.loads(report.read_text())["test"]],
+                         [str(current)])
+        self.assertEqual(extra.read_bytes(), b"retained debug RPM")
+        self.assertEqual(current.read_bytes(), b"current download")
+        self.assertEqual(list(build.glob(".download-*")), [])
+
+    def test_failed_staged_download_preserves_existing_and_partial_rpms(self):
+        build = self.downloads / "demo-1-1"
+        build.mkdir(parents=True)
+        previous = build / "demo-1-1.x86_64.rpm"
+        previous.write_bytes(b"previous download")
+
+        def download(cmd, cwd, **kwargs):
+            self.assertEqual(cmd[1], "download-build")
+            self.assertEqual(cwd.parent, build)
+            (cwd / previous.name).write_bytes(b"partial download")
+            return 7, "download failed"
+
+        with patch.object(mod, "run", side_effect=download), \
+                patch.object(mod, "test_one") as test:
+            self.assertEqual(self.run_main(), 1)
+        test.assert_not_called()
+        self.assertEqual(previous.read_bytes(), b"previous download")
+        partial, = build.glob(f".download-*/{previous.name}")
+        self.assertEqual(partial.read_bytes(), b"partial download")
+
     def test_recovery_clears_build_before_download(self):
         for mode in ("--resume", "--retry-failed"):
             with self.subTest(mode=mode):
@@ -1911,14 +1960,19 @@ class ArtifactRetentionTests(RunnerTestCase):
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)
         rpm.write_text("original rpm")
+
+        def command(cmd, cwd=None, **kwargs):
+            if cmd[1] == "download-build":
+                (cwd / rpm.name).write_bytes(b"downloaded RPM")
+            return 0, "listing\n"
+
         for mode in ([], ["--test-only"]):
             work = rpm.parent / ".tarpm-demo-1-1.noarch"
             if work.exists():
                 shutil.rmtree(work)
             with self.subTest(mode=mode), \
                     patch.object(mod.shutil, "which", return_value="/fake/tool"), \
-                    patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)), \
-                    patch.object(mod, "run", return_value=(0, "listing\n")), \
+                    patch.object(mod, "run", side_effect=command), \
                     patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")):
                 # Each attempt starts without an old work dir so the failure
                 # occurs after all tarpm commands, during final cleanup.

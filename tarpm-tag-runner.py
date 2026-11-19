@@ -931,8 +931,10 @@ def fetch_progress(nvr: str, pdir: Path, output: bytes | str | None,
     return label, fmt_duration(elapsed) + suffix
 
 
-def fetch_one(nvr: str, args, counter: "Counter | None" = None) -> FetchResult:
-    pdir = build_dir(args.dir, nvr)
+def fetch_one(nvr: str, args, counter: "Counter | None" = None,
+              *, download_dir: Path | None = None) -> FetchResult:
+    bdir = build_dir(args.dir, nvr)
+    pdir = download_dir if download_dir is not None else bdir
     pdir.mkdir(parents=True, exist_ok=True)
     cmd = ["koji", "download-build"]
     if args.arch:
@@ -1271,14 +1273,26 @@ def process_build(nvr: str, args, fetch_counter=None) -> tuple:
     --keep); a build whose RPMs all passed is removed entirely. Failures
     keep their RPMs and work dirs.
     """
-    fetch = fetch_one(nvr, args, fetch_counter)
+    bdir = build_dir(args.dir, nvr)
+    staging = None
+    if any(bdir.glob("*.rpm")):
+        # Koji leaves unrelated files in its working directory. Isolate the
+        # download before identifying its RPMs or replacing a retained copy.
+        staging = Path(tempfile.mkdtemp(prefix=".download-", dir=bdir))
+    fetch = fetch_one(nvr, args, fetch_counter, download_dir=staging)
     if not fetch.ok:
         # A failed or partial download is not valid test input; the RPMs
         # and the fetch log are kept for inspection and can be tested
         # later with --test-only.
         return fetch, []
-    bdir = build_dir(args.dir, nvr)
-    units = build_units(bdir, args)
+    units = build_units(staging if staging is not None else bdir, args)
+    if staging is not None:
+        for rpm in staging.glob("*.rpm"):
+            if rpm.is_file():
+                rpm.replace(bdir / rpm.name)
+        if not any(staging.iterdir()):
+            staging.rmdir()
+        units = [bdir / rpm.name for rpm in units]
     total = len(units)
     tests = []
     for i, rpm in enumerate(units, start=1):

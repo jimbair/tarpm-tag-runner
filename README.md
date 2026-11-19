@@ -188,6 +188,12 @@ successful fetch, even with `--keep`. Failed downloads retain partial files
 and fetch logs; empty build directories are removed unless `--keep` is set.
 In `--test-only`, source RPMs are simply skipped and left on disk.
 
+When a fetch-and-test run finds existing RPMs in a build directory, it
+downloads into a separate `.download-*` subdirectory. A successful fetch
+moves the new RPMs into the build directory and tests those files. Other
+RPMs already in the directory are outside the test selection. If the fetch
+fails, any partial downloads stay in the subdirectory for inspection.
+
 ## Test cycle and retained files
 
 Each RPM goes through these stages; a nonzero exit stops that RPM's cycle.
