@@ -473,8 +473,10 @@ result is truncated to 120 characters for grouping. If no signature was
 captured, grouping uses normalized runner exception text or the explicit
 `(no diagnostic output)` label.
 
-Every report replaces the failure lists in `DIR/logs/`; a report with no
-failures removes old lists. Lists contain sorted, deduplicated NVRs,
+Every report replaces the generated failure lists in `DIR/logs/`. A report
+with no failures removes those lists and preserves other files in the log
+directory. The list filenames below are reserved for the runner. Lists
+contain sorted, deduplicated NVRs,
 optionally followed by `  # detail`:
 
 | File | Contents |

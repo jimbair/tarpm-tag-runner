@@ -1060,6 +1060,39 @@ class ReportPathTests(RunnerTestCase):
         self.assertTrue(report.is_file())
         self.assertTrue(json_path.is_file())
 
+    def test_report_cannot_replace_generated_failure_list(self):
+        report = self.downloads / "logs" / "failed-all.txt"
+        with patch.object(mod, "fetch_one") as fetch:
+            self.assertEqual(self.run_main("--no-test", "-r", str(report)), 2)
+        fetch.assert_not_called()
+        self.assertFalse(report.exists())
+
+    def test_failure_list_cleanup_preserves_logs_and_custom_reports(self):
+        logdir = self.downloads / "logs"
+        logdir.mkdir(parents=True)
+        fetch_log = logdir / "failed-fetch-1-1.fetch.log"
+        test_log = logdir / "failed-test-1-1.src.test.log"
+        for path in (fetch_log, test_log):
+            path.write_text("retained diagnostics")
+        args = mod.parse_args(self.argv)
+        fetched = mod.FetchResult("failed-fetch-1-1", False, 1, fetch_log,
+                                  signature="download error")
+        tested = mod.TestResult("failed-test-1-1.src.rpm", "failed-test-1-1", "src",
+                                False, "unpack", 1, log=test_log, signature="unpack error")
+        mod.write_failure_lists(args, [fetched], [tested])
+        generated = set(logdir.iterdir()) - {fetch_log, test_log}
+        self.assertEqual(len(generated), 6)
+        # Replacing an older failure list must also preserve retained logs.
+        mod.write_failure_lists(args, [fetched], [tested])
+
+        report = logdir / "failed-summary.txt"
+        with patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
+            self.assertEqual(self.run_main("--no-test", "-r", str(report)), 0)
+        self.assertEqual(set(logdir.iterdir()), {report, fetch_log, test_log})
+        self.assertIn("status:    passed", report.read_text())
+        for path in (fetch_log, test_log):
+            self.assertEqual(path.read_text(), "retained diagnostics")
+
 
 class TimingTests(RunnerTestCase):
     def test_stage_times_include_the_failing_command_and_skip_unreached_stages(self):

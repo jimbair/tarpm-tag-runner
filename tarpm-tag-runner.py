@@ -2245,6 +2245,20 @@ def cumulative_results(manifest: dict, latest: dict, current: list,
 # failure lists (plain NVR files under DIR/logs, feedable to --from-file)
 # ---------------------------------------------------------------------------
 
+FAILURE_LIST_STAGES = frozenset({
+    "fetch", "unpack", "repack", "unpack-repacked", "list-original",
+    "list-repacked", "cleanup", "exception", "unknown",
+})
+FAILURE_LIST_FILES = {"failed-all.txt", "failed-index.tsv"} | {
+    f"failed-{stage}.txt" for stage in FAILURE_LIST_STAGES
+}
+
+
+def is_failure_list_name(name: str) -> bool:
+    return (name in FAILURE_LIST_FILES
+            or bool(re.fullmatch(r"failed-sig-[a-z0-9-]{1,32}-[0-9a-f]{6}\.txt", name)))
+
+
 def _sig_slug(signature: str) -> str:
     """Filename slug for a signature: sanitized lowercase alnum/hyphens
     (capped at 32 chars) plus 6 hex chars of its SHA-256, so distinct
@@ -2293,7 +2307,7 @@ def write_failure_lists(args, fetch: list | None, test: list | None,
     try:
         if logdir.is_dir():
             for p in logdir.glob("failed-*"):
-                if p.is_file():
+                if is_failure_list_name(p.name) and (p.is_symlink() or p.is_file()):
                     p.unlink(missing_ok=True)
         rows = failure_rows(fetch, test)
         if run:
@@ -2325,7 +2339,8 @@ def write_failure_lists(args, fetch: list | None, test: list | None,
 
         by_stage = {}
         for stage, sig, nvr, rpm, rc in rows:
-            by_stage.setdefault(stage, {}).setdefault(nvr, detail(stage, rc, sig))
+            name = stage if stage in FAILURE_LIST_STAGES else "unknown"
+            by_stage.setdefault(name, {}).setdefault(nvr, detail(stage, rc, sig))
         for stage in sorted(by_stage):
             (logdir / f"failed-{stage}.txt").write_text(nvr_text(by_stage[stage]))
 
@@ -2559,19 +2574,26 @@ def validate_output_paths(args) -> None:
             return (canonical,)
         return canonical, (info.st_dev, info.st_ino)
 
-    protected = [root / name for name in ("run.json", "journal.jsonl", "build-sizes.json",
-                                          f"tag-{args.tag}.txt")]
+    logdir = root / "logs"
+    protected = [root, logdir, root / "run.json", root / "journal.jsonl",
+                 root / "build-sizes.json", root / f"tag-{args.tag}.txt"]
     if args.from_file:
         protected.append(Path(args.from_file))
     used = {key: path for path in protected for key in path_keys(path)}
+    canonical_logdir = path_keys(logdir)[0]
     for option, path in outputs:
         keys = path_keys(path)
+        # Check both a named output in logs/ and an alias to a generated list.
+        for candidate in (path, keys[0]):
+            if (is_failure_list_name(candidate.name)
+                    and path_keys(candidate.parent)[0] == canonical_logdir):
+                raise UsageError(f"{option} destination {path} overlaps a generated failure list")
         for key in keys:
             if key in used:
                 raise UsageError(f"{option} destination {path} overlaps {used[key]}")
         used.update((key, path) for key in keys)
 
-    managed_dirs = [root / "logs"]
+    managed_dirs = [logdir]
     if args.run_log:
         managed_dirs.append(Path(args.run_log).parent)
     for option, path in reports:
