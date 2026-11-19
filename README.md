@@ -124,8 +124,8 @@ whitespace-delimited token on each line is used; headers, blank lines, and
 Koji build-type query; generate them with the filtered command above to
 exclude image-only builds. Duplicate NVRs run once. `-n` is applied after
 package filtering and optional size sorting, before journal filtering. In
-`--test-only`, it limits matching build directories in alphabetical order
-unless `--sort` is supplied.
+`--test-only`, only build directories with selected RPMs count toward the
+limit. The default order is alphabetical.
 
 ### Size ordering
 

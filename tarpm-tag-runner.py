@@ -1029,38 +1029,37 @@ def collect_test_units(args) -> list:
     DIR, the same way they apply to the tag list in a fetch run.
     """
     root = Path(args.dir)
-    units = []
     if not root.is_dir():
-        return units
+        return []
+
+    def eligible_builds():
+        directories = root.iterdir()
+        if not args.sort:
+            directories = sorted(directories, key=lambda path: path.name)
+        for directory in directories:
+            if not directory.is_dir() or directory.name == "logs":
+                continue
+            if args.pkg and not select_nvrs([directory.name], args.pkg):
+                continue
+            rpms = build_units(build_dir(args.dir, directory.name), args)
+            if rpms:
+                yield directory.name, rpms
+
+    builds = eligible_builds()
     if args.sort:
-        ranked = []
+        direction = -1 if args.sort == "desc" else 1
+
+        def size_key(build):
+            nvr, rpms = build
+            return direction * sum(rpm.stat().st_size for rpm in rpms), nvr
+
         try:
-            for d in root.iterdir():
-                if not d.is_dir() or d.name == "logs":
-                    continue
-                if args.pkg and not select_nvrs([d.name], args.pkg):
-                    continue
-                local = build_units(build_dir(args.dir, d.name), args)
-                size = sum(rpm.stat().st_size for rpm in local)
-                ranked.append(((-size if args.sort == "desc" else size), d.name, local))
+            builds = sorted(builds, key=size_key)
         except OSError as exc:
             raise UsageError(f"cannot measure local build sizes: {exc}") from exc
-        ranked.sort(key=lambda row: (row[0], row[1]))
-        if args.limit:
-            ranked = ranked[:args.limit]
-        return [rpm for _, _, local in ranked for rpm in local]
-    builds = 0
-    for d in sorted(root.iterdir(), key=lambda p: p.name):
-        if not d.is_dir() or d.name == "logs":
-            continue
-        if args.pkg and not any(d.name == p or d.name.startswith(p + "-")
-                                for p in args.pkg):
-            continue
-        builds += 1
-        if args.limit and builds > args.limit:
-            break
-        units.extend(build_units(build_dir(args.dir, d.name), args))
-    return units
+    if args.limit:
+        builds = itertools.islice(builds, min(args.limit, sys.maxsize))
+    return [rpm for _, rpms in builds for rpm in rpms]
 
 
 def remove_tree(path: Path) -> None:

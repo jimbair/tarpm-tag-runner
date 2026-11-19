@@ -298,9 +298,23 @@ class SizeSortingTests(RunnerTestCase):
                     patch.object(mod, "fetch_size_metadata") as fetch:
                 args = mod.parse_args(self.argv + ["--test-only", "--sort", "asc", "-n", "1"]
                                       + (["--no-src"] if no_src else []))
-                self.assertTrue(all(unit.parent.name == expected for unit in mod.collect_test_units(args)))
+                units = mod.collect_test_units(args)
+                self.assertTrue(units)
+                self.assertEqual({unit.parent.name for unit in units}, {expected})
             cache.assert_not_called()
             fetch.assert_not_called()
+
+    def test_local_limit_skips_builds_without_selected_rpms(self):
+        for nvr, arch in (("a-1-1", "src"), ("b-1-1", "aarch64"), ("z-1-1", "x86_64")):
+            rpm = self.downloads / nvr / f"{nvr}.{arch}.rpm"
+            rpm.parent.mkdir(parents=True)
+            rpm.write_bytes(b"RPM")
+        expected = self.downloads / "z-1-1" / "z-1-1.x86_64.rpm"
+        options = ["--test-only", "--no-src", "-a", "x86_64", "-n", "1"]
+        for sort in ([], ["--sort", "asc"], ["--sort", "desc"]):
+            with self.subTest(sort=sort):
+                args = mod.parse_args(self.argv + options + sort)
+                self.assertEqual(mod.collect_test_units(args), [expected])
 
     def test_local_sort_rejects_symlinked_builds_before_testing(self):
         outside = self.root / "outside"
