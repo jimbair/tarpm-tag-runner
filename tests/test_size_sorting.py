@@ -252,6 +252,22 @@ class SizeSortingTests(RunnerTestCase):
         cache.assert_not_called()
         fetch.assert_not_called()
 
+    def test_sorted_recovery_with_no_pending_builds_after_limit_needs_no_koji(self):
+        self.listfile.write_text("passed-1-1\nfailed-1-1\n")
+        self.cache({"passed-1-1": {"src": 1}, "failed-1-1": {"src": 2}})
+        mod.write_run_manifest(self.downloads / "run.json", ["passed-1-1", "failed-1-1"], "active")
+        (self.downloads / "journal.jsonl").write_text(
+            '{"nvr":"passed-1-1","run_id":"active","status":"pass"}\n'
+            '{"nvr":"failed-1-1","run_id":"active","status":"test-fail"}\n')
+        with patch.object(mod.shutil, "which", return_value=None), \
+                patch.object(mod, "fetch_size_metadata") as fetch, \
+                patch.object(mod, "process_build") as process:
+            for mode in ("--resume", "--retry-failed"):
+                with self.subTest(mode=mode):
+                    self.assertEqual(self.run_main(mode, "--sort", "asc", "-n", "1"), 0)
+        fetch.assert_not_called()
+        process.assert_not_called()
+
     def test_invalid_manifest_fails_before_size_cache_work(self):
         self.downloads.mkdir()
         (self.downloads / "run.json").write_text('{"run_id":')

@@ -105,10 +105,11 @@ A full NVR such as `7zip-25.01-5.fc44` can select that exact build.
 Tag lists are cached as `DIR/tag-<TAG>.txt`, containing
 `koji latest-pkg --all --type=rpm TAG` output with a comment marking the RPM
 build-type filter. Later runs reuse that snapshot until `--refresh`. Older
-caches without the marker are refreshed automatically once, including on
-`--resume` and `--retry-failed`, so existing image entries are removed before
-package, limit, and journal filtering. This refresh requires Koji access;
-if it fails, the old cache is preserved and the run stops.
+caches without the marker are refreshed automatically once when used as a
+build list, including for `--retry-failed` and legacy resumes without a
+manifest. This removes image entries before package, limit, and journal
+filtering. Koji access is required for the refresh. A failed refresh
+preserves the old cache and stops the run.
 Fresh query output is validated and the cache is replaced atomically;
 interrupted or failed cache writes preserve the previous snapshot.
 
@@ -321,11 +322,13 @@ python tarpm-tag-runner.py -t f44 -j 2 --resume
 python tarpm-tag-runner.py -t f44 -j 2 --retry-failed
 ```
 
-Both modes clear each selected build directory before downloading. Normal
-tag/file selection, `-p`, and `-n` still apply; resume also restricts work to
-the manifest's selection, preserving pending builds outside a temporary
-filter. They test every selected RPM of a build, not just its previously
-failing RPMs. A resume with nothing pending rebuilds the cumulative reports
+Both modes clear each selected build directory before downloading.
+`--resume` uses the saved manifest as its build list even after a tag cache
+refresh. An explicit `--from-file` narrows that selection. `--retry-failed`
+uses the usual tag or file selection. The `-p` and `-n` filters apply in both
+modes, and temporary filters leave other pending builds in the manifest.
+Both modes test every selected RPM of a build, including earlier passes.
+A resume with nothing pending rebuilds the cumulative reports
 without downloading, testing, or adding journal records. Nothing to do
 exits 0. Exit status and console work counts describe the current invocation;
 a filtered resume can succeed while other builds remain pending in the

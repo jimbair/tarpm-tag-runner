@@ -462,6 +462,30 @@ class RunManifestTests(RunnerTestCase):
             self.assertEqual(self.run_main("--resume"), 0)
         process.assert_not_called()
 
+    def test_resume_keeps_pending_builds_after_tag_refresh(self):
+        self.argv = self.argv[2:]
+        manifest = self.downloads / "run.json"
+        mod.write_run_manifest(manifest, ["old-1-1"], "active")
+        before = manifest.read_bytes()
+        cache = self.downloads / "tag-f44.txt"
+        cache.write_text(mod.RPM_TAG_CACHE_HEADER + "old-1-1\n")
+        with patch.object(mod, "run", return_value=(0, "new-1-1 f44 user\n")):
+            self.assertEqual(self.run_main("--list", "--refresh"), 0)
+        self.assertIn("new-1-1", cache.read_text())
+        with patch.object(mod, "read_nvrs") as read, \
+                patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("--resume"), 0)
+        read.assert_not_called()
+        self.assertEqual([call.args[0] for call in process.call_args_list], ["old-1-1"])
+        self.assertEqual(manifest.read_bytes(), before)
+
+    def test_explicit_resume_list_cannot_displace_a_manifest_build_at_limit(self):
+        self.listfile.write_text("outside-1-1\ndemo-1-1\n")
+        mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+        with patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("--resume", "-n", "1"), 0)
+        self.assertEqual([call.args[0] for call in process.call_args_list], ["demo-1-1"])
+
     def test_retry_uses_historical_failures_but_starts_a_new_run(self):
         path = self.downloads / "run.json"
         mod.write_run_manifest(path, ["other-1-1"], "previous-run")
@@ -769,7 +793,7 @@ class CliSelectionTests(RunnerTestCase):
         self.assertIn("invalid build NVR", stderr)
         self.assertEqual(cache.read_text(), previous)
 
-    def test_recovery_drops_image_failures_from_legacy_cache(self):
+    def test_recovery_without_manifest_drops_image_failures_from_legacy_cache(self):
         self.downloads.mkdir()
         cache = self.downloads / "tag-f44.txt"
         image = "Fedora-Games-Live-44-20260424.n.0"
@@ -777,9 +801,6 @@ class CliSelectionTests(RunnerTestCase):
                    {"nvr": "hello-1-1", "status": "test-fail"}]
         (self.downloads / "journal.jsonl").write_text(
             "".join(json.dumps(record) + "\n" for record in records))
-        mod.write_run_manifest(self.downloads / "run.json",
-                               [image, "hello-1-1"], "old-run")
-        manifest = (self.downloads / "run.json").read_text()
         self.argv = ["-d", str(self.downloads), "--no-run-log"]
         for mode in ("--resume", "--retry-failed"):
             with self.subTest(mode=mode):
@@ -789,7 +810,7 @@ class CliSelectionTests(RunnerTestCase):
                     result, stdout, _ = self.list_output(mode)
                 self.assertEqual(result, 0)
                 self.assertEqual(stdout, "hello-1-1\n")
-                self.assertEqual((self.downloads / "run.json").read_text(), manifest)
+                self.assertFalse((self.downloads / "run.json").exists())
 
     def test_explicit_file_keeps_supplied_builds_without_querying_koji(self):
         self.listfile.write_text("Fedora-IoT-32-20191107.0\nhello-1-1\n")

@@ -2653,8 +2653,26 @@ def main(argv=None) -> int:
     legacy_records = []
     run = None
     if do_fetch:
+        manifest_path = Path(args.dir) / "run.json"
+        journal_path = str(Path(args.dir) / "journal.jsonl")
         try:
-            nvrs, tag_source = read_nvrs(args)
+            if args.resume:
+                manifest = read_run_manifest(manifest_path)
+            if manifest is not None:
+                run_id = manifest["run_id"]
+                context = manifest.get("context") or {}
+                settings = context.get("settings") or {}
+                if ((context.get("tag", args.tag) != args.tag)
+                        or (settings and (
+                            sorted(settings["architectures"]) != sorted(args.arch)
+                            or settings["include_source"] != (not args.no_src)))):
+                    raise UsageError("resume requires the original tag, architecture, "
+                                     "and source settings; start a fresh run to change them")
+            if manifest is not None and not args.from_file:
+                nvrs = list(dict.fromkeys(manifest["nvrs"]))
+                tag_source = f"saved run ({manifest_path})"
+            else:
+                nvrs, tag_source = read_nvrs(args)
         except UsageError as exc:
             log(f"{PROG}: error: {exc}", err=True)
             return 2
@@ -2667,25 +2685,10 @@ def main(argv=None) -> int:
             log(f"{PROG}: error: no builds matched the -p filters: "
                   f"{' '.join(args.pkg)}", err=True)
             return 2
-        journal_path = str(Path(args.dir) / "journal.jsonl")
-        latest = {}
+        if manifest is not None and args.from_file:
+            active = set(manifest["nvrs"])
+            selected = [nvr for nvr in selected if nvr in active]
         if args.resume:
-            try:
-                manifest = read_run_manifest(Path(args.dir) / "run.json")
-            except UsageError as exc:
-                log(f"{PROG}: error: {exc}", err=True)
-                return 2
-            if manifest is not None:
-                run_id = manifest["run_id"]
-                context = manifest.get('context') or {}
-                settings = context.get('settings') or {}
-                if ((context.get('tag', args.tag) != args.tag)
-                        or (settings and (
-                            sorted(settings['architectures']) != sorted(args.arch)
-                            or settings['include_source'] != (not args.no_src)))):
-                    log(f"{PROG}: error: resume requires the original tag, architecture, "
-                        "and source settings; start a fresh run to change them", err=True)
-                    return 2
             latest = read_journal(journal_path, run_id=run_id)
         elif args.retry_failed:
             latest = read_journal(journal_path)
@@ -2694,14 +2697,15 @@ def main(argv=None) -> int:
         # Sorting otherwise precedes -n, which still precedes journal filters.
         eligible = selected
         if args.resume:
-            active = set(manifest["nvrs"]) if manifest is not None else set(selected)
-            eligible = [n for n in selected if n in active
-                        and latest.get(n, {}).get("status") not in ("pass", "warn")]
+            eligible = [n for n in selected
+                        if latest.get(n, {}).get("status") not in ("pass", "warn")]
         elif args.retry_failed:
             eligible = [n for n in selected
                         if latest.get(n, {}).get("status") in ("fetch-fail", "test-fail")]
         if args.sort and eligible:
-            if not args.list and shutil.which("koji") is None:
+            # For a fresh run a nonempty sort stays nonempty after -n.
+            # Recovery may become a no-op once we know the sorted prefix.
+            if not (args.list or args.resume or args.retry_failed) and shutil.which("koji") is None:
                 log(f"{PROG}: error: koji client not found in PATH", err=True)
                 return 2
             try:
@@ -2727,9 +2731,6 @@ def main(argv=None) -> int:
         if args.resume:
             # Only passes from this run can satisfy its selection. Older
             # successes must not hide unfinished or queued re-test attempts.
-            if manifest is not None:
-                run_builds = set(manifest["nvrs"])
-                selected = [n for n in selected if n in run_builds]
             before = len(selected)
             selected = [n for n in selected
                         if latest.get(n, {}).get("status")
@@ -2772,7 +2773,7 @@ def main(argv=None) -> int:
                 # A first resume of a legacy journal must keep its already
                 # completed builds as well as the pending selection.
                 manifest = write_run_manifest(
-                    Path(args.dir) / "run.json",
+                    manifest_path,
                     run_selection if args.resume else selected, run_id,
                     context={**session, 'tag': args.tag})
             except OSError as exc:
