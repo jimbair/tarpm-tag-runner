@@ -104,8 +104,9 @@ caches without the marker are refreshed automatically once when used as a
 build list, including for `--retry-failed`. This removes image entries before
 package, limit, and journal filtering. The refresh requires Koji access.
 On failure, the runner preserves the old cache and stops.
-Fresh query output is validated and the cache is replaced atomically;
-interrupted or failed cache writes preserve the previous snapshot.
+The runner validates the query's stdout and replaces the cache atomically.
+Warnings on stderr go to diagnostics. Interrupted or failed cache writes
+preserve the previous snapshot.
 
 Before downloads start, the runner checks for Koji and tarpm. A missing
 client exits `2` before replacing the run manifest or writing the journal.
@@ -220,7 +221,8 @@ count logical file bytes, without following symlinks or counting hardlinks
 twice; the completed input tree is measured once, on the first heartbeat
 that needs it. Fast tests do not scan the tree for progress.
 
-The two listing outputs are compared with Python's `difflib`. A difference
+The two listing commands' stdout streams are compared with Python's
+`difflib`. Stderr is logged separately. A difference
 is a `content-diff` warning, not a failure; failure to generate a listing
 is a failed stage. This compares listings, not file bytes or all metadata.
 Listings are saved and compared as raw bytes, including non-UTF-8 filenames.

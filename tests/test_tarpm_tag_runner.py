@@ -686,16 +686,20 @@ class CliSelectionTests(RunnerTestCase):
         proc = Mock()
         proc.communicate.side_effect = [
             mod.subprocess.TimeoutExpired(["koji"], 60),
-            ("demo-1-1 f44 user\n", None),
+            ("demo-1-1 f44 user\n", "Warning: the pkgurl option is obsolete\n"),
         ]
         proc.returncode = 0
         with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
-                patch.object(mod.subprocess, "Popen", return_value=proc):
+                patch.object(mod.subprocess, "Popen", return_value=proc) as popen:
             result, stdout, stderr = self.list_output("--refresh")
         self.assertEqual(result, 0)
         self.assertEqual(stdout, "demo-1-1\n")
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.PIPE)
         self.assertIn("still fetching koji tag", stderr)
         self.assertIn("saved tag list", stderr)
+        self.assertIn("Warning: the pkgurl option is obsolete", stderr)
+        cache = self.downloads / "tag-f44.txt"
+        self.assertEqual(cache.read_text(), mod.RPM_TAG_CACHE_HEADER + "demo-1-1 f44 user\n")
 
     def test_tag_query_filters_rpm_builds_and_cache_is_reused(self):
         self.argv = ["-t", "f45", "-d", str(self.downloads), "--no-run-log"]
@@ -1735,6 +1739,29 @@ class TestProgressTests(RunnerTestCase):
 
 
 class ListingEncodingTests(RunnerTestCase):
+    def test_listing_diagnostics_do_not_change_the_content_comparison(self):
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir()
+        rpm.write_text("original rpm")
+
+        def spawn(cmd, **kwargs):
+            child = Mock(returncode=0)
+            output = (None, None)
+            if cmd[1] == "-t":
+                self.assertEqual(kwargs["stderr"], subprocess.PIPE)
+                output = (b"same listing\n", f"Warning for {Path(cmd[3]).name}\n".encode())
+            child.communicate.return_value = output
+            return child
+
+        with patch.object(mod.subprocess, "Popen", side_effect=spawn), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            result = mod.test_one(rpm, mod.parse_args(self.argv))
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.warning)
+        self.assertIn(f"Warning for {rpm.name}", stderr.getvalue())
+        self.assertIn(f"Warning for {rpm.stem}-repacked.rpm", stderr.getvalue())
+
     def test_listings_are_compared_and_saved_without_lossy_decoding(self):
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)
@@ -1772,17 +1799,23 @@ class ListingEncodingTests(RunnerTestCase):
         rpm.write_text("original rpm")
         (self.downloads / "logs").mkdir()
 
-        def command(cmd, **kwargs):
-            return (9, b"tarpm: invalid \xff\n") if cmd[1] == "-t" else (0, "")
+        def spawn(cmd, **kwargs):
+            if cmd[1] == "-t":
+                child = Mock(returncode=9)
+                child.communicate.return_value = (b"partial listing", b"tarpm: invalid \xff\n")
+            else:
+                child = Mock(returncode=0)
+                child.communicate.return_value = (None, None)
+            return child
 
-        with patch.object(mod, "run", side_effect=command), \
+        with patch.object(mod.subprocess, "Popen", side_effect=spawn), \
                 contextlib.redirect_stdout(io.StringIO()):
             result = mod.test_one(rpm, mod.parse_args(self.argv))
         self.assertFalse(result.ok)
         self.assertEqual(result.stage, "list-original")
         self.assertEqual(result.exit_code, 9)
         self.assertEqual(result.signature, "invalid \\xff")
-        self.assertIn("invalid \\xff", result.log.read_text())
+        self.assertIn("partial listing\ntarpm: invalid \\xff", result.log.read_text())
         self.assertFalse(rpm.exists())
 
 

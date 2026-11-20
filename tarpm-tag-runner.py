@@ -349,8 +349,13 @@ class Counter:
 def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         heartbeat: int = 0, counter_suffix: str = "",
         start: float | None = None, log_err: bool = False,
-        detail_fn=None, binary_output: bool = False, progress_fn=None) -> tuple:
-    """Run an external command; return (exit_code, combined stdout+stderr).
+        detail_fn=None, binary_output: bool = False, progress_fn=None,
+        *, separate_stderr: bool = False) -> tuple:
+    """Run an external command and return (exit_code, output).
+
+    By default, output includes both streams. With separate_stderr enabled,
+    successful commands return stdout and log stderr as diagnostics. Failed
+    commands include both streams in their returned diagnostic output.
 
     The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
     foreground process group) reaches only this process; a force-quit may
@@ -388,7 +393,7 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
             executable=executable,
             cwd=str(cwd) if cwd else None,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             text=not binary_output,
             encoding=None if binary_output else "utf-8",
             errors=None if binary_output else "backslashreplace",
@@ -407,8 +412,8 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
                 # off. Only the final call's output is used: each
                 # TimeoutExpired carries the cumulative partial output, so
                 # accumulating would duplicate lines.
-                out, _ = (proc.communicate(timeout=heartbeat)
-                          if heartbeat > 0 else proc.communicate())
+                out, diagnostics = (proc.communicate(timeout=heartbeat)
+                                    if heartbeat > 0 else proc.communicate())
                 break
             except subprocess.TimeoutExpired as exc:
                 elapsed = time.monotonic() - t0
@@ -426,7 +431,18 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         proc.kill()
         proc.wait()
         raise
-    return proc.returncode, out or (b"" if binary_output else "")
+    out = out or (b"" if binary_output else "")
+    if diagnostics:
+        if proc.returncode:
+            newline = b"\n" if binary_output else "\n"
+            if out and not out.endswith(newline):
+                out += newline
+            out += diagnostics
+        else:
+            message = (diagnostics.decode("utf-8", errors="backslashreplace")
+                       if binary_output else diagnostics)
+            log(f"{PROG}: {label or cmd[0]}: {message.rstrip()}", err=True)
+    return proc.returncode, out
 
 
 @dataclasses.dataclass
@@ -542,7 +558,8 @@ def read_nvrs(args) -> tuple:
         t0 = time.monotonic()
         cmd = ["koji", "latest-pkg", "--all", "--type=rpm", args.tag]
         rc, text = run(cmd, label=f"fetching koji tag {args.tag}",
-                       heartbeat=args.heartbeat, log_err=args.list)
+                       heartbeat=args.heartbeat, log_err=args.list,
+                       separate_stderr=True)
         elapsed = time.monotonic() - t0
         if rc != 0:
             log(f"{PROG}: tag {args.tag}: failed (after {elapsed:.1f}s)",
@@ -1062,7 +1079,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
         rc, out = run(cmd, label=f"testing {base}",
                       heartbeat=args.heartbeat, start=test_t0,
                       counter_suffix=position, detail_fn=detail,
-                      binary_output=binary_output)
+                      binary_output=binary_output, separate_stderr=binary_output)
         stage_seconds[name] = time.monotonic() - start
         if binary_output and isinstance(out, str):
             out = out.encode("utf-8")
