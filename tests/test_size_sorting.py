@@ -190,7 +190,7 @@ class SizeSortingTests(RunnerTestCase):
         path = self.cache({"other-1-1": {"src": 10}})
         old_cache = path.read_bytes()
         manifest = self.downloads / "run.json"
-        mod.write_run_manifest(manifest, ["demo-1-1"], "old")
+        self.write_manifest(manifest, ["demo-1-1"], "old")
         old_manifest = manifest.read_bytes()
         for operation in ("replace", "fsync"):
             with self.subTest(operation=operation), \
@@ -231,11 +231,10 @@ class SizeSortingTests(RunnerTestCase):
         self.cache({"passed-1-1": {"src": 1}, "failed-1-1": {"src": 2},
                     "new-1-1": {"src": 3}})
         manifest = self.downloads / "run.json"
-        mod.write_run_manifest(manifest, ["passed-1-1", "failed-1-1"], "active")
+        self.write_manifest(manifest, ["passed-1-1", "failed-1-1"], "active")
         before = manifest.read_bytes()
-        (self.downloads / "journal.jsonl").write_text("".join(json.dumps(
-            {"nvr": nvr, "status": status, "run_id": "active"}) + "\n"
-            for nvr, status in (("passed-1-1", "pass"), ("failed-1-1", "test-fail"))))
+        self.write_journal([self.build_record("passed-1-1", "pass"),
+                            self.build_record("failed-1-1", "test-fail")])
         for mode in ("--resume", "--retry-failed"):
             with self.subTest(mode=mode):
                 self.assertEqual(self.listed(mode, "--sort", "asc", "-n", "1")[1], [])
@@ -243,9 +242,8 @@ class SizeSortingTests(RunnerTestCase):
                 self.assertEqual(manifest.read_bytes(), before)
 
     def test_empty_resume_never_loads_size_cache(self):
-        mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
-        (self.downloads / "journal.jsonl").write_text(json.dumps(
-            {"nvr": "demo-1-1", "status": "pass", "run_id": "active"}) + "\n")
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+        self.write_journal([self.build_record("demo-1-1", "pass")])
         with patch.object(mod, "read_size_cache") as cache, \
                 patch.object(mod, "fetch_size_metadata") as fetch:
             self.assertEqual(self.listed("--resume", "--sort", "asc")[0], 0)
@@ -255,10 +253,9 @@ class SizeSortingTests(RunnerTestCase):
     def test_sorted_recovery_with_no_pending_builds_after_limit_needs_no_koji(self):
         self.listfile.write_text("passed-1-1\nfailed-1-1\n")
         self.cache({"passed-1-1": {"src": 1}, "failed-1-1": {"src": 2}})
-        mod.write_run_manifest(self.downloads / "run.json", ["passed-1-1", "failed-1-1"], "active")
-        (self.downloads / "journal.jsonl").write_text(
-            '{"nvr":"passed-1-1","run_id":"active","status":"pass"}\n'
-            '{"nvr":"failed-1-1","run_id":"active","status":"test-fail"}\n')
+        self.write_manifest(self.downloads / "run.json", ["passed-1-1", "failed-1-1"], "active")
+        self.write_journal([self.build_record("passed-1-1", "pass"),
+                            self.build_record("failed-1-1", "test-fail")])
         with patch.object(mod.shutil, "which", return_value=None), \
                 patch.object(mod, "fetch_size_metadata") as fetch, \
                 patch.object(mod, "process_build") as process:

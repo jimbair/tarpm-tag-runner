@@ -71,7 +71,6 @@ class CumulativeReportTests(RunnerTestCase):
         self.assertEqual(data['run']['build_statuses'], {'warn': 1, 'pass': 2})
         self.assertEqual(data['run']['pending_builds'], 0)
         self.assertEqual(data['run']['status'], 'passed')
-        self.assertEqual(data['run']['summary_only_builds'], [])
         self.assertEqual(data['timings']['unpack']['total_seconds'], 9)
         self.assertEqual(data['timings']['unpack']['count'], 5)
         self.assertEqual(data['failure_types'], {'fetch': [], 'test': []})
@@ -232,70 +231,20 @@ class CumulativeReportTests(RunnerTestCase):
         self.attempt({nvr: self.build(nvr) for nvr in self.nvrs[1:]}, '--resume')
         self.assertEqual(self.data()['summary']['test']['total'], 4)
 
-    def legacy_journal(self, manifest=True):
-        self.downloads.mkdir()
-        records = [
-            {'nvr': self.nvrs[0], 'status': 'pass', 'exit_code': None},
-            {'nvr': self.nvrs[1], 'status': 'test-fail', 'stage': 'repack',
-             'exit_code': 1, 'signature': 'old payload error', 'rpms': ['one', 'two']},
-            {'nvr': self.nvrs[2], 'status': 'fetch-fail', 'stage': 'fetch',
-             'exit_code': 1, 'signature': 'old network error'}]
-        if manifest:
-            mod.write_run_manifest(self.downloads / 'run.json', self.nvrs, 'old-run')
-            for rec in records:
-                rec['run_id'] = 'old-run'
-        (self.downloads / 'journal.jsonl').write_text(
-            ''.join(json.dumps(rec) + '\n' for rec in records))
+    def test_unsupported_and_invalid_rows_do_not_override_current_history(self):
+        self.attempt({nvr: self.build(nvr) for nvr in self.nvrs})
+        run_id = self.data()['run']['id']
+        nvr = self.nvrs[0]
+        mod.JOURNAL.append({'run_id': run_id, 'nvr': nvr, 'status': 'fetch-fail',
+                            'signature': {'bad': True}})
+        invalid = self.build_record(nvr, 'pass', run_id)
+        invalid['status'] = None
+        mod.JOURNAL.append(invalid)
 
-    def test_legacy_records_keep_build_counts_without_inventing_rpm_totals(self):
-        self.legacy_journal()
-        status, called = self.attempt({self.nvrs[2]: self.build(self.nvrs[2])},
-                                     '--resume', '-p', 'ccc', version='2')
-        self.assertEqual((status, called), (0, [self.nvrs[2]]))
-        data = self.data()
-        self.assertEqual(data['run']['summary_only_builds'], self.nvrs[:2])
-        self.assertEqual(data['summary']['fetch'], {'total': 3, 'ok': 3, 'failed': 0})
-        self.assertEqual(data['summary']['test']['total'], 1)
-        self.assertEqual(data['run']['build_statuses'], {'pass': 2, 'test-fail': 1})
-        self.assertEqual(data['run']['status'], 'failed')
-        report = (self.root / 'report.txt').read_text()
-        self.assertIn('2 build(s) have summary-only journal records', report)
-        self.assertIn('older RPM results cannot be reconstructed', report)
-        self.assertIn('bbb-1-1: first failure stage repack', report)
-        self.assertIn('bbb-1-1', (self.downloads / 'logs/failed-all.txt').read_text())
-        self.assertIn('old payload error', (self.downloads / 'logs/failed-index.tsv').read_text())
-
-    def test_legacy_journal_without_manifest_adopts_skipped_successes_once(self):
-        self.legacy_journal(manifest=False)
-        self.attempt({nvr: self.build(nvr) for nvr in self.nvrs[1:]}, '--resume')
-        data = self.data()
-        self.assertEqual(data['run']['selected_builds'], 3)
-        self.assertEqual(data['run']['summary_only_builds'], self.nvrs[:1])
-        latest = mod.read_journal(str(self.downloads / 'journal.jsonl'), data['run']['id'])
-        self.assertEqual(set(latest), set(self.nvrs))
-        before = (self.downloads / 'journal.jsonl').read_bytes()
-        self.assertEqual(self.attempt({}, '--resume')[1], [])
-        self.assertEqual((self.downloads / 'journal.jsonl').read_bytes(), before)
-        self.assertEqual(self.data()['run']['summary_only_builds'], self.nvrs[:1])
-
-    def test_legacy_upgrade_preserves_old_reports_once_before_overwriting(self):
-        self.legacy_journal()
-        report_path = self.root / 'report.txt'
-        report_path.write_text('Original report: 139437 RPMs\n')
-        self.json_path.write_text('{"summary": {"test": {"total": 139437}}}\n')
-        original_report = report_path.read_bytes()
-        original_json = self.json_path.read_bytes()
-        self.attempt({self.nvrs[2]: self.build(self.nvrs[2])}, '--resume', '-p', 'ccc')
-        text_backups = list(self.root.glob('report.txt.before-resume-*.bak'))
-        json_backups = list(self.root.glob('results.json.before-resume-*.bak'))
-        self.assertEqual(len(text_backups), 1)
-        self.assertEqual(len(json_backups), 1)
-        self.assertEqual(text_backups[0].read_bytes(), original_report)
-        self.assertEqual(json_backups[0].read_bytes(), original_json)
-        self.assertIn(str(text_backups[0]), report_path.read_text())
-        self.attempt({}, '--resume', '-p', 'ccc')
-        self.assertEqual(list(self.root.glob('report.txt.before-resume-*.bak')), text_backups)
-        self.assertEqual(list(self.root.glob('results.json.before-resume-*.bak')), json_backups)
+        self.assertEqual(self.attempt({}, '--resume'), (0, []))
+        self.assertEqual(self.data()['run']['build_statuses'], {'pass': 3})
+        self.assertEqual(len(self.data()['run']['attempts']), 1)
+        self.assertEqual(self.attempt({}, '--retry-failed'), (0, []))
 
     def test_incompatible_resume_settings_fail_before_touching_results(self):
         self.initial_failures()
@@ -307,28 +256,17 @@ class CumulativeReportTests(RunnerTestCase):
                 self.assertEqual(((self.downloads / 'journal.jsonl').read_bytes(),
                                   self.json_path.read_bytes()), before)
 
-    def test_failed_legacy_backup_does_not_overwrite_original_report(self):
-        self.legacy_journal()
-        report_path = self.root / 'report.txt'
-        report_path.write_text('Original report: 139437 RPMs\n')
-        with patch.object(mod.tempfile, 'NamedTemporaryFile', side_effect=PermissionError), \
-                self.assertRaises(PermissionError):
-            self.attempt({self.nvrs[2]: self.build(self.nvrs[2])}, '--resume', '-p', 'ccc')
-        self.assertEqual(report_path.read_text(), 'Original report: 139437 RPMs\n')
-
-    def test_corrupt_details_never_restore_a_superseded_failure(self):
+    def test_corrupt_current_results_stop_recovery_before_work_or_reports(self):
         self.initial_failures()
-        record = mod.journal_record(self.nvrs[1], *self.build(self.nvrs[1]),
-                                    run_id=self.data()['run']['id'])
+        run_id = self.data()['run']['id']
+        record = self.build_record(self.nvrs[1], 'pass', run_id)
         record['results']['test'][0]['stage_seconds'] = {'unpack': 'bad'}
         mod.JOURNAL.append(record)
-        # No work for this passed build; only summary-level knowledge is retained.
-        self.attempt({}, '--resume', '-p', 'bbb')
-        data = self.data()
-        self.assertEqual(data['run']['summary_only_builds'], [self.nvrs[1]])
-        self.assertEqual(data['run']['build_statuses'], {'warn': 1, 'pass': 1, 'fetch-fail': 1})
-        self.assertEqual(data['summary']['test']['failed'], 0)
-        self.assertNotIn('bbb-1-1', (self.downloads / 'logs/failed-all.txt').read_text())
+        paths = [self.json_path, self.root / 'report.txt', self.downloads / 'run.json',
+                 self.downloads / 'journal.jsonl', self.downloads / 'logs/failed-all.txt']
+        before = [path.read_bytes() for path in paths]
+        self.assertEqual(self.attempt({}, '--resume', '-p', 'bbb'), (2, []))
+        self.assertEqual([path.read_bytes() for path in paths], before)
 
     def test_report_includes_current_results_if_journal_persistence_fails(self):
         self.initial_failures()

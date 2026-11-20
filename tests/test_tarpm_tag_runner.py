@@ -246,15 +246,39 @@ class RunnerTestCase(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             return mod.main(self.argv + list(extra))
 
+    def write_manifest(self, path, nvrs, run_id):
+        return mod.write_run_manifest(path, nvrs, run_id, context={
+            "started": "2026-10-21T10:00:00+00:00", "tag": "f44",
+            "command": ["tarpm-tag-runner.py"],
+            "settings": {"architectures": [], "include_source": True},
+        })
+
+    def build_record(self, nvr, status, run_id="active"):
+        fetch = mod.FetchResult(nvr, status != "fetch-fail")
+        tests = []
+        if status in ("pass", "warn", "test-fail"):
+            tests.append(mod.TestResult(
+                f"{nvr}.noarch.rpm", nvr, "noarch", status != "test-fail",
+                stage="repack" if status == "test-fail" else None,
+                warning="content-diff" if status == "warn" else None))
+        attempt = {"id": f"{run_id}-{nvr}", "started": "2026-10-21T10:00:00+00:00",
+                   "selected_builds": 1, "tag": "f44", "tarpm": "unknown" if tests else None,
+                   "settings": {"architectures": [], "include_source": True}}
+        return mod.journal_record(nvr, fetch, tests, run_id, attempt)
+
+    def write_journal(self, records):
+        self.downloads.mkdir(parents=True, exist_ok=True)
+        path = self.downloads / "journal.jsonl"
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        return path
+
 
 class MissingKojiTests(RunnerTestCase):
     def test_missing_koji_preserves_run_state_for_cached_and_explicit_lists(self):
         manifest = self.downloads / "run.json"
-        mod.write_run_manifest(manifest, ["demo-1-1"], "previous-run")
+        self.write_manifest(manifest, ["demo-1-1"], "previous-run")
         before_manifest = manifest.read_bytes()
-        journal = self.downloads / "journal.jsonl"
-        journal.write_text(json.dumps({"nvr": "demo-1-1", "status": "test-fail",
-                                       "run_id": "previous-run"}) + "\n")
+        journal = self.write_journal([self.build_record("demo-1-1", "test-fail", "previous-run")])
         before_journal = journal.read_bytes()
         sentinel = self.downloads / "demo-1-1/partial.rpm"
         sentinel.parent.mkdir()
@@ -284,9 +308,8 @@ class MissingKojiTests(RunnerTestCase):
                 self.assertEqual(sentinel.read_text(), "retained download")
 
     def test_empty_recovery_does_not_require_koji_or_open_journal(self):
-        mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "finished")
-        (self.downloads / "journal.jsonl").write_text(json.dumps(
-            {"nvr": "demo-1-1", "status": "pass", "run_id": "finished"}) + "\n")
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "finished")
+        self.write_journal([self.build_record("demo-1-1", "pass", "finished")])
         with patch.object(mod.shutil, "which", side_effect=lambda name:
                           None if name == "koji" else "/fake/tarpm"), \
                 patch.object(mod.JOURNAL, "open") as open_journal:
@@ -341,20 +364,20 @@ class JournalRecoveryTests(RunnerTestCase):
 
     def test_new_record_survives_torn_tail(self):
         path = self.root / "journal.jsonl"
-        old = {"nvr": "old-1-1", "status": "pass"}
+        old = self.build_record("old-1-1", "pass")
         path.write_text(json.dumps(old) + '\n{"nvr":"broken')
         mod.JOURNAL.open(str(path))
-        new = {"nvr": "new-1-1", "status": "test-fail"}
+        new = self.build_record("new-1-1", "test-fail")
         mod.JOURNAL.append(new)
         self.assertEqual(mod.read_journal(str(path)),
                          {old["nvr"]: old, new["nvr"]: new})
 
     def test_valid_tail_without_newline_is_preserved(self):
         path = self.root / "journal.jsonl"
-        old = {"nvr": "old-1-1", "status": "pass"}
+        old = self.build_record("old-1-1", "pass")
         path.write_text(json.dumps(old))
         mod.JOURNAL.open(str(path))
-        new = {"nvr": "new-1-1", "status": "pass"}
+        new = self.build_record("new-1-1", "pass")
         mod.JOURNAL.append(new)
         self.assertEqual(mod.read_journal(str(path)),
                          {old["nvr"]: old, new["nvr"]: new})
@@ -370,10 +393,8 @@ class RunManifestTests(RunnerTestCase):
         nvrs = ["done-1-1", "active-1-1", "queued-1-1"]
         self.listfile.write_text("\n".join(nvrs) + "\n")
         manifest_path = self.downloads / "run.json"
-        mod.write_run_manifest(manifest_path, nvrs, "old-run")
-        (self.downloads / "journal.jsonl").write_text("".join(
-            json.dumps({"nvr": nvr, "status": "pass", "run_id": "old-run"}) + "\n"
-            for nvr in nvrs))
+        self.write_manifest(manifest_path, nvrs, "old-run")
+        self.write_journal(self.build_record(nvr, "pass", "old-run") for nvr in nvrs)
         partial = self.downloads / "active-1-1/partial.rpm"
 
         def process(nvr, args, counter):
@@ -414,7 +435,7 @@ class RunManifestTests(RunnerTestCase):
 
     def test_failed_manifest_replace_preserves_previous_run_and_rpms(self):
         path = self.downloads / "run.json"
-        mod.write_run_manifest(path, ["demo-1-1"], "previous-run")
+        self.write_manifest(path, ["demo-1-1"], "previous-run")
         before = path.read_bytes()
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir()
@@ -433,7 +454,8 @@ class RunManifestTests(RunnerTestCase):
         (self.downloads / "journal.jsonl").write_text(json.dumps(
             {"nvr": "demo-1-1", "status": "pass"}) + "\n")
         for invalid in ('{"run_id":', '{}',
-                        '{"run_id":"new", "nvrs":["../demo-1-1"]}'):
+                        '{"run_id":"new", "nvrs":["../demo-1-1"]}',
+                        '{"run_id":"old", "nvrs":["Fedora-Games-Live-44-20260424.n.0"]}'):
             with self.subTest(manifest=invalid):
                 (self.downloads / "run.json").write_text(invalid)
                 with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
@@ -441,9 +463,24 @@ class RunManifestTests(RunnerTestCase):
                     self.assertEqual(self.run_main("--resume"), 2)
                 process.assert_not_called()
 
+    def test_resume_requires_manifest_even_with_journal_history(self):
+        journal = self.write_journal([{"nvr": "demo-1-1", "status": "pass"}])
+        before = journal.read_bytes()
+        with patch.object(mod, "read_nvrs") as read, \
+                patch.object(mod, "process_build") as process, \
+                patch.object(mod.JOURNAL, "open") as open_journal:
+            self.assertEqual(self.run_main("--resume"), 2)
+            self.assertEqual(self.run_main("--resume", "--list"), 2)
+        read.assert_not_called()
+        process.assert_not_called()
+        open_journal.assert_not_called()
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertFalse((self.downloads / "run.json").exists())
+        self.assertFalse((self.root / "report.txt").exists())
+
     def test_list_does_not_replace_manifest(self):
         path = self.downloads / "run.json"
-        mod.write_run_manifest(path, ["demo-1-1"], "existing-run")
+        self.write_manifest(path, ["demo-1-1"], "existing-run")
         before = path.read_bytes()
         for options in (["--list"], ["--resume", "--list"]):
             with self.subTest(options=options):
@@ -454,7 +491,7 @@ class RunManifestTests(RunnerTestCase):
         nvrs = ["aaa-1-1", "bbb-1-1"]
         self.listfile.write_text("\n".join(nvrs) + "\n")
         path = self.downloads / "run.json"
-        mod.write_run_manifest(path, nvrs, "current-run")
+        self.write_manifest(path, nvrs, "current-run")
         with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
                 patch.object(mod, "process_build", side_effect=self.passed_build) as process:
             self.assertEqual(self.run_main("--resume", "-p", "aaa"), 0)
@@ -468,9 +505,8 @@ class RunManifestTests(RunnerTestCase):
 
     def test_resume_does_not_add_builds_outside_active_run(self):
         self.listfile.write_text("demo-1-1\nother-1-1\n")
-        mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "current-run")
-        (self.downloads / "journal.jsonl").write_text(json.dumps(
-            {"nvr": "demo-1-1", "status": "pass", "run_id": "current-run"}) + "\n")
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "current-run")
+        self.write_journal([self.build_record("demo-1-1", "pass", "current-run")])
         with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
                 patch.object(mod, "process_build") as process:
             self.assertEqual(self.run_main("--resume"), 0)
@@ -479,7 +515,7 @@ class RunManifestTests(RunnerTestCase):
     def test_resume_keeps_pending_builds_after_tag_refresh(self):
         self.argv = self.argv[2:]
         manifest = self.downloads / "run.json"
-        mod.write_run_manifest(manifest, ["old-1-1"], "active")
+        self.write_manifest(manifest, ["old-1-1"], "active")
         before = manifest.read_bytes()
         cache = self.downloads / "tag-f44.txt"
         cache.write_text(mod.RPM_TAG_CACHE_HEADER + "old-1-1\n")
@@ -495,16 +531,15 @@ class RunManifestTests(RunnerTestCase):
 
     def test_explicit_resume_list_cannot_displace_a_manifest_build_at_limit(self):
         self.listfile.write_text("outside-1-1\ndemo-1-1\n")
-        mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
         with patch.object(mod, "process_build", side_effect=self.passed_build) as process:
             self.assertEqual(self.run_main("--resume", "-n", "1"), 0)
         self.assertEqual([call.args[0] for call in process.call_args_list], ["demo-1-1"])
 
     def test_retry_uses_historical_failures_but_starts_a_new_run(self):
         path = self.downloads / "run.json"
-        mod.write_run_manifest(path, ["other-1-1"], "previous-run")
-        (self.downloads / "journal.jsonl").write_text(json.dumps(
-            {"nvr": "demo-1-1", "status": "test-fail", "run_id": "older-run"}) + "\n")
+        self.write_manifest(path, ["other-1-1"], "previous-run")
+        self.write_journal([self.build_record("demo-1-1", "test-fail", "older-run")])
         with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
                 patch.object(mod, "process_build", side_effect=self.passed_build) as process:
             self.assertEqual(self.run_main("--retry-failed"), 0)
@@ -521,8 +556,8 @@ class JournalWriteTests(RunnerTestCase):
         path = self.root / "journal.jsonl"
         mod.JOURNAL.open(str(path))
         real_write = os.write
-        records = [{"nvr": "first-1-1", "status": "test-fail"},
-                   {"nvr": "second-1-1", "status": "pass"}]
+        records = [self.build_record("first-1-1", "test-fail"),
+                   self.build_record("second-1-1", "pass")]
         with patch.object(mod.os, "write", side_effect=lambda fd, data: real_write(fd, data[:7])):
             for record in records:
                 mod.JOURNAL.append(record)
@@ -531,7 +566,7 @@ class JournalWriteTests(RunnerTestCase):
     def test_failed_append_rolls_back_before_next_record(self):
         path = self.root / "journal.jsonl"
         mod.JOURNAL.open(str(path))
-        old = {"nvr": "old-1-1", "status": "pass"}
+        old = self.build_record("old-1-1", "pass")
         mod.JOURNAL.append(old)
         before = path.read_bytes()
         real_write = os.write
@@ -547,10 +582,10 @@ class JournalWriteTests(RunnerTestCase):
         stderr = io.StringIO()
         with patch.object(mod.os, "write", side_effect=fail_after_partial_write), \
                 contextlib.redirect_stderr(stderr):
-            mod.JOURNAL.append({"nvr": "broken-1-1", "status": "test-fail"})
+            mod.JOURNAL.append(self.build_record("broken-1-1", "test-fail"))
         self.assertEqual(path.read_bytes(), before)
         self.assertIn("could not append journal record", stderr.getvalue())
-        new = {"nvr": "new-1-1", "status": "pass"}
+        new = self.build_record("new-1-1", "pass")
         mod.JOURNAL.append(new)
         self.assertEqual(mod.read_journal(str(path)), {old["nvr"]: old, new["nvr"]: new})
 
@@ -559,8 +594,8 @@ class JournalWriteTests(RunnerTestCase):
         mod.JOURNAL.open(str(path))
         with patch.object(mod.os, "write", return_value=0), \
                 contextlib.redirect_stderr(io.StringIO()):
-            mod.JOURNAL.append({"nvr": "broken-1-1", "status": "test-fail"})
-        record = {"nvr": "new-1-1", "status": "pass"}
+            mod.JOURNAL.append(self.build_record("broken-1-1", "test-fail"))
+        record = self.build_record("new-1-1", "pass")
         mod.JOURNAL.append(record)
         self.assertEqual(mod.read_journal(str(path)), {record["nvr"]: record})
 
@@ -581,12 +616,12 @@ class JournalWriteTests(RunnerTestCase):
         with patch.object(mod.os, "write", side_effect=fail_after_partial_write), \
                 patch.object(mod.os, "ftruncate", side_effect=OSError("repair failed")), \
                 contextlib.redirect_stderr(stderr):
-            mod.JOURNAL.append({"nvr": "broken-1-1", "status": "test-fail"})
+            mod.JOURNAL.append(self.build_record("broken-1-1", "test-fail"))
         self.assertIsNone(mod.JOURNAL._fh)
         self.assertIn("journal disabled: rollback failed", stderr.getvalue())
         before = path.read_bytes()
         with patch.object(mod.os, "write") as write:
-            mod.JOURNAL.append({"nvr": "new-1-1", "status": "pass"})
+            mod.JOURNAL.append(self.build_record("new-1-1", "pass"))
         write.assert_not_called()
         self.assertEqual(path.read_bytes(), before)
 
@@ -599,10 +634,7 @@ class CliSelectionTests(RunnerTestCase):
         return result, stdout.getvalue(), stderr.getvalue()
 
     def test_resume_list_closed_pipe_exits_without_tracebacks(self):
-        self.downloads.mkdir()
-        journal = self.downloads / "journal.jsonl"
-        journal.write_text(json.dumps({"nvr": "demo-0-1", "status": "test-fail",
-                                       "run_id": "pipe-test"}) + "\n")
+        journal = self.write_journal([self.build_record("demo-0-1", "test-fail", "pipe-test")])
         before = journal.read_bytes()
         manifest = self.downloads / "run.json"
         runlog = self.root / "pipe-run.log"
@@ -614,7 +646,7 @@ class CliSelectionTests(RunnerTestCase):
             with self.subTest(count=count):
                 nvrs = [f"demo-{i}-1" for i in range(count)]
                 self.listfile.write_text("\n".join(nvrs) + "\n")
-                mod.write_run_manifest(manifest, nvrs, "pipe-test")
+                self.write_manifest(manifest, nvrs, "pipe-test")
                 saved_manifest = manifest.read_bytes()
                 reader, writer = os.pipe()
                 os.close(reader)
@@ -807,24 +839,18 @@ class CliSelectionTests(RunnerTestCase):
         self.assertIn("invalid build NVR", stderr)
         self.assertEqual(cache.read_text(), previous)
 
-    def test_recovery_without_manifest_drops_image_failures_from_legacy_cache(self):
-        self.downloads.mkdir()
+    def test_retry_failed_drops_image_failures_from_unfiltered_tag_cache(self):
         cache = self.downloads / "tag-f44.txt"
         image = "Fedora-Games-Live-44-20260424.n.0"
-        records = [{"nvr": image, "status": "fetch-fail"},
-                   {"nvr": "hello-1-1", "status": "test-fail"}]
-        (self.downloads / "journal.jsonl").write_text(
-            "".join(json.dumps(record) + "\n" for record in records))
+        self.write_journal([self.build_record(image, "fetch-fail"),
+                            self.build_record("hello-1-1", "test-fail")])
         self.argv = ["-d", str(self.downloads), "--no-run-log"]
-        for mode in ("--resume", "--retry-failed"):
-            with self.subTest(mode=mode):
-                cache.write_text(f"{image}\nhello-1-1\n")
-                with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
-                        patch.object(mod, "run", return_value=(0, "hello-1-1 f44 user\n")):
-                    result, stdout, _ = self.list_output(mode)
-                self.assertEqual(result, 0)
-                self.assertEqual(stdout, "hello-1-1\n")
-                self.assertFalse((self.downloads / "run.json").exists())
+        cache.write_text(f"{image}\nhello-1-1\n")
+        with patch.object(mod, "run", return_value=(0, "hello-1-1 f44 user\n")):
+            result, stdout, _ = self.list_output("--retry-failed")
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "hello-1-1\n")
+        self.assertFalse((self.downloads / "run.json").exists())
 
     def test_explicit_file_keeps_supplied_builds_without_querying_koji(self):
         self.listfile.write_text("Fedora-IoT-32-20191107.0\nhello-1-1\n")
@@ -837,13 +863,12 @@ class CliSelectionTests(RunnerTestCase):
         self.assertFalse((self.downloads / "tag-f44.txt").exists())
 
     def test_resume_list_excludes_passed_and_warned_builds(self):
-        self.listfile.write_text("pass-1-1\nwarn-1-1\nfail-1-1\nnew-1-1\n")
-        self.downloads.mkdir()
-        records = [{"nvr": "pass-1-1", "status": "pass"},
-                   {"nvr": "warn-1-1", "status": "warn"},
-                   {"nvr": "fail-1-1", "status": "test-fail"}]
-        (self.downloads / "journal.jsonl").write_text(
-            "".join(json.dumps(record) + "\n" for record in records))
+        nvrs = ["pass-1-1", "warn-1-1", "fail-1-1", "new-1-1"]
+        self.listfile.write_text("\n".join(nvrs) + "\n")
+        self.write_manifest(self.downloads / "run.json", nvrs, "active")
+        self.write_journal([self.build_record("pass-1-1", "pass"),
+                            self.build_record("warn-1-1", "warn"),
+                            self.build_record("fail-1-1", "test-fail")])
         with patch.object(mod, "process_build") as process:
             result, stdout, stderr = self.list_output("--resume")
         self.assertEqual(result, 0)
@@ -852,9 +877,8 @@ class CliSelectionTests(RunnerTestCase):
         process.assert_not_called()
 
     def test_empty_recovery_lists_leave_stdout_empty(self):
-        self.downloads.mkdir()
-        (self.downloads / "journal.jsonl").write_text(json.dumps(
-            {"nvr": "demo-1-1", "status": "pass"}) + "\n")
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+        self.write_journal([self.build_record("demo-1-1", "pass")])
         for mode in ("--resume", "--retry-failed"):
             with self.subTest(mode=mode):
                 result, stdout, stderr = self.list_output(mode)
@@ -1034,9 +1058,8 @@ class ReportPathTests(RunnerTestCase):
         self.assertEqual(mod.parse_args([]).report, "report.txt")
 
     def test_output_aliases_are_rejected_before_changing_run_state(self):
-        manifest = mod.write_run_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
-        journal = self.downloads / "journal.jsonl"
-        journal.write_text('{"nvr":"demo-1-1","run_id":"active","status":"pass"}\n')
+        manifest = self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+        journal = self.write_journal([self.build_record("demo-1-1", "pass")])
         original_journal = journal.read_bytes()
         alias = self.root / "journal-copy.json"
         os.link(journal, alias)
@@ -1314,6 +1337,7 @@ class BuildPathTests(RunnerTestCase):
         outside.mkdir()
         marker = outside / "keep.txt"
         marker.write_text("unrelated data")
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
         for invalid in ("../outside-1-1", str(outside), ".", "..", "demo",
                         "demo--1", "dir/demo-1-1", r"dir\demo-1-1"):
             with self.subTest(nvr=invalid):
@@ -1353,8 +1377,8 @@ class BuildPathTests(RunnerTestCase):
         link.symlink_to(outside, target_is_directory=True)
         for mode in ("--resume", "--retry-failed"):
             with self.subTest(mode=mode):
-                (self.downloads / "journal.jsonl").write_text(json.dumps(
-                    {"nvr": "demo-1-1", "status": "test-fail"}) + "\n")
+                self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+                self.write_journal([self.build_record("demo-1-1", "test-fail")])
                 with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
                         patch.object(mod, "process_build") as process:
                     self.assertEqual(self.run_main(mode), 1)
@@ -1608,9 +1632,8 @@ class FetchRecoveryTests(RunnerTestCase):
                 bdir = self.downloads / "demo-1-1"
                 bdir.mkdir(parents=True, exist_ok=True)
                 (bdir / "partial.rpm").write_text("truncated download")
-                journal = self.downloads / "journal.jsonl"
-                journal.write_text(json.dumps({"nvr": "demo-1-1",
-                                               "status": "test-fail"}) + "\n")
+                self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+                self.write_journal([self.build_record("demo-1-1", "test-fail")])
 
                 def process(nvr, args, counter):
                     self.assertFalse(bdir.exists())
@@ -1624,6 +1647,7 @@ class FetchRecoveryTests(RunnerTestCase):
 
     def test_failed_resume_cleanup_does_not_reuse_rpms(self):
         (self.downloads / "demo-1-1").mkdir(parents=True)
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
         with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
                 patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")), \
                 patch.object(mod, "process_build") as process:
