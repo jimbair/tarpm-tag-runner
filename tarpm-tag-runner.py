@@ -1025,136 +1025,148 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     nvr = rpm.parent.name
     arch = base.rsplit(".", 1)[-1]
     work = rpm.parent / f".tarpm-{base}"
-    work.mkdir()
-    test_t0 = time.monotonic()
-
-    # Key the log name on the RPM basename so subpackages of one build
-    # (7zip, 7zip-reduced, ...) get separate logs.
-    logfile = diagnostic_log(args, nvr, f"{base}.test.log")
-    buf = [
-        f"rpm:     {rpm}",
-        f"tarpm:   {shutil.which('tarpm') or 'tarpm'}",
-        f"started: {now_utc()}",
-        "-" * 40,
-    ]
-    failed_stage = None
-    failed_rc = None
-    failed_out = ""
-    repacked = work / f"{base}-repacked.rpm"
-    original_size = _file_bytes(rpm)
-
-    def unpack_progress(directory: Path, input_size: int | None,
-                        expected: int | None = None) -> tuple[str, str]:
-        extracted = _tree_bytes(directory)
-        details = f"; unpacked {_size_pair(extracted, expected)}"
-        if input_size is not None:
-            details += f"; RPM {human(input_size)}"
-        return _estimated_percent(extracted, expected), details
-
-    unpacked_size = None
-    stage_seconds = {}
-
-    def input_tree_size() -> int:
-        nonlocal unpacked_size
-        # Scan completed input once, and only when a heartbeat needs it.
-        if unpacked_size is None:
-            unpacked_size = _tree_bytes(work / "ext")
-        return unpacked_size
-
-    def timed_run(name: str, cmd: list, progress_fn=None,
-                  binary_output: bool = False) -> tuple:
-        position = ""
-        if progress:
-            n, total = progress
-            percent = f", {100 * n / total:.1f}%" if total > 0 else ""
-            position = f" (RPM {n}/{total}{percent})"
-
-        def detail(output, pid, elapsed):
-            estimate, sizes = progress_fn(output, pid) if progress_fn else ("", "")
-            return f"{name}{estimate}, {fmt_duration(elapsed)}{sizes}"
-
-        if args.verbose:
-            log("+ " + " ".join(str(c) for c in cmd))
-        start = time.monotonic()
-        rc, out = run(cmd, label=f"testing {base}",
-                      heartbeat=args.heartbeat, start=test_t0,
-                      counter_suffix=position, detail_fn=detail,
-                      binary_output=binary_output, separate_stderr=binary_output)
-        stage_seconds[name] = time.monotonic() - start
-        if binary_output and isinstance(out, str):
-            out = out.encode("utf-8")
-        return rc, out
-
-    def stage(name: str, cmd: list, progress_fn=None) -> bool:
-        nonlocal failed_stage, failed_rc, failed_out
-        rc, out = timed_run(name, cmd, progress_fn)
-        buf.append("$ " + " ".join(str(c) for c in cmd))
-        if out.strip():
-            buf.append(out.rstrip("\n"))
-        if rc != 0:
-            failed_stage = name
-            failed_rc = rc
-            failed_out = out
-            return False
-        return True
-
-    ok = stage("unpack", ["tarpm", "-x", "-f", str(rpm), "-O", str(work / "ext")],
-               progress_fn=lambda output, pid: unpack_progress(work / "ext", original_size))
-    if ok:
-        ok = stage("repack", ["tarpm", "-c", "-f", str(repacked), str(work / "ext")],
-                   progress_fn=lambda output, pid: repack_progress(
-                       repacked, pid, original_size, input_tree_size()))
-    if ok:
-        repacked_size = _file_bytes(repacked)
-        ok = stage("unpack-repacked",
-                   ["tarpm", "-x", "-f", str(repacked), "-O", str(work / "ext2")],
-                   progress_fn=lambda output, pid: unpack_progress(
-                       work / "ext2", repacked_size, input_tree_size()))
-
-    # Extra check: file list of original vs repacked (warning only, in case
-    # tarpm -t output is noisy). A listing that fails to generate is a
-    # failed stage, not a diff to compare.
-    warning = None
-    if ok:
-        rc, list_orig = timed_run("list-original", ["tarpm", "-t", "-f", str(rpm)],
-                                 binary_output=True)
-        (work / "list-orig.txt").write_bytes(list_orig)
-        if rc != 0:
-            ok = False
-            failed_stage = "list-original"
-            failed_rc = rc
-            failed_out = list_orig.decode("utf-8", errors="backslashreplace")
-            buf.append("$ tarpm -t -f " + str(rpm))
-            buf.append(failed_out.strip() or "(no output)")
-    if ok:
-        rc, list_repacked = timed_run("list-repacked", ["tarpm", "-t", "-f", str(repacked)],
-                                     binary_output=True)
-        (work / "list-repacked.txt").write_bytes(list_repacked)
-        if rc != 0:
-            ok = False
-            failed_stage = "list-repacked"
-            failed_rc = rc
-            failed_out = list_repacked.decode("utf-8", errors="backslashreplace")
-            buf.append("$ tarpm -t -f " + str(repacked))
-            buf.append(failed_out.strip() or "(no output)")
-    if ok and list_orig != list_repacked:
-        warning = "content-diff"
-        buf.append("content check: file lists differ (warning only)")
-        difference = b"\n".join(difflib.diff_bytes(difflib.unified_diff,
-            list_orig.splitlines(), list_repacked.splitlines(),
-            fromfile=b"original", tofile=b"repacked", lineterm=b""))
-        buf.append(difference.decode("utf-8", errors="backslashreplace"))
-
-    duration = time.monotonic() - test_t0
-    buf.append("timings: " + ", ".join(f"{name}={seconds:.3f}s"
-                                       for name, seconds in stage_seconds.items()))
-    cleanup_error = None
+    cleanup = [(rpm, Path.unlink)]
+    cleanup_errors = []
     try:
-        remove_tree(work)
-        rpm.unlink(missing_ok=True)
-    except OSError as exc:
-        cleanup_error = repr(exc)
-        message = f"cannot clean up files for {rpm}: {exc}"
+        work.mkdir()
+        cleanup.insert(0, (work, remove_tree))
+        test_t0 = time.monotonic()
+
+        # Key the log name on the RPM basename so subpackages of one build
+        # (7zip, 7zip-reduced, ...) get separate logs.
+        logfile = diagnostic_log(args, nvr, f"{base}.test.log")
+        buf = [
+            f"rpm:     {rpm}",
+            f"tarpm:   {shutil.which('tarpm') or 'tarpm'}",
+            f"started: {now_utc()}",
+            "-" * 40,
+        ]
+        failed_stage = None
+        failed_rc = None
+        failed_out = ""
+        repacked = work / f"{base}-repacked.rpm"
+        original_size = _file_bytes(rpm)
+
+        def unpack_progress(directory: Path, input_size: int | None,
+                            expected: int | None = None) -> tuple[str, str]:
+            extracted = _tree_bytes(directory)
+            details = f"; unpacked {_size_pair(extracted, expected)}"
+            if input_size is not None:
+                details += f"; RPM {human(input_size)}"
+            return _estimated_percent(extracted, expected), details
+
+        unpacked_size = None
+        stage_seconds = {}
+
+        def input_tree_size() -> int:
+            nonlocal unpacked_size
+            # Scan completed input once, and only when a heartbeat needs it.
+            if unpacked_size is None:
+                unpacked_size = _tree_bytes(work / "ext")
+            return unpacked_size
+
+        def timed_run(name: str, cmd: list, progress_fn=None,
+                      binary_output: bool = False) -> tuple:
+            position = ""
+            if progress:
+                n, total = progress
+                percent = f", {100 * n / total:.1f}%" if total > 0 else ""
+                position = f" (RPM {n}/{total}{percent})"
+
+            def detail(output, pid, elapsed):
+                estimate, sizes = progress_fn(output, pid) if progress_fn else ("", "")
+                return f"{name}{estimate}, {fmt_duration(elapsed)}{sizes}"
+
+            if args.verbose:
+                log("+ " + " ".join(str(c) for c in cmd))
+            start = time.monotonic()
+            rc, out = run(cmd, label=f"testing {base}",
+                          heartbeat=args.heartbeat, start=test_t0,
+                          counter_suffix=position, detail_fn=detail,
+                          binary_output=binary_output, separate_stderr=binary_output)
+            stage_seconds[name] = time.monotonic() - start
+            if binary_output and isinstance(out, str):
+                out = out.encode("utf-8")
+            return rc, out
+
+        def stage(name: str, cmd: list, progress_fn=None) -> bool:
+            nonlocal failed_stage, failed_rc, failed_out
+            rc, out = timed_run(name, cmd, progress_fn)
+            buf.append("$ " + " ".join(str(c) for c in cmd))
+            if out.strip():
+                buf.append(out.rstrip("\n"))
+            if rc != 0:
+                failed_stage = name
+                failed_rc = rc
+                failed_out = out
+                return False
+            return True
+
+        ok = stage("unpack", ["tarpm", "-x", "-f", str(rpm), "-O", str(work / "ext")],
+                   progress_fn=lambda output, pid: unpack_progress(work / "ext", original_size))
+        if ok:
+            ok = stage("repack", ["tarpm", "-c", "-f", str(repacked), str(work / "ext")],
+                       progress_fn=lambda output, pid: repack_progress(
+                           repacked, pid, original_size, input_tree_size()))
+        if ok:
+            repacked_size = _file_bytes(repacked)
+            ok = stage("unpack-repacked",
+                       ["tarpm", "-x", "-f", str(repacked), "-O", str(work / "ext2")],
+                       progress_fn=lambda output, pid: unpack_progress(
+                           work / "ext2", repacked_size, input_tree_size()))
+
+        # Extra check: file list of original vs repacked (warning only, in case
+        # tarpm -t output is noisy). A listing that fails to generate is a
+        # failed stage, not a diff to compare.
+        warning = None
+        if ok:
+            rc, list_orig = timed_run("list-original", ["tarpm", "-t", "-f", str(rpm)],
+                                     binary_output=True)
+            (work / "list-orig.txt").write_bytes(list_orig)
+            if rc != 0:
+                ok = False
+                failed_stage = "list-original"
+                failed_rc = rc
+                failed_out = list_orig.decode("utf-8", errors="backslashreplace")
+                buf.append("$ tarpm -t -f " + str(rpm))
+                buf.append(failed_out.strip() or "(no output)")
+        if ok:
+            rc, list_repacked = timed_run("list-repacked", ["tarpm", "-t", "-f", str(repacked)],
+                                         binary_output=True)
+            (work / "list-repacked.txt").write_bytes(list_repacked)
+            if rc != 0:
+                ok = False
+                failed_stage = "list-repacked"
+                failed_rc = rc
+                failed_out = list_repacked.decode("utf-8", errors="backslashreplace")
+                buf.append("$ tarpm -t -f " + str(repacked))
+                buf.append(failed_out.strip() or "(no output)")
+        if ok and list_orig != list_repacked:
+            warning = "content-diff"
+            buf.append("content check: file lists differ (warning only)")
+            difference = b"\n".join(difflib.diff_bytes(difflib.unified_diff,
+                list_orig.splitlines(), list_repacked.splitlines(),
+                fromfile=b"original", tofile=b"repacked", lineterm=b""))
+            buf.append(difference.decode("utf-8", errors="backslashreplace"))
+
+        duration = time.monotonic() - test_t0
+        buf.append("timings: " + ", ".join(f"{name}={seconds:.3f}s"
+                                           for name, seconds in stage_seconds.items()))
+    finally:
+        for path, remove in cleanup:
+            try:
+                remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                cleanup_errors.append(exc)
+                log(f"{PROG}: warning: cannot remove {path}: {exc}", err=True)
+
+    cleanup_error = None
+    if cleanup_errors:
+        cleanup_error = ", ".join(repr(error) for error in cleanup_errors)
+        details = ", ".join(str(error) for error in cleanup_errors)
+        message = f"cannot clean up files for {rpm}: {details}"
         buf.append(message)
         if ok:
             ok = False

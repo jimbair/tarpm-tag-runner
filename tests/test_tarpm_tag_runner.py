@@ -6,6 +6,7 @@ No koji, tarpm, or network needed: external commands are mocked. Run with:
     python3 -m unittest discover -s tests -v
 """
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -1852,6 +1853,42 @@ class ListingEncodingTests(RunnerTestCase):
 
 
 class ArtifactCleanupTests(RunnerTestCase):
+    def test_listing_write_exception_cleans_up_before_the_next_rpm(self):
+        first = "aaa-demo-1-1.noarch"
+        second = "bbb-demo-1-1.noarch"
+        write_bytes = Path.write_bytes
+
+        def write(path, data):
+            if path.name == "list-orig.txt" and path.parent.name == f".tarpm-{first}":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return write_bytes(path, data)
+
+        def command(cmd, cwd=None, **kwargs):
+            if cmd[1] == "download-build":
+                for base in (first, second):
+                    (cwd / f"{base}.rpm").write_bytes(b"downloaded RPM")
+            elif cmd[1] == "-x":
+                rpm = Path(cmd[3])
+                if rpm.name == f"{second}.rpm":
+                    self.assertFalse((rpm.parent / f"{first}.rpm").exists())
+                    self.assertFalse((rpm.parent / f".tarpm-{first}").exists())
+                extracted = Path(cmd[-1])
+                extracted.mkdir()
+                (extracted / "payload").write_bytes(b"data")
+            elif cmd[1] == "-c":
+                Path(cmd[3]).write_bytes(b"repacked RPM")
+            return 0, "listing\n"
+
+        report = self.root / "results.json"
+        with patch.object(mod, "run", side_effect=command), \
+                patch.object(Path, "write_bytes", new=write):
+            self.assertEqual(self.run_main("--json", str(report)), 1)
+        failed, passed = json.loads(report.read_text())["test"]
+        self.assertEqual(failed["stage"], "exception")
+        self.assertIn("No space left on device", failed["error"])
+        self.assertTrue(passed["ok"])
+        self.assertEqual(list(self.downloads.glob(".build-*")), [])
+
     def test_passing_test_removes_readonly_payload_directories(self):
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)

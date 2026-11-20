@@ -230,8 +230,9 @@ Diagnostic logs and displayed diffs escape invalid UTF-8 bytes as `\xff`
 instead of failing to decode command output.
 
 Each attempt downloads into a unique workspace under `DIR/.build-*/`.
-It removes RPMs and extracted files after each test and removes the
-remaining workspace when the build finishes. This includes partial
+It removes RPMs and extracted files after each test, including tests that
+raise a runner exception. The remaining workspace is removed when the
+build finishes. This includes partial
 downloads after a failed fetch and RPMs excluded from testing. Diagnostic
 logs for failures and listing warnings have separate paths for each
 invocation and build so cumulative reports can reference them.
