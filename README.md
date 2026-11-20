@@ -30,20 +30,20 @@ sudo dnf install tarpm
 
 ```bash
 # Preview a small selection without downloading RPMs:
-python tarpm-tag-runner.py -t f44 -p hello --list
+python tarpm-tag-runner.py -t f45 -p hello --list
 
 # Preview the ten smallest builds for x86_64, including noarch and src:
-python tarpm-tag-runner.py -t f44 -a x86_64 --sort asc -n 10 --list
+python tarpm-tag-runner.py -t f45 -a x86_64 --sort asc -n 10 --list
 
 # Fetch and test hello, including its source RPM:
-python tarpm-tag-runner.py -t f44 -p hello -a x86_64
+python tarpm-tag-runner.py -t f45 -p hello -a x86_64
 
 # Test two source-package selections, four builds at once:
-python tarpm-tag-runner.py -t f44 -p 7zip -p 389-ds-base -j 4 --json results.json
+python tarpm-tag-runner.py -t f45 -p 7zip -p 389-ds-base -j 4 --json results.json
 
 # Test the whole tag, then resume failed or unfinished builds:
-python tarpm-tag-runner.py -t f44 -j 2 --json results.json
-python tarpm-tag-runner.py -t f44 -j 2 --resume --json results.json
+python tarpm-tag-runner.py -t f45 -j 2 --json results.json
+python tarpm-tag-runner.py -t f45 -j 2 --resume --json results.json
 ```
 
 To update the runner in place from this repository's latest `main` branch:
@@ -64,9 +64,10 @@ identical download reports that the runner is already up to date.
 
 ## Options and build selection
 
-Run `python tarpm-tag-runner.py --help` for CLI help. Defaults: tag `f44`,
-download directory `./rpms`, report `./report.txt`, one worker, all binary
-architectures plus source RPMs. Koji's default debuginfo exclusion applies.
+Run `python tarpm-tag-runner.py --help` for CLI help. The default tag is
+`f45`. The runner uses `./rpms`, writes `./report.txt`, and runs one worker.
+It selects all binary architectures and source RPMs by default. Koji's
+default debuginfo exclusion applies.
 
 | Option | Effect |
 | --- | --- |
@@ -243,7 +244,7 @@ be removed, the result fails at stage `cleanup` and retains its log.
 
 ```text
 rpms/
-├── tag-f44.txt                      # cached tag list
+├── tag-f45.txt                      # cached tag list
 ├── build-sizes.json                 # optional per-NVR size cache (--sort)
 ├── journal.jsonl                    # finished-build records
 ├── run.json                         # active run ID and full build selection
@@ -292,10 +293,10 @@ Retry selects the latest failures across all run IDs.
 
 ```bash
 # Continue a run by retrying failed and unfinished builds:
-python tarpm-tag-runner.py -t f44 -j 2 --resume
+python tarpm-tag-runner.py -t f45 -j 2 --resume
 
 # Re-run recorded failures after a tarpm update:
-python tarpm-tag-runner.py -t f44 -j 2 --retry-failed
+python tarpm-tag-runner.py -t f45 -j 2 --retry-failed
 ```
 
 Both modes download each selected build into a fresh workspace and test
@@ -399,9 +400,9 @@ Use a saved JSON report as a baseline to see what changed after updating
 tarpm:
 
 ```bash
-python tarpm-tag-runner.py -t f44 -p hello -a x86_64 --json baseline.json
+python tarpm-tag-runner.py -t f45 -p hello -a x86_64 --json baseline.json
 # After updating tarpm, repeat the same selection:
-python tarpm-tag-runner.py -t f44 -p hello -a x86_64 \
+python tarpm-tag-runner.py -t f45 -p hello -a x86_64 \
     --compare baseline.json --json current.json
 ```
 
@@ -498,8 +499,8 @@ python -m unittest discover -s tests -v
 
 GitHub Actions runs independent jobs on native x86-64 and ARM64 Ubuntu VMs,
 each using a Fedora 44 container with Koji and tarpm. Both run that suite
-and use Fedora's `hello` build for real download/round-trip smoke tests with
-their native RPM architecture (`x86_64` or `aarch64`). They check failure
+and smoke-test Fedora's `hello` build from the runner's default Koji tag
+on their native RPM architecture (`x86_64` or `aarch64`). They check failure
 recovery with `--resume`, cleanup after failed and successful tests, tarpm
 version metadata, and `--no-src` without an architecture filter. Reports
 and logs are uploaded as

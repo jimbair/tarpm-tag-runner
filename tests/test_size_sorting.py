@@ -129,7 +129,6 @@ class SizeSortingTests(RunnerTestCase):
         tag = self.downloads / "tag-f44.txt"
         before = mod.RPM_TAG_CACHE_HEADER + "latest-1-1\nretired-1-1\n"
         tag.write_text(before)
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         with patch.object(mod, "SIZE_BULK_MIN", 2), \
                 patch.object(mod, "fetch_size_metadata", side_effect=[
                     ({"latest-1-1": 1, "unrelated-1-1": 9},
@@ -156,7 +155,6 @@ class SizeSortingTests(RunnerTestCase):
 
     def test_refresh_adds_new_nvrs_without_refetching_known_sizes(self):
         self.cache({"old-1-1": {"src": 100}})
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         with patch.object(mod, "run", return_value=(0, "old-1-1\nnew-1-1\n")), \
                 patch.object(mod, "fetch_size_metadata", side_effect=[
                     ({"new-1-1": 2}, {}), ({}, {2: {"src": 1}})]) as fetch:

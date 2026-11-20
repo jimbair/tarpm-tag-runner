@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
                         help="new directory for reports and logs")
-    parser.add_argument("--tag", default="f44")
+    parser.add_argument("--tag", help="Koji tag to test (uses the runner default if omitted)")
     parser.add_argument("--arch", default=platform.machine(),
                         help="binary RPM architecture (default: host architecture)")
     args = parser.parse_args()
@@ -41,9 +41,11 @@ def main():
     def invoke(phase, *options, directory=downloads, arches=(args.arch,),
                expected_status=0, env=None):
         json_path = output / f"{phase}.json"
-        command = [sys.executable, str(RUNNER), "-t", args.tag, "-p", "hello",
+        command = [sys.executable, str(RUNNER), "-p", "hello",
                    "-d", str(directory), "--heartbeat", "15",
                    "-r", str(output / f"{phase}.txt"), "--json", str(json_path)]
+        if args.tag is not None:
+            command += ["-t", args.tag]
         for arch in arches:
             command += ["-a", arch]
         print(f"\n=== {phase} ===", flush=True)

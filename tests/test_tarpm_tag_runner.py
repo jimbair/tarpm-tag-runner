@@ -220,7 +220,7 @@ class RunnerTestCase(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.downloads = self.root / "rpms"
         self.seed_tag("demo-1-1\n")
-        self.argv = ["-d", str(self.downloads),
+        self.argv = ["-t", "f44", "-d", str(self.downloads),
                      "-r", str(self.root / "report.txt"), "--no-run-log"]
         journal = mod.Journal()
         self.enter_patch = patch.object(mod, "JOURNAL", journal)
@@ -674,7 +674,6 @@ class CliSelectionTests(RunnerTestCase):
         (self.downloads / "tag-f44.txt").write_text(
             mod.RPM_TAG_CACHE_HEADER +
             "Build Tag Built by\n------------------\ndemo-1-1 f44 user\n")
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         with patch.object(mod, "run") as command:
             result, stdout, stderr = self.list_output()
         self.assertEqual(result, 0)
@@ -682,25 +681,28 @@ class CliSelectionTests(RunnerTestCase):
         self.assertIn("using cached list", stderr)
         command.assert_not_called()
 
-    def test_fresh_list_and_heartbeat_diagnostics_use_stderr(self):
+    def test_default_list_queries_f45_and_keeps_diagnostics_off_stdout(self):
         self.argv = ["-d", str(self.downloads), "--no-run-log"]
         proc = Mock()
         proc.communicate.side_effect = [
             mod.subprocess.TimeoutExpired(["koji"], 60),
-            ("demo-1-1 f44 user\n", "Warning: the pkgurl option is obsolete\n"),
+            ("demo-1-1 f45 user\n", "Warning: the pkgurl option is obsolete\n"),
         ]
         proc.returncode = 0
         with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
                 patch.object(mod.subprocess, "Popen", return_value=proc) as popen:
-            result, stdout, stderr = self.list_output("--refresh")
+            result, stdout, stderr = self.list_output()
         self.assertEqual(result, 0)
         self.assertEqual(stdout, "demo-1-1\n")
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0],
+                         ["koji", "latest-pkg", "--all", "--type=rpm", "f45"])
         self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.PIPE)
         self.assertIn("still fetching koji tag", stderr)
         self.assertIn("saved tag list", stderr)
         self.assertIn("Warning: the pkgurl option is obsolete", stderr)
-        cache = self.downloads / "tag-f44.txt"
-        self.assertEqual(cache.read_text(), mod.RPM_TAG_CACHE_HEADER + "demo-1-1 f44 user\n")
+        cache = self.downloads / "tag-f45.txt"
+        self.assertEqual(cache.read_text(), mod.RPM_TAG_CACHE_HEADER + "demo-1-1 f45 user\n")
 
     def test_tag_query_filters_rpm_builds_and_cache_is_reused(self):
         self.argv = ["-t", "f45", "-d", str(self.downloads), "--no-run-log"]
@@ -728,7 +730,6 @@ class CliSelectionTests(RunnerTestCase):
         cache = self.downloads / "tag-f44.txt"
         cache.write_text("Fedora-Games-Live-44-20260424.n.0 f44 user\n"
                          "hello-1-1 f44 user\n")
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         output = "hello-2-1 f44 user\nhello-extra-2-1 f44 user\n"
         with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
                 patch.object(mod, "run", return_value=(0, output)) as command:
@@ -747,7 +748,6 @@ class CliSelectionTests(RunnerTestCase):
                 (mod.RPM_TAG_CACHE_HEADER + "hello-1-1 f44 user\n", ["--refresh"])):
             with self.subTest(options=options):
                 cache.write_text(content)
-                self.argv = ["-d", str(self.downloads), "--no-run-log"]
                 with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
                         patch.object(mod, "run", return_value=(1, "hub unavailable")):
                     result, stdout, stderr = self.list_output(*options)
@@ -761,7 +761,6 @@ class CliSelectionTests(RunnerTestCase):
         self.downloads.mkdir(exist_ok=True)
         cache = self.downloads / "tag-f44.txt"
         previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\nother-1-1\n"
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         for operation in ("fsync", "replace"):
             with self.subTest(operation=operation):
                 cache.write_text(previous)
@@ -799,7 +798,6 @@ class CliSelectionTests(RunnerTestCase):
             stream.write = interrupted_write
             return stream
 
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
                 patch.object(mod, "run", return_value=(0, "new-1-1\nother-1-1\n")), \
                 patch.object(mod.tempfile, "NamedTemporaryFile", side_effect=partial_file), \
@@ -813,7 +811,6 @@ class CliSelectionTests(RunnerTestCase):
         cache = self.downloads / "tag-f44.txt"
         previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\n"
         cache.write_text(previous)
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
                 patch.object(mod, "run", return_value=(0, "new-1-1\ninvalid\n")):
             result, stdout, stderr = self.list_output("--refresh")
@@ -827,7 +824,6 @@ class CliSelectionTests(RunnerTestCase):
         image = "Fedora-Games-Live-44-20260424.n.0"
         self.write_journal([self.build_record(image, "fetch-fail"),
                             self.build_record("hello-1-1", "test-fail")])
-        self.argv = ["-d", str(self.downloads), "--no-run-log"]
         cache.write_text(f"{image}\nhello-1-1\n")
         with patch.object(mod, "run", return_value=(0, "hello-1-1 f44 user\n")):
             result, stdout, _ = self.list_output("--retry-failed")
@@ -2208,7 +2204,7 @@ class JournalInterruptTests(unittest.TestCase):
         mod.shutil.which = lambda name: "/usr/bin/fake"  # tarpm gate
         try:
             with self.assertRaises(KeyboardInterrupt):
-                mod.main(argv=["-d", d, "--no-run-log"])
+                mod.main(argv=["-t", "f44", "-d", d, "--no-run-log"])
         finally:
             mod.process_build = real_process_build
             mod.run_pool = real_run_pool

@@ -2299,16 +2299,16 @@ def parse_args(argv) -> argparse.Namespace:
         allow_abbrev=False,
         description="List builds in a Koji tag, fetch their RPMs, and "
                     "tarpm-test each one.",
-        epilog="examples:\n"
-               "  %(prog)s --list -t f44 -p 7zip              # list the NVRs that would be fetched\n"
-               "  %(prog)s -t f44 -j 4                      # test the tag\n"
-               "  %(prog)s -t f44 -j 4 -p 7zip --no-src       # skip .src.rpm\n"
-               "  %(prog)s -t f44 -j 4 --resume             # retry unfinished builds\n",
+        epilog="Examples\n"
+               "  %(prog)s --list -p 7zip             # list the selected builds\n"
+               "  %(prog)s -j 4                       # test the default tag\n"
+               "  %(prog)s -j 4 -p 7zip --no-src      # skip source RPMs\n"
+               "  %(prog)s -j 4 --resume              # retry unfinished builds\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # fetch
-    ap.add_argument("-t", "--tag", default="f44",
-                    help="Koji tag to query for RPM builds (default: f44)")
+    ap.add_argument("-t", "--tag", default="f45",
+                    help="Koji tag to query for RPM builds (default: %(default)s)")
     ap.add_argument("-p", "--pkg", action="append", metavar="PKG",
                     help="include builds whose NVR equals PKG or starts with "
                          "PKG- (repeatable; default: every package)")
