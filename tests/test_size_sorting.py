@@ -5,7 +5,6 @@ import json
 import threading
 import unittest
 import xmlrpc.client
-from pathlib import Path
 from unittest.mock import patch
 
 from test_tarpm_tag_runner import RunnerTestCase, mod
@@ -51,7 +50,7 @@ class SizeSortingTests(RunnerTestCase):
             mod.parse_args(["--sort", "size-asc"])
 
     def test_unsorted_selection_never_reads_or_fetches_sizes(self):
-        self.listfile.write_text("z-1-1\na-1-1\n")
+        self.seed_tag("z-1-1\na-1-1\n")
         with patch.object(mod, "read_size_cache") as cache, \
                 patch.object(mod, "fetch_size_metadata") as fetch:
             status, nvrs, _ = self.listed()
@@ -60,7 +59,7 @@ class SizeSortingTests(RunnerTestCase):
         fetch.assert_not_called()
 
     def test_arch_source_filters_ties_and_limit_apply_to_sizes(self):
-        self.listfile.write_text("c-1-1\nb-1-1\na-1-1\n")
+        self.seed_tag("c-1-1\nb-1-1\na-1-1\n")
         self.cache({"a-1-1": {"x86_64": 10, "noarch": 5, "src": 1000},
                     "b-1-1": {"x86_64": 20, "src": 1, "aarch64": 5000},
                     "c-1-1": {"x86_64": 15, "src": 0}})
@@ -86,7 +85,7 @@ class SizeSortingTests(RunnerTestCase):
         fetch.assert_not_called()
 
     def test_streamed_batched_lookup_then_offline_cache_reuse(self):
-        self.listfile.write_text("large-1-1\nsmall-1-1\n")
+        self.seed_tag("large-1-1\nsmall-1-1\n")
         calls = []
 
         def query(request, timeout):
@@ -118,7 +117,7 @@ class SizeSortingTests(RunnerTestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_package_filter_limits_missing_lookups(self):
-        self.listfile.write_text("excluded-1-1\nwanted-1-1\n")
+        self.seed_tag("excluded-1-1\nwanted-1-1\n")
         with patch.object(mod, "fetch_size_metadata", side_effect=[
                 ({"wanted-1-1": 7}, {}), ({}, {7: {"src": 12}})]) as fetch:
             status, nvrs, _ = self.listed("--sort", "desc", "-p", "wanted")
@@ -126,7 +125,7 @@ class SizeSortingTests(RunnerTestCase):
         self.assertEqual(fetch.call_args_list[0].args[1][0]["params"], ["wanted-1-1"])
 
     def test_bulk_query_keeps_cached_selection_and_fills_retired_nvrs(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         tag = self.downloads / "tag-f44.txt"
         before = mod.RPM_TAG_CACHE_HEADER + "latest-1-1\nretired-1-1\n"
         tag.write_text(before)
@@ -145,7 +144,7 @@ class SizeSortingTests(RunnerTestCase):
         self.assertEqual(tag.read_text(), before)
 
     def test_only_missing_entries_are_updated_and_unrelated_entries_survive(self):
-        self.listfile.write_text("known-1-1\nnew-1-1\n")
+        self.seed_tag("known-1-1\nnew-1-1\n")
         path = self.cache({"known-1-1": {"src": 10}, "other-1-1": {"src": 20}})
         with patch.object(mod, "fetch_size_metadata", side_effect=[
                 ({"new-1-1": 3}, {}), ({}, {3: {"src": 1}})]) as fetch:
@@ -205,7 +204,7 @@ class SizeSortingTests(RunnerTestCase):
             self.assertEqual(list(self.downloads.glob(".build-sizes-*.tmp")), [])
 
     def test_interrupted_update_keeps_completed_batches(self):
-        self.listfile.write_text("first-1-1\nsecond-1-1\n")
+        self.seed_tag("first-1-1\nsecond-1-1\n")
         with patch.object(mod, "SIZE_BATCH", 1), \
                 patch.object(mod, "fetch_size_metadata", side_effect=[
                     ({"first-1-1": 1}, {}), ({}, {1: {"src": 10}}), KeyboardInterrupt]), \
@@ -227,7 +226,7 @@ class SizeSortingTests(RunnerTestCase):
             self.assertFalse((self.downloads / "build-sizes.json").exists())
 
     def test_recovery_filters_after_limit_and_preserves_manifest(self):
-        self.listfile.write_text("passed-1-1\nfailed-1-1\nnew-1-1\n")
+        self.seed_tag("passed-1-1\nfailed-1-1\nnew-1-1\n")
         self.cache({"passed-1-1": {"src": 1}, "failed-1-1": {"src": 2},
                     "new-1-1": {"src": 3}})
         manifest = self.downloads / "run.json"
@@ -251,7 +250,7 @@ class SizeSortingTests(RunnerTestCase):
         fetch.assert_not_called()
 
     def test_sorted_recovery_with_no_pending_builds_after_limit_needs_no_koji(self):
-        self.listfile.write_text("passed-1-1\nfailed-1-1\n")
+        self.seed_tag("passed-1-1\nfailed-1-1\n")
         self.cache({"passed-1-1": {"src": 1}, "failed-1-1": {"src": 2}})
         self.write_manifest(self.downloads / "run.json", ["passed-1-1", "failed-1-1"], "active")
         self.write_journal([self.build_record("passed-1-1", "pass"),
@@ -266,7 +265,7 @@ class SizeSortingTests(RunnerTestCase):
         process.assert_not_called()
 
     def test_invalid_manifest_fails_before_size_cache_work(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         (self.downloads / "run.json").write_text('{"run_id":')
         with patch.object(mod, "read_size_cache") as cache, \
                 patch.object(mod, "fetch_size_metadata") as fetch:
@@ -278,60 +277,16 @@ class SizeSortingTests(RunnerTestCase):
         with patch.object(mod.shutil, "which", return_value=None), \
                 patch.object(mod, "read_size_cache") as cache, \
                 patch.object(mod, "fetch_size_metadata") as fetch:
-            self.assertEqual(self.run_main("--no-test", "--sort", "asc"), 2)
+            self.assertEqual(self.run_main("--sort", "asc"), 2)
         cache.assert_not_called()
         fetch.assert_not_called()
-        self.assertFalse(self.downloads.exists())
-
-    def test_local_sort_uses_selected_files_before_limit_without_metadata(self):
-        for name, binary, source in (("a-1-1", 1, 1000), ("b-1-1", 10, 1)):
-            directory = self.downloads / name
-            directory.mkdir(parents=True)
-            (directory / f"{name}.x86_64.rpm").write_bytes(b"x" * binary)
-            (directory / f"{name}.src.rpm").write_bytes(b"x" * source)
-        for no_src, expected in ((False, "b-1-1"), (True, "a-1-1")):
-            with self.subTest(no_src=no_src), \
-                    patch.object(mod, "read_size_cache") as cache, \
-                    patch.object(mod, "fetch_size_metadata") as fetch:
-                args = mod.parse_args(self.argv + ["--test-only", "--sort", "asc", "-n", "1"]
-                                      + (["--no-src"] if no_src else []))
-                units = mod.collect_test_units(args)
-                self.assertTrue(units)
-                self.assertEqual({unit.parent.name for unit in units}, {expected})
-            cache.assert_not_called()
-            fetch.assert_not_called()
-
-    def test_local_limit_skips_builds_without_selected_rpms(self):
-        for nvr, arch in (("a-1-1", "src"), ("b-1-1", "aarch64"), ("z-1-1", "x86_64")):
-            rpm = self.downloads / nvr / f"{nvr}.{arch}.rpm"
-            rpm.parent.mkdir(parents=True)
-            rpm.write_bytes(b"RPM")
-        expected = self.downloads / "z-1-1" / "z-1-1.x86_64.rpm"
-        options = ["--test-only", "--no-src", "-a", "x86_64", "-n", "1"]
-        for sort in ([], ["--sort", "asc"], ["--sort", "desc"]):
-            with self.subTest(sort=sort):
-                args = mod.parse_args(self.argv + options + sort)
-                self.assertEqual(mod.collect_test_units(args), [expected])
-
-    def test_local_sort_rejects_symlinked_builds_before_testing(self):
-        outside = self.root / "outside"
-        outside.mkdir()
-        rpm_path = outside / "demo-1-1.src.rpm"
-        rpm_path.write_text("original")
-        self.downloads.mkdir()
-        (self.downloads / "demo-1-1").symlink_to(outside, target_is_directory=True)
-        with patch.object(mod, "test_one") as test, \
-                patch.object(mod, "fetch_size_metadata") as fetch:
-            self.assertEqual(self.run_main("--test-only", "--sort", "asc"), 2)
-        test.assert_not_called()
-        fetch.assert_not_called()
-        self.assertEqual(rpm_path.read_text(), "original")
+        self.assertFalse((self.downloads / "run.json").exists())
 
     def test_report_records_sort_setting(self):
         self.cache({"demo-1-1": {"src": 1}})
         path = self.root / "result.json"
-        with patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
-            self.assertEqual(self.run_main("--sort", "desc", "--no-test", "--json", str(path)), 0)
+        with patch.object(mod, "process_build", side_effect=self.passed_build):
+            self.assertEqual(self.run_main("--sort", "desc", "--json", str(path)), 0)
         self.assertEqual(json.loads(path.read_text())["session"]["settings"]["sort"], "desc")
         self.assertIn("sort:      desc", (self.root / "report.txt").read_text())
 

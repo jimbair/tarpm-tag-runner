@@ -13,7 +13,7 @@ class CumulativeReportTests(RunnerTestCase):
     def setUp(self):
         super().setUp()
         self.nvrs = ['aaa-1-1', 'bbb-1-1', 'ccc-1-1']
-        self.listfile.write_text('\n'.join(self.nvrs) + '\n')
+        self.seed_tag('\n'.join(self.nvrs) + '\n')
         self.json_path = self.root / 'results.json'
         self.argv += ['--json', str(self.json_path)]
 
@@ -93,7 +93,6 @@ class CumulativeReportTests(RunnerTestCase):
         self.assertIn('selected: 3 build(s)', report)
         self.assertIn('rpms:     5', report)
         self.assertIn('saved test versions: tarpm-1-', report)
-        self.assertIn('removed:  3 passed RPM(s) (this invocation;', report)
         self.assertNotIn('=== TEST FAILURES ===', report)
         addendum = report.split('=== RUN ATTEMPTS ===')[1]
         self.assertIn('test failures: bbb-1-1', addendum)
@@ -114,7 +113,7 @@ class CumulativeReportTests(RunnerTestCase):
         self.assertIn('ccc-1-1', (self.downloads / 'logs/failed-all.txt').read_text())
         self.assertNotIn('bbb-1-1', (self.downloads / 'logs/failed-all.txt').read_text())
 
-    def test_local_retest_preserves_diagnostics_for_the_journaled_attempt(self):
+    def test_resume_keeps_diagnostics_from_both_attempts(self):
         def command(diagnostic):
             def run(cmd, cwd=None, binary_output=False, **kwargs):
                 if cmd[1] == "download-build":
@@ -128,20 +127,20 @@ class CumulativeReportTests(RunnerTestCase):
             self.assertEqual(self.run_main(), 1)
         saved = self.data()["test"][0]
         saved_log = Path(saved["log"])
-        with patch.object(mod, "run", side_effect=command("local retest diagnostic")):
-            self.assertEqual(self.run_main("--test-only", "-p", "aaa"), 1)
+        with patch.object(mod, "run", side_effect=command("resume attempt diagnostic")):
+            self.assertEqual(self.run_main("--resume", "-p", "aaa"), 1)
         current_log = Path(self.data()["test"][0]["log"])
         self.assertNotEqual(current_log, saved_log)
-        self.assertIn("tarpm: local retest diagnostic", current_log.read_text())
+        self.assertIn("tarpm: resume attempt diagnostic", current_log.read_text())
         self.assertIn("tarpm: first attempt diagnostic", saved_log.read_text())
 
         with patch.object(mod, "run") as run:
             self.assertEqual(self.run_main("--resume", "-p", "bbb"), 0)
         run.assert_not_called()
-        self.assertEqual(self.data()["test"][0]["log"], str(saved_log))
+        self.assertEqual(self.data()["test"][0]["log"], str(current_log))
         report = (self.root / "report.txt").read_text()
-        self.assertIn("tarpm: first attempt diagnostic", report)
-        self.assertNotIn("tarpm: local retest diagnostic", report)
+        self.assertIn("tarpm: resume attempt diagnostic", report)
+        self.assertNotIn("tarpm: first attempt diagnostic", report)
 
     def test_no_pending_resume_rebuilds_reports_without_tools_or_journal_changes(self):
         self.attempt({nvr: self.build(nvr) for nvr in self.nvrs})

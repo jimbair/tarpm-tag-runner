@@ -45,12 +45,12 @@ jobs:
       - name: Real hello RPM smoke tests
         run: python3 tests/smoke_test.py --arch "${{ matrix.arch }}" --output "$RUNNER_TEMP/hello-smoke"
 
-      - name: Upload smoke-test reports, logs, and RPM artifacts
+      - name: Upload smoke-test reports and logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hello-smoke-${{ matrix.arch }}
           path: ${{ runner.temp }}/hello-smoke
-          include-hidden-files: true
+          include-hidden-files: false
           if-no-files-found: ignore
           retention-days: 7

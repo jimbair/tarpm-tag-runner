@@ -164,8 +164,7 @@ class SelfUpdateTests(unittest.TestCase):
                 self.assert_unchanged()
 
     def test_update_rejects_run_options_before_downloading(self):
-        for extra in (["--no-test"], ["-p", "hello"], ["--list"],
-                      ["--test-only"], ["-d", "other"]):
+        for extra in (["--resume"], ["-p", "hello"], ["--list"], ["-d", "other"]):
             with self.subTest(extra=extra), \
                     patch.object(mod.urllib.request, "urlopen") as download, \
                     contextlib.redirect_stderr(io.StringIO()), \
@@ -218,11 +217,9 @@ class RunnerTestCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="ttr-test-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.listfile = self.root / "nvrs.txt"
-        self.listfile.write_text("demo-1-1\n")
         self.downloads = self.root / "rpms"
-        self.argv = ["--from-file", str(self.listfile),
-                     "-d", str(self.downloads),
+        self.seed_tag("demo-1-1\n")
+        self.argv = ["-d", str(self.downloads),
                      "-r", str(self.root / "report.txt"), "--no-run-log"]
         journal = mod.Journal()
         self.enter_patch = patch.object(mod, "JOURNAL", journal)
@@ -241,10 +238,20 @@ class RunnerTestCase(unittest.TestCase):
         package_patch.start()
         self.addCleanup(package_patch.stop)
 
+    def seed_tag(self, text):
+        self.downloads.mkdir(exist_ok=True)
+        (self.downloads / "tag-f44.txt").write_text(
+            mod.RPM_TAG_CACHE_HEADER + text, encoding="utf-8")
+
     def run_main(self, *extra):
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             return mod.main(self.argv + list(extra))
+
+    def passed_build(self, nvr, args, counter):
+        return (mod.FetchResult(nvr, True),
+                [mod.TestResult(rpm=nvr + ".noarch.rpm", nvr=nvr,
+                                arch="noarch", ok=True)])
 
     def write_manifest(self, path, nvrs, run_id):
         return mod.write_run_manifest(path, nvrs, run_id, context={
@@ -274,38 +281,24 @@ class RunnerTestCase(unittest.TestCase):
 
 
 class MissingKojiTests(RunnerTestCase):
-    def test_missing_koji_preserves_run_state_for_cached_and_explicit_lists(self):
+    def test_missing_koji_preserves_run_state_for_cached_tag(self):
         manifest = self.downloads / "run.json"
         self.write_manifest(manifest, ["demo-1-1"], "previous-run")
         before_manifest = manifest.read_bytes()
         journal = self.write_journal([self.build_record("demo-1-1", "test-fail", "previous-run")])
         before_journal = journal.read_bytes()
-        sentinel = self.downloads / "demo-1-1/partial.rpm"
-        sentinel.parent.mkdir()
-        sentinel.write_text("retained download")
-        (self.downloads / "tag-f44.txt").write_text(
-            mod.RPM_TAG_CACHE_HEADER + "demo-1-1\n")
-        for cached in (False, True):
-            argv = self.argv[2:] if cached else self.argv
-            for options in ([], ["--no-test"], ["--resume"], ["--retry-failed"]):
-                with self.subTest(cached=cached, options=options), \
-                        patch.object(mod.shutil, "which", side_effect=lambda name:
-                                     None if name == "koji" else "/fake/tarpm"), \
-                        patch.object(mod, "run") as command, \
-                        patch.object(mod, "process_build") as process, \
-                        patch.object(mod, "fetch_one") as fetch, \
-                        patch.object(mod.JOURNAL, "open") as open_journal, \
-                        contextlib.redirect_stdout(io.StringIO()), \
-                        contextlib.redirect_stderr(io.StringIO()) as stderr:
-                    self.assertEqual(mod.main(argv + options), 2)
-                self.assertIn("koji client not found", stderr.getvalue())
-                command.assert_not_called()
-                process.assert_not_called()
-                fetch.assert_not_called()
-                open_journal.assert_not_called()
-                self.assertEqual(manifest.read_bytes(), before_manifest)
-                self.assertEqual(journal.read_bytes(), before_journal)
-                self.assertEqual(sentinel.read_text(), "retained download")
+        for options in ([], ["--resume"], ["--retry-failed"]):
+            with self.subTest(options=options), \
+                    patch.object(mod.shutil, "which", return_value=None), \
+                    patch.object(mod, "run") as command, \
+                    patch.object(mod, "process_build") as process, \
+                    patch.object(mod.JOURNAL, "open") as open_journal:
+                self.assertEqual(self.run_main(*options), 2)
+            command.assert_not_called()
+            process.assert_not_called()
+            open_journal.assert_not_called()
+            self.assertEqual(manifest.read_bytes(), before_manifest)
+            self.assertEqual(journal.read_bytes(), before_journal)
 
     def test_empty_recovery_does_not_require_koji_or_open_journal(self):
         self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "finished")
@@ -323,11 +316,12 @@ class MissingKojiTests(RunnerTestCase):
         empty_path.mkdir()
         result = subprocess.run(
             [sys.executable, str(_ROOT / "tarpm-tag-runner.py"),
-             *self.argv, "--no-test"], capture_output=True, text=True,
+             *self.argv], capture_output=True, text=True,
             env={**os.environ, "PATH": str(empty_path)}, timeout=10)
         self.assertEqual(result.returncode, 2)
         self.assertIn("koji client not found", result.stderr)
-        self.assertFalse(self.downloads.exists())
+        self.assertFalse((self.downloads / "run.json").exists())
+        self.assertFalse((self.downloads / "journal.jsonl").exists())
 
     def test_cli_download_resolves_koji_from_relative_path(self):
         bin_dir = self.root / "bin"
@@ -335,28 +329,23 @@ class MissingKojiTests(RunnerTestCase):
         koji = bin_dir / "koji"
         koji.write_text('#!/bin/sh\nprintf "downloaded" > "$2.noarch.rpm"\n')
         koji.chmod(0o755)
+        tarpm = bin_dir / "tarpm"
+        tarpm.write_text('#!/bin/sh\nexit 0\n')
+        tarpm.chmod(0o755)
         result = subprocess.run(
-            [sys.executable, str(_ROOT / "tarpm-tag-runner.py"),
-             *self.argv, "--no-test"], cwd=self.root, capture_output=True, text=True,
+            [sys.executable, str(_ROOT / "tarpm-tag-runner.py"), *self.argv],
+            cwd=self.root, capture_output=True, text=True,
             env={**os.environ, "PATH": "bin"}, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        rpm = self.downloads / "demo-1-1" / "demo-1-1.noarch.rpm"
-        self.assertEqual(rpm.read_text(), "downloaded")
+        self.assertIn("test:  1 RPM(s), 1 ok", result.stdout)
+        self.assertEqual(list(self.downloads.glob(".build-*")), [])
 
 
 class JournalRecoveryTests(RunnerTestCase):
-    def test_fetch_only_does_not_make_resume_skip_tests(self):
-        with patch.object(mod, "fetch_one", return_value=mod.FetchResult(
-                nvr="demo-1-1", ok=True)):
-            self.assertEqual(self.run_main("--no-test"), 0)
-        latest = mod.read_journal(str(self.downloads / "journal.jsonl"))
-        self.assertEqual(latest["demo-1-1"]["status"], "fetched")
-        mod.JOURNAL._fh.close()
-        test = mod.TestResult(rpm="demo-1-1.noarch.rpm", nvr="demo-1-1",
-                              arch="noarch", ok=True)
-        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
-                patch.object(mod, "process_build", return_value=(
-                    mod.FetchResult("demo-1-1", True), [test])) as process:
+    def test_resume_retests_an_existing_fetch_only_record(self):
+        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
+        self.write_journal([self.build_record("demo-1-1", "fetched")])
+        with patch.object(mod, "process_build", side_effect=self.passed_build) as process:
             self.assertEqual(self.run_main("--resume"), 0)
         process.assert_called_once()
         latest = mod.read_journal(str(self.downloads / "journal.jsonl"))
@@ -384,14 +373,9 @@ class JournalRecoveryTests(RunnerTestCase):
 
 
 class RunManifestTests(RunnerTestCase):
-    def passed_build(self, nvr, args, counter):
-        return (mod.FetchResult(nvr, True),
-                [mod.TestResult(rpm=nvr + ".noarch.rpm", nvr=nvr,
-                                arch="noarch", ok=True)])
-
     def test_interrupted_rerun_resumes_active_and_queued_old_passes(self):
         nvrs = ["done-1-1", "active-1-1", "queued-1-1"]
-        self.listfile.write_text("\n".join(nvrs) + "\n")
+        self.seed_tag("\n".join(nvrs) + "\n")
         manifest_path = self.downloads / "run.json"
         self.write_manifest(manifest_path, nvrs, "old-run")
         self.write_journal(self.build_record(nvr, "pass", "old-run") for nvr in nvrs)
@@ -423,7 +407,7 @@ class RunManifestTests(RunnerTestCase):
                 patch.object(mod, "process_build", side_effect=self.passed_build) as process:
             self.assertEqual(self.run_main("--resume"), 0)
         self.assertEqual([call.args[0] for call in process.call_args_list], nvrs[1:])
-        self.assertFalse(partial.exists())
+        self.assertEqual(partial.read_text(), "incomplete rerun")
         current = mod.read_journal(str(self.downloads / "journal.jsonl"), run_id=run_id)
         self.assertEqual(set(current), set(nvrs))
         self.assertTrue(all(record["status"] == "pass" for record in current.values()))
@@ -449,8 +433,21 @@ class RunManifestTests(RunnerTestCase):
         self.assertEqual(rpm.read_text(), "previous RPM")
         self.assertEqual(list(self.downloads.glob(".run-*.tmp")), [])
 
+    def test_logs_setup_failure_preserves_active_run(self):
+        path = self.downloads / "run.json"
+        self.write_manifest(path, ["demo-1-1"], "previous-run")
+        before = path.read_bytes()
+        journal = self.write_journal([self.build_record("demo-1-1", "test-fail", "previous-run")])
+        records = journal.read_bytes()
+        (self.downloads / "logs").write_text("regular file")
+        with patch.object(mod, "process_build") as process:
+            self.assertEqual(self.run_main(), 2)
+        process.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(journal.read_bytes(), records)
+
     def test_invalid_manifest_never_falls_back_to_old_passes(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         (self.downloads / "journal.jsonl").write_text(json.dumps(
             {"nvr": "demo-1-1", "status": "pass"}) + "\n")
         for invalid in ('{"run_id":', '{}',
@@ -489,7 +486,7 @@ class RunManifestTests(RunnerTestCase):
 
     def test_filtered_resume_preserves_other_pending_builds(self):
         nvrs = ["aaa-1-1", "bbb-1-1"]
-        self.listfile.write_text("\n".join(nvrs) + "\n")
+        self.seed_tag("\n".join(nvrs) + "\n")
         path = self.downloads / "run.json"
         self.write_manifest(path, nvrs, "current-run")
         with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
@@ -504,7 +501,7 @@ class RunManifestTests(RunnerTestCase):
         self.assertEqual(mod.read_run_manifest(path)["run_id"], "current-run")
 
     def test_resume_does_not_add_builds_outside_active_run(self):
-        self.listfile.write_text("demo-1-1\nother-1-1\n")
+        self.seed_tag("demo-1-1\nother-1-1\n")
         self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "current-run")
         self.write_journal([self.build_record("demo-1-1", "pass", "current-run")])
         with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
@@ -513,7 +510,6 @@ class RunManifestTests(RunnerTestCase):
         process.assert_not_called()
 
     def test_resume_keeps_pending_builds_after_tag_refresh(self):
-        self.argv = self.argv[2:]
         manifest = self.downloads / "run.json"
         self.write_manifest(manifest, ["old-1-1"], "active")
         before = manifest.read_bytes()
@@ -528,13 +524,6 @@ class RunManifestTests(RunnerTestCase):
         read.assert_not_called()
         self.assertEqual([call.args[0] for call in process.call_args_list], ["old-1-1"])
         self.assertEqual(manifest.read_bytes(), before)
-
-    def test_explicit_resume_list_cannot_displace_a_manifest_build_at_limit(self):
-        self.listfile.write_text("outside-1-1\ndemo-1-1\n")
-        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
-        with patch.object(mod, "process_build", side_effect=self.passed_build) as process:
-            self.assertEqual(self.run_main("--resume", "-n", "1"), 0)
-        self.assertEqual([call.args[0] for call in process.call_args_list], ["demo-1-1"])
 
     def test_retry_uses_historical_failures_but_starts_a_new_run(self):
         path = self.downloads / "run.json"
@@ -645,7 +634,7 @@ class CliSelectionTests(RunnerTestCase):
         for count in (1, 5000):
             with self.subTest(count=count):
                 nvrs = [f"demo-{i}-1" for i in range(count)]
-                self.listfile.write_text("\n".join(nvrs) + "\n")
+                self.seed_tag("\n".join(nvrs) + "\n")
                 self.write_manifest(manifest, nvrs, "pipe-test")
                 saved_manifest = manifest.read_bytes()
                 reader, writer = os.pipe()
@@ -668,30 +657,19 @@ class CliSelectionTests(RunnerTestCase):
                 self.assertEqual(manifest.read_bytes(), saved_manifest)
                 self.assertFalse((self.root / "report.txt").exists())
 
-    def test_test_only_list_is_rejected_without_touching_rpms(self):
-        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
-        rpm.parent.mkdir(parents=True)
-        rpm.write_text("original rpm")
-        with patch.object(mod, "run") as command, \
-                self.assertRaises(SystemExit) as error:
-            self.run_main("--test-only", "--list")
-        self.assertEqual(error.exception.code, 2)
-        command.assert_not_called()
-        self.assertEqual(rpm.read_text(), "original rpm")
-        self.assertFalse((self.root / "report.txt").exists())
-
-    def test_file_list_stdout_round_trips_without_diagnostics(self):
-        result, stdout, stderr = self.list_output()
-        self.assertEqual(result, 0)
-        self.assertEqual(stdout, "demo-1-1\n")
-        self.assertIn("list from", stderr)
-        self.listfile.write_text(stdout)
-        with contextlib.redirect_stdout(io.StringIO()):
-            nvrs, _ = mod.read_nvrs(mod.parse_args(self.argv))
-        self.assertEqual(nvrs, ["demo-1-1"])
+    def test_removed_flags_are_rejected_before_work(self):
+        for options in (["--test-only"], ["--from-file", "nvrs.txt"],
+                        ["--no-test"], ["--keep"]):
+            with self.subTest(options=options), \
+                    patch.object(mod, "run") as command, \
+                    self.assertRaises(SystemExit) as error:
+                self.run_main(*options)
+            self.assertEqual(error.exception.code, 2)
+            command.assert_not_called()
+            self.assertFalse((self.downloads / "run.json").exists())
 
     def test_cached_list_stdout_contains_only_nvrs(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         (self.downloads / "tag-f44.txt").write_text(
             mod.RPM_TAG_CACHE_HEADER +
             "Build Tag Built by\n------------------\ndemo-1-1 f44 user\n")
@@ -713,7 +691,7 @@ class CliSelectionTests(RunnerTestCase):
         proc.returncode = 0
         with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
                 patch.object(mod.subprocess, "Popen", return_value=proc):
-            result, stdout, stderr = self.list_output()
+            result, stdout, stderr = self.list_output("--refresh")
         self.assertEqual(result, 0)
         self.assertEqual(stdout, "demo-1-1\n")
         self.assertIn("still fetching koji tag", stderr)
@@ -741,7 +719,7 @@ class CliSelectionTests(RunnerTestCase):
         command.assert_not_called()
 
     def test_legacy_cache_refreshes_before_package_filter_and_limit(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         cache = self.downloads / "tag-f44.txt"
         cache.write_text("Fedora-Games-Live-44-20260424.n.0 f44 user\n"
                          "hello-1-1 f44 user\n")
@@ -757,7 +735,7 @@ class CliSelectionTests(RunnerTestCase):
         self.assertEqual(cache.read_text(), mod.RPM_TAG_CACHE_HEADER + output)
 
     def test_failed_filtered_query_preserves_existing_cache(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         cache = self.downloads / "tag-f44.txt"
         for content, options in (
                 ("Fedora-IoT-32-20191107.0 f44 user\n", []),
@@ -775,7 +753,7 @@ class CliSelectionTests(RunnerTestCase):
                 self.assertEqual(cache.read_text(), content)
 
     def test_failed_cache_write_preserves_previous_snapshot(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         cache = self.downloads / "tag-f44.txt"
         previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\nother-1-1\n"
         self.argv = ["-d", str(self.downloads), "--no-run-log"]
@@ -798,7 +776,7 @@ class CliSelectionTests(RunnerTestCase):
                 query.assert_not_called()
 
     def test_interrupted_partial_cache_write_never_replaces_snapshot(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         cache = self.downloads / "tag-f44.txt"
         previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\nother-1-1\n"
         cache.write_text(previous)
@@ -826,7 +804,7 @@ class CliSelectionTests(RunnerTestCase):
         self.assertEqual(list(self.downloads.glob(".tag-*.tmp")), [])
 
     def test_invalid_query_output_does_not_replace_cache(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         cache = self.downloads / "tag-f44.txt"
         previous = mod.RPM_TAG_CACHE_HEADER + "old-1-1\n"
         cache.write_text(previous)
@@ -852,19 +830,9 @@ class CliSelectionTests(RunnerTestCase):
         self.assertEqual(stdout, "hello-1-1\n")
         self.assertFalse((self.downloads / "run.json").exists())
 
-    def test_explicit_file_keeps_supplied_builds_without_querying_koji(self):
-        self.listfile.write_text("Fedora-IoT-32-20191107.0\nhello-1-1\n")
-        with patch.object(mod, "run") as command, \
-                patch.object(mod.shutil, "which", return_value=None):
-            result, stdout, _ = self.list_output()
-        self.assertEqual(result, 0)
-        self.assertEqual(stdout, self.listfile.read_text())
-        command.assert_not_called()
-        self.assertFalse((self.downloads / "tag-f44.txt").exists())
-
     def test_resume_list_excludes_passed_and_warned_builds(self):
         nvrs = ["pass-1-1", "warn-1-1", "fail-1-1", "new-1-1"]
-        self.listfile.write_text("\n".join(nvrs) + "\n")
+        self.seed_tag("\n".join(nvrs) + "\n")
         self.write_manifest(self.downloads / "run.json", nvrs, "active")
         self.write_journal([self.build_record("pass-1-1", "pass"),
                             self.build_record("warn-1-1", "warn"),
@@ -1026,17 +994,6 @@ class ReportContentTests(RunnerTestCase):
         self.assertIn("OSError: failed at <path>",
                       (self.downloads / "logs/failed-index.tsv").read_text())
 
-    def test_fetch_only_skips_rpm_lookup_and_has_timing_and_empty_test_summary(self):
-        path = self.root / "fetch.json"
-        with patch.object(mod, "tarpm_package_info") as package, \
-                patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
-            self.assertEqual(self.run_main("--no-test", "--json", str(path)), 0)
-        package.assert_not_called()
-        data = json.loads(path.read_text())
-        self.assertIsNone(data["session"]["tarpm"])
-        self.assertEqual(data["session"]["mode"], "fetch-only")
-        self.assertNotIn("test", data["summary"])
-
 
 class ReportPathTests(RunnerTestCase):
     def test_retry_default_matches_cli_and_explicit_argv(self):
@@ -1072,27 +1029,23 @@ class ReportPathTests(RunnerTestCase):
                 ["-r", str(symlink)],
                 ["--json", str(self.root / "report.txt")]):
             with self.subTest(options=options), patch.object(mod, "fetch_one") as fetch:
-                self.assertEqual(self.run_main("--no-test", *options), 2)
+                self.assertEqual(self.run_main(*options), 2)
                 fetch.assert_not_called()
                 self.assertEqual(json.loads((self.downloads / "run.json").read_text()), manifest)
                 self.assertEqual(journal.read_bytes(), original_journal)
 
-    def test_missing_report_parent_preserves_local_rpm(self):
-        rpm = self.downloads / "demo-1-1" / "demo-1-1.src.rpm"
-        rpm.parent.mkdir(parents=True)
-        rpm.write_bytes(b"original RPM")
+    def test_missing_report_parent_prevents_downloads(self):
         for option in ("-r", "--json"):
-            with self.subTest(option=option), patch.object(mod, "test_one") as test:
-                self.assertEqual(self.run_main("--test-only", option,
-                                               str(self.root / "missing" / "report")), 2)
-                test.assert_not_called()
-                self.assertEqual(rpm.read_bytes(), b"original RPM")
+            with self.subTest(option=option), patch.object(mod, "process_build") as process:
+                self.assertEqual(self.run_main(option, str(self.root / "missing/report")), 2)
+            process.assert_not_called()
+            self.assertFalse((self.downloads / "run.json").exists())
 
     def test_reports_can_use_download_directories_created_by_the_runner(self):
         report = self.downloads / "logs" / "report.txt"
         json_path = self.downloads / "results.json"
-        with patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
-            self.assertEqual(self.run_main("--no-test", "-r", str(report),
+        with patch.object(mod, "process_build", side_effect=self.passed_build):
+            self.assertEqual(self.run_main("-r", str(report),
                                            "--json", str(json_path)), 0)
         self.assertTrue(report.is_file())
         self.assertTrue(json_path.is_file())
@@ -1100,7 +1053,7 @@ class ReportPathTests(RunnerTestCase):
     def test_report_cannot_replace_generated_failure_list(self):
         report = self.downloads / "logs" / "failed-all.txt"
         with patch.object(mod, "fetch_one") as fetch:
-            self.assertEqual(self.run_main("--no-test", "-r", str(report)), 2)
+            self.assertEqual(self.run_main("-r", str(report)), 2)
         fetch.assert_not_called()
         self.assertFalse(report.exists())
 
@@ -1123,8 +1076,8 @@ class ReportPathTests(RunnerTestCase):
         mod.write_failure_lists(args, [fetched], [tested])
 
         report = logdir / "failed-summary.txt"
-        with patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
-            self.assertEqual(self.run_main("--no-test", "-r", str(report)), 0)
+        with patch.object(mod, "process_build", side_effect=self.passed_build):
+            self.assertEqual(self.run_main("-r", str(report)), 0)
         self.assertEqual(set(logdir.iterdir()), {report, fetch_log, test_log})
         self.assertIn("status:    passed", report.read_text())
         for path in (fetch_log, test_log):
@@ -1136,7 +1089,7 @@ class TimingTests(RunnerTestCase):
         stages = ["unpack", "repack", "unpack-repacked", "list-original", "list-repacked"]
         for failure in [None] + stages:
             with self.subTest(failure=failure):
-                args = mod.parse_args(self.argv + ["--keep"])
+                args = mod.parse_args(self.argv)
                 rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
                 rpm.parent.mkdir(parents=True, exist_ok=True)
                 rpm.write_text("rpm")
@@ -1162,7 +1115,8 @@ class TimingTests(RunnerTestCase):
                 self.assertEqual(result.duration_seconds, elapsed - 100)
                 self.assertEqual(result.ok, failure is None)
                 self.assertEqual(result.stage, failure)
-                self.assertIn("timings: unpack=2.000s", result.log.read_text())
+                if failure:
+                    self.assertIn("timings: unpack=2.000s", result.log.read_text())
 
     def test_fetch_time_and_summary_show_measured_failures_without_inventing_exception_times(self):
         args = mod.parse_args(self.argv)
@@ -1170,7 +1124,7 @@ class TimingTests(RunnerTestCase):
         with patch.object(mod, "run", return_value=(1, "failed download")), \
                 patch.object(mod.time, "monotonic", side_effect=[10, 14.5]), \
                 contextlib.redirect_stdout(io.StringIO()):
-            fetched = mod.fetch_one("demo-1-1", args)
+            fetched = mod.fetch_one("demo-1-1", args, download_dir=self.root / "fetch")
         self.assertFalse(fetched.ok)
         self.assertEqual(fetched.duration_seconds, 4.5)
         fetch = [fetched, mod.FetchResult("unknown-1-1", False, error="worker exception")]
@@ -1267,18 +1221,18 @@ class ComparisonTests(RunnerTestCase):
                 path.write_text(contents)
                 with patch.object(mod, "fetch_one") as fetch, \
                         patch.object(mod, "process_build") as process:
-                    self.assertEqual(self.run_main("--no-test", "--compare", str(path)), 2)
+                    self.assertEqual(self.run_main("--compare", str(path)), 2)
                 fetch.assert_not_called()
                 process.assert_not_called()
-                self.assertFalse(self.downloads.exists())
+                self.assertFalse((self.downloads / "run.json").exists())
                 self.assertFalse((self.root / "report.txt").exists())
         with self.assertRaises(mod.UsageError):
             mod.read_comparison_report(self.root / "missing.json")
 
     def test_main_loads_baseline_before_overwriting_the_same_json_path(self):
         path = self.baseline(fetch=[mod.FetchResult("demo-1-1", False, 1, signature="network error")])
-        with patch.object(mod, "fetch_one", return_value=mod.FetchResult("demo-1-1", True)):
-            self.assertEqual(self.run_main("--no-test", "--compare", str(path),
+        with patch.object(mod, "process_build", side_effect=self.passed_build):
+            self.assertEqual(self.run_main("--compare", str(path),
                                            "--json", str(path)), 0)
         data = json.loads(path.read_text())
         self.assertEqual(len(data['comparison']['fetch']['resolved']), 1)
@@ -1289,7 +1243,7 @@ class ComparisonTests(RunnerTestCase):
         path = self.baseline(fetch=[mod.FetchResult("demo-1-1", True)])
         failed = mod.FetchResult("demo-1-1", False, 1, signature="download failed")
         with patch.object(mod, "fetch_one", return_value=failed):
-            self.assertEqual(self.run_main("--no-test", "--compare", str(path)), 1)
+            self.assertEqual(self.run_main("--compare", str(path)), 1)
         report = (self.root / "report.txt").read_text()
         self.assertIn("fetch REGRESSION demo-1-1", report)
         self.assertIn("1 regressions", report)
@@ -1301,37 +1255,6 @@ class ComparisonTests(RunnerTestCase):
 
 
 class BuildPathTests(RunnerTestCase):
-    def test_test_only_rejects_symlink_before_testing_any_rpm(self):
-        outside = self.root / "outside-1-1"
-        outside.mkdir()
-        original = outside / "demo-1-1.noarch.rpm"
-        original.write_text("external original")
-        valid = self.downloads / "aaa-1-1/aaa-1-1.noarch.rpm"
-        valid.parent.mkdir(parents=True)
-        valid.write_text("local original")
-        (self.downloads / "demo-1-1").symlink_to(outside, target_is_directory=True)
-        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
-                patch.object(mod, "run") as command:
-            self.assertEqual(self.run_main("--test-only"), 2)
-        command.assert_not_called()
-        self.assertEqual(original.read_text(), "external original")
-        self.assertEqual(valid.read_text(), "local original")
-
-    def test_test_only_cleanup_leaves_filtered_symlink_alone(self):
-        outside = self.root / "empty-outside"
-        outside.mkdir()
-        rpm = self.downloads / "good-1-1/good-1-1.noarch.rpm"
-        rpm.parent.mkdir(parents=True)
-        rpm.write_text("local original")
-        link = self.downloads / "other-1-1"
-        link.symlink_to(outside, target_is_directory=True)
-        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
-                patch.object(mod, "run", return_value=(0, "listing\n")):
-            self.assertEqual(self.run_main("--test-only", "-p", "good"), 0)
-        self.assertFalse(rpm.exists())
-        self.assertTrue(link.is_symlink())
-        self.assertTrue(outside.is_dir())
-
     def test_invalid_nvrs_are_rejected_before_any_build_runs(self):
         outside = self.root / "outside-1-1"
         outside.mkdir()
@@ -1341,7 +1264,7 @@ class BuildPathTests(RunnerTestCase):
         for invalid in ("../outside-1-1", str(outside), ".", "..", "demo",
                         "demo--1", "dir/demo-1-1", r"dir\demo-1-1"):
             with self.subTest(nvr=invalid):
-                self.listfile.write_text(f"demo-1-1\n{invalid}\n")
+                self.write_manifest(self.downloads / "run.json", ["demo-1-1", invalid], "active")
                 with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
                         patch.object(mod, "process_build") as process:
                     self.assertEqual(self.run_main("--resume"), 2)
@@ -1352,27 +1275,14 @@ class BuildPathTests(RunnerTestCase):
         for nvr in ("hello-2.12.2-1.fc44", "389-ds-base-3.1.2-1.fc44",
                     "libstdc++-16.0.1-0.1.fc44", "demo-1.0~rc1^git-1.fc44"):
             with self.subTest(nvr=nvr):
-                self.assertEqual(mod.build_dir(str(self.downloads), nvr),
-                                 self.downloads / nvr)
-
-    def test_direct_fetch_rejects_paths_and_symlinks(self):
-        self.downloads.mkdir()
-        outside = self.root / "outside-1-1"
-        outside.mkdir()
-        (self.downloads / "demo-1-1").symlink_to(outside, target_is_directory=True)
-        args = mod.parse_args(self.argv)
-        for nvr in ("../outside-1-1", "demo-1-1"):
-            with self.subTest(nvr=nvr), patch.object(mod, "run") as command:
-                with self.assertRaises(mod.UsageError):
-                    mod.fetch_one(nvr, args)
-                command.assert_not_called()
+                mod.validate_nvr(nvr)
 
     def test_recovery_does_not_delete_symlink_targets(self):
         outside = self.root / "outside-1-1"
         outside.mkdir()
         marker = outside / "keep.txt"
         marker.write_text("unrelated data")
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         link = self.downloads / "demo-1-1"
         link.symlink_to(outside, target_is_directory=True)
         for mode in ("--resume", "--retry-failed"):
@@ -1380,9 +1290,9 @@ class BuildPathTests(RunnerTestCase):
                 self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
                 self.write_journal([self.build_record("demo-1-1", "test-fail")])
                 with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
-                        patch.object(mod, "process_build") as process:
-                    self.assertEqual(self.run_main(mode), 1)
-                process.assert_not_called()
+                        patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+                    self.assertEqual(self.run_main(mode), 0)
+                process.assert_called_once()
                 self.assertEqual(marker.read_text(), "unrelated data")
                 self.assertTrue(link.is_symlink())
                 mod.JOURNAL._fh.close()
@@ -1437,7 +1347,7 @@ class FetchProgressTests(RunnerTestCase):
         self.assertEqual(mod.koji_download_progress(output).percent, 61)
 
     def test_sizes_fall_back_to_current_rpm_or_explicit_build_total(self):
-        self.downloads.mkdir()
+        self.downloads.mkdir(exist_ok=True)
         (self.downloads / "first.rpm").write_bytes(b"x" * 2048)
         (self.downloads / "next.rpm").write_bytes(b"x" * 1024)
         output = "Downloading [2/2]: next.rpm\n"
@@ -1460,14 +1370,14 @@ class FetchProgressTests(RunnerTestCase):
                          ("fetching demo.rpm (RPM 2/3, 66.7%)", "1m 00s, 913.00 MiB so far"))
 
     def test_fetch_heartbeat_uses_native_progress_and_keeps_full_output(self):
-        args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
+        args = mod.parse_args(self.argv + ["--heartbeat", "1"])
         (self.downloads / "logs").mkdir(parents=True)
         first = "Downloading [1/2]: first.rpm\n" + self.bar("61%")
         next_rpm = first + self.bar("100%") + "Downloading [2/2]: next.rpm\n"
         final = next_rpm + self.bar("21%") + self.bar("100%") + "\n"
         cmd = ["koji", "download-build", "demo-1-1"]
         proc = Mock()
-        proc.returncode = 0
+        proc.returncode = 7
         proc.communicate.side_effect = [
             subprocess.TimeoutExpired(cmd, 1, output=first.encode()),
             subprocess.TimeoutExpired(cmd, 1, output=next_rpm.encode()),
@@ -1478,8 +1388,9 @@ class FetchProgressTests(RunnerTestCase):
                 patch.object(mod, "koji_download_progress", wraps=mod.koji_download_progress) as parse, \
                 patch.object(mod, "_file_bytes", return_value=1024), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
-            result = mod.fetch_one("demo-1-1", args, mod.Counter(2))
-        self.assertTrue(result.ok)
+            result = mod.fetch_one("demo-1-1", args, mod.Counter(2),
+                                   download_dir=self.root / "fetch")
+        self.assertEqual(result.exit_code, 7)
         popen.assert_called_once()
         self.assertEqual(popen.call_args.args[0], cmd)
         beats = [line for line in stdout.getvalue().splitlines() if "still fetching" in line]
@@ -1495,197 +1406,126 @@ class FetchProgressTests(RunnerTestCase):
         self.assertEqual(result.log.read_bytes().decode(), final)
 
     def test_fast_fetch_does_not_parse_progress(self):
-        args = mod.parse_args(self.argv + ["--keep"])
+        args = mod.parse_args(self.argv)
         (self.downloads / "logs").mkdir(parents=True)
         proc = Mock(returncode=0)
         proc.communicate.return_value = ("downloaded\n", None)
         with patch.object(mod.subprocess, "Popen", return_value=proc), \
                 patch.object(mod, "koji_download_progress") as parse, \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = mod.fetch_one("demo-1-1", args)
+            result = mod.fetch_one("demo-1-1", args, download_dir=self.root / "fetch")
         self.assertTrue(result.ok)
         parse.assert_not_called()
 
 
 class FetchRecoveryTests(RunnerTestCase):
-    def test_failed_fetch_removes_empty_directory_and_keeps_failure_records(self):
-        for options in (["--no-test"], []):
-            with self.subTest(options=options), \
-                    patch.object(mod.shutil, "which", return_value="/fake/tool"), \
-                    patch.object(mod, "run", return_value=(7, "download failed")):
-                self.assertEqual(self.run_main(*options), 1)
-                self.assertFalse((self.downloads / "demo-1-1").exists())
-                record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
-                logfile = Path(record["results"]["fetch"]["log"])
-                self.assertEqual(logfile.read_text(), "download failed")
-                self.assertEqual(record["status"], "fetch-fail")
-                self.assertEqual(record["exit_code"], 7)
-                self.assertEqual(record["signature"], "download failed")
-
-        # Recovery uses the journal, even after the empty directory is gone.
-        with patch.object(mod.shutil, "which", return_value="/fake/tool"), \
-                patch.object(mod, "run", return_value=(0, "downloaded")) as command:
-            self.assertEqual(self.run_main("--retry-failed"), 0)
-        command.assert_called_once()
-        self.assertEqual(command.call_args.args[0][-1], "demo-1-1")
-
-    def test_failed_fetch_keep_retains_empty_directory(self):
-        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
-                patch.object(mod, "run", return_value=(1, "download failed")):
-            self.assertEqual(self.run_main("--no-test", "--keep"), 1)
-        bdir = self.downloads / "demo-1-1"
-        self.assertTrue(bdir.is_dir())
-        self.assertEqual(list(bdir.iterdir()), [])
-
-    def test_failed_fetch_preserves_all_directory_contents(self):
-        args = mod.parse_args(self.argv)
-        (self.downloads / "logs").mkdir(parents=True)
-        bdir = self.downloads / "demo-1-1"
-        bdir.mkdir()
-        for name in ("partial.rpm", ".download", "nested"):
-            with self.subTest(name=name):
-                item = bdir / name
-                if name == "nested":
-                    item.mkdir()
-                else:
-                    item.write_text("partial download")
-                with patch.object(mod, "run", return_value=(1, "download failed")), \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    result = mod.fetch_one("demo-1-1", args)
-                self.assertFalse(result.ok)
-                self.assertTrue(item.exists())
-                if item.is_dir():
-                    item.rmdir()
-                else:
-                    self.assertEqual(item.read_text(), "partial download")
-                    item.unlink()
-
-    def test_failed_fetch_cleanup_error_preserves_original_failure(self):
-        with patch.object(mod.shutil, "which", return_value="/fake/koji"), \
-                patch.object(mod, "run", return_value=(7, "download failed")), \
-                patch.object(Path, "rmdir", side_effect=PermissionError("denied")):
-            self.assertEqual(self.run_main("--no-test"), 1)
-        self.assertTrue((self.downloads / "demo-1-1").is_dir())
-        record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
-        self.assertEqual(record["exit_code"], 7)
-        self.assertEqual(record["signature"], "download failed")
-
-    def test_duplicate_nvrs_are_processed_once(self):
-        self.listfile.write_text("demo-1-1\ndemo-1-1  # repeated\n")
-        with patch.object(mod, "fetch_one", return_value=mod.FetchResult(
-                "demo-1-1", True)) as fetch:
-            self.assertEqual(self.run_main("--no-test", "-j", "2"), 0)
-        fetch.assert_called_once()
-
-    def test_normal_run_tests_only_rpms_from_current_download(self):
-        build = self.downloads / "demo-1-1"
-        build.mkdir(parents=True)
-        current = build / "demo-1-1.x86_64.rpm"
-        current.write_bytes(b"old main RPM")
-        extra = build / "demo-debuginfo-1-1.x86_64.rpm"
-        extra.write_bytes(b"retained debug RPM")
-        tested = []
-
-        def command(cmd, cwd=None, binary_output=False, **kwargs):
-            if cmd[1] == "download-build":
-                self.assertEqual(list(cwd.iterdir()), [])
-                (cwd / current.name).write_bytes(b"current download")
-            elif cmd[1] == "-x" and not tested:
-                rpm = Path(cmd[3])
-                self.assertEqual(rpm.read_bytes(), b"current download")
-                tested.append(rpm)
-            return 0, b"" if binary_output else ""
-
-        report = self.root / "downloads.json"
-        with patch.object(mod, "run", side_effect=command):
-            self.assertEqual(self.run_main("--keep", "--json", str(report)), 0)
-        self.assertEqual(tested, [current])
-        self.assertEqual([row["rpm"] for row in json.loads(report.read_text())["test"]],
-                         [str(current)])
-        self.assertEqual(extra.read_bytes(), b"retained debug RPM")
-        self.assertEqual(current.read_bytes(), b"current download")
-        self.assertEqual(list(build.glob(".download-*")), [])
-
-    def test_failed_staged_download_preserves_existing_and_partial_rpms(self):
-        build = self.downloads / "demo-1-1"
-        build.mkdir(parents=True)
-        previous = build / "demo-1-1.x86_64.rpm"
-        previous.write_bytes(b"previous download")
+    def test_failed_fetch_discards_partial_download_and_can_resume(self):
+        fetched = []
 
         def download(cmd, cwd, **kwargs):
-            self.assertEqual(cmd[1], "download-build")
-            self.assertEqual(cwd.parent, build)
-            (cwd / previous.name).write_bytes(b"partial download")
-            return 7, "download failed"
+            fetched.append(cwd)
+            (cwd / "demo-1-1.noarch.rpm").write_text("partial RPM")
+            (cwd / ".part").mkdir()
+            return 7, "download interrupted"
 
         with patch.object(mod, "run", side_effect=download), \
                 patch.object(mod, "test_one") as test:
             self.assertEqual(self.run_main(), 1)
         test.assert_not_called()
-        self.assertEqual(previous.read_bytes(), b"previous download")
-        partial, = build.glob(f".download-*/{previous.name}")
-        self.assertEqual(partial.read_bytes(), b"partial download")
+        self.assertEqual(len(fetched), 1)
+        self.assertFalse(fetched[0].parent.exists())
+        journal = self.downloads / "journal.jsonl"
+        record = mod.read_journal(journal)["demo-1-1"]
+        self.assertEqual((record["status"], record["exit_code"]), ("fetch-fail", 7))
+        self.assertIn("download interrupted", Path(record["results"]["fetch"]["log"]).read_text())
+        with patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("--resume"), 0)
+        process.assert_called_once()
+        updated = mod.read_journal(journal)["demo-1-1"]
+        self.assertEqual(updated["status"], "pass")
+        self.assertEqual(updated["run_id"], record["run_id"])
 
-    def test_recovery_clears_build_before_download(self):
-        for mode in ("--resume", "--retry-failed"):
-            with self.subTest(mode=mode):
-                bdir = self.downloads / "demo-1-1"
-                bdir.mkdir(parents=True, exist_ok=True)
-                (bdir / "partial.rpm").write_text("truncated download")
-                self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
-                self.write_journal([self.build_record("demo-1-1", "test-fail")])
+    def test_failed_workspace_cleanup_does_not_hide_download_failure(self):
+        with patch.object(mod, "run", return_value=(7, "download failed")), \
+                patch.object(mod, "remove_tree", side_effect=PermissionError("denied")):
+            self.assertEqual(self.run_main(), 1)
+        record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
+        self.assertEqual(record["exit_code"], 7)
+        self.assertEqual(record["signature"], "download failed")
 
-                def process(nvr, args, counter):
-                    self.assertFalse(bdir.exists())
-                    return mod.FetchResult(nvr, True), []
+    def test_duplicate_nvrs_are_processed_once(self):
+        self.seed_tag("demo-1-1\ndemo-1-1  # repeated\n")
+        with patch.object(mod, "process_build", side_effect=self.passed_build) as process:
+            self.assertEqual(self.run_main("-j", "2"), 0)
+        process.assert_called_once()
 
-                with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
-                        patch.object(mod, "process_build", side_effect=process) as work:
-                    self.assertEqual(self.run_main(mode), 0)
-                work.assert_called_once()
-                mod.JOURNAL._fh.close()
+    def test_run_and_resume_use_only_their_own_downloads(self):
+        saved = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        saved.parent.mkdir()
+        saved.write_bytes(b"unrelated RPM")
+        unfinished = self.downloads / ".build-interrupted/demo-1-1/demo-1-1.noarch.rpm"
+        unfinished.parent.mkdir(parents=True)
+        unfinished.write_bytes(b"old partial download")
+        fetched = []
 
-    def test_failed_resume_cleanup_does_not_reuse_rpms(self):
-        (self.downloads / "demo-1-1").mkdir(parents=True)
-        self.write_manifest(self.downloads / "run.json", ["demo-1-1"], "active")
-        with patch.object(mod.shutil, "which", return_value="/fake/tarpm"), \
-                patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")), \
-                patch.object(mod, "process_build") as process:
-            self.assertEqual(self.run_main("--resume"), 1)
-        process.assert_not_called()
-        record = mod.read_journal(str(self.downloads / "journal.jsonl"))
-        self.assertEqual(record["demo-1-1"]["status"], "fetch-fail")
+        def command(cmd, cwd=None, binary_output=False, **kwargs):
+            if cmd[1] == "download-build":
+                self.assertEqual(list(cwd.iterdir()), [])
+                fetched.append(cwd)
+                (cwd / saved.name).write_bytes(b"current download")
+            elif cmd[1] == "-x" and Path(cmd[3]).name == saved.name:
+                rpm = Path(cmd[3])
+                self.assertEqual(rpm.parent, fetched[-1])
+                self.assertEqual(rpm.read_bytes(), b"current download")
+                if len(fetched) == 1:
+                    return 9, "tarpm: first attempt failed"
+            return 0, b"same listing\n" if binary_output else ""
 
-    def test_no_src_discards_source_downloads(self):
+        report = self.root / "downloads.json"
+        with patch.object(mod, "run", side_effect=command):
+            self.assertEqual(self.run_main("--json", str(report)), 1)
+            first = json.loads(report.read_text())
+            self.assertEqual(first["test"][0]["stage"], "unpack")
+            self.assertFalse(fetched[0].parent.exists())
+            self.assertEqual(self.run_main("--resume", "--json", str(report)), 0)
+        resumed = json.loads(report.read_text())
+        self.assertEqual(len(fetched), 2)
+        self.assertNotEqual(fetched[0], fetched[1])
+        self.assertFalse(fetched[1].parent.exists())
+        self.assertEqual(resumed["run"]["id"], first["run"]["id"])
+        self.assertEqual(resumed["run"]["status"], "passed")
+        self.assertEqual(resumed["test"][0]["rpm"], str(fetched[1] / saved.name))
+        self.assertEqual(saved.read_bytes(), b"unrelated RPM")
+        self.assertEqual(unfinished.read_bytes(), b"old partial download")
+
+    def test_no_src_filters_tests_and_removes_all_downloads(self):
+        def command(cmd, cwd=None, binary_output=False, **kwargs):
+            if cmd[1] == "download-build":
+                (cwd / "demo-1-1.src.rpm").write_text("source")
+                (cwd / "demo-1-1.x86_64.rpm").write_text("binary")
+            return 0, b"same listing\n" if binary_output else ""
+
         for arch in ([], ["-a", "x86_64"]):
-            with self.subTest(arch=arch):
-                args = mod.parse_args(self.argv + ["--no-src", "--keep"] + arch)
-                (self.downloads / "logs").mkdir(parents=True, exist_ok=True)
+            with self.subTest(arch=arch), patch.object(mod, "run", side_effect=command):
+                report = self.root / "no-src.json"
+                self.assertEqual(self.run_main("--no-src", *arch, "--json", str(report)), 0)
+                self.assertEqual([r["arch"] for r in json.loads(report.read_text())["test"]],
+                                 ["x86_64"])
+                self.assertEqual(list(self.downloads.glob(".build-*")), [])
 
-                def download(cmd, cwd, **kwargs):
-                    (cwd / "demo-1-1.src.rpm").write_text("source")
-                    (cwd / "demo-1-1.x86_64.rpm").write_text("binary")
-                    return 0, "downloaded"
+    def test_no_eligible_rpms_are_reported_as_a_failure(self):
+        def download(cmd, cwd, **kwargs):
+            (cwd / "demo-1-1.src.rpm").write_text("source")
+            return 0, "downloaded"
 
-                with patch.object(mod, "run", side_effect=download), \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    result = mod.fetch_one("demo-1-1", args)
-                self.assertTrue(result.ok)
-                self.assertFalse((self.downloads / "demo-1-1/demo-1-1.src.rpm").exists())
-                self.assertTrue((self.downloads / "demo-1-1/demo-1-1.x86_64.rpm").exists())
-
-    def test_no_src_preserves_partial_download_on_failure(self):
-        args = mod.parse_args(self.argv + ["--no-src"])
-        (self.downloads / "logs").mkdir(parents=True)
-        bdir = self.downloads / "demo-1-1"
-        bdir.mkdir()
-        source = bdir / "demo-1-1.src.rpm"
-        source.write_text("partial source")
-        with patch.object(mod, "run", return_value=(1, "download failed")), \
-                contextlib.redirect_stdout(io.StringIO()):
-            result = mod.fetch_one("demo-1-1", args)
-        self.assertFalse(result.ok)
-        self.assertTrue(source.exists())
+        with patch.object(mod, "run", side_effect=download), \
+                patch.object(mod, "test_one") as test:
+            self.assertEqual(self.run_main("--no-src"), 1)
+        test.assert_not_called()
+        record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
+        self.assertEqual(record["status"], "fetch-fail")
+        self.assertIn("no RPMs matching", record["signature"])
+        self.assertEqual(list(self.downloads.glob(".build-*")), [])
 
 
 class TestProgressTests(RunnerTestCase):
@@ -1765,7 +1605,7 @@ class TestProgressTests(RunnerTestCase):
                                  (estimate, f"; payload {size}; RPM pending; input 4 KiB"))
 
     def test_only_heartbeats_show_stage_sizes(self):
-        args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
+        args = mod.parse_args(self.argv + ["--heartbeat", "1"])
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)
         rpm.write_bytes(b"x" * 2048)
@@ -1831,7 +1671,7 @@ class TestProgressTests(RunnerTestCase):
                              for call in tree_bytes.call_args_list), 2)
 
     def test_reunpack_estimates_without_batch_counter_or_repack_heartbeat(self):
-        args = mod.parse_args(self.argv + ["--keep", "--heartbeat", "1"])
+        args = mod.parse_args(self.argv + ["--heartbeat", "1"])
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)
         rpm.write_bytes(b"x" * 2048)
@@ -1898,7 +1738,6 @@ class ListingEncodingTests(RunnerTestCase):
     def test_listings_are_compared_and_saved_without_lossy_decoding(self):
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)
-        rpm.write_text("original rpm")
         (self.downloads / "logs").mkdir()
         work = rpm.parent / ".tarpm-demo-1-1.noarch"
         for original, repacked in ((b"name-\xff\n", b"name-\xff\n"),
@@ -1906,17 +1745,24 @@ class ListingEncodingTests(RunnerTestCase):
                                    (b"name-\\xff\n", b"name-\xff\n")):
             with self.subTest(original=original, repacked=repacked):
                 listings = iter((original, repacked))
+                rpm.write_text("original rpm")
+
+                def cleanup(directory):
+                    self.assertEqual((work / "list-orig.txt").read_bytes(), original)
+                    self.assertEqual((work / "list-repacked.txt").read_bytes(), repacked)
+                    shutil.rmtree(directory)
 
                 def command(cmd, **kwargs):
                     return (0, next(listings)) if cmd[1] == "-t" else (0, "")
 
                 with patch.object(mod, "run", side_effect=command), \
+                        patch.object(mod, "remove_tree", side_effect=cleanup), \
                         contextlib.redirect_stdout(io.StringIO()):
-                    result = mod.test_one(rpm, mod.parse_args(self.argv + ["--keep"]))
+                    result = mod.test_one(rpm, mod.parse_args(self.argv))
                 self.assertTrue(result.ok)
                 self.assertEqual(result.warning, "content-diff" if original != repacked else None)
-                self.assertEqual((work / "list-orig.txt").read_bytes(), original)
-                self.assertEqual((work / "list-repacked.txt").read_bytes(), repacked)
+                self.assertFalse(work.exists())
+                self.assertFalse(rpm.exists())
                 if original != repacked:
                     self.assertIn("\\xff", result.log.read_text())
 
@@ -1937,10 +1783,10 @@ class ListingEncodingTests(RunnerTestCase):
         self.assertEqual(result.exit_code, 9)
         self.assertEqual(result.signature, "invalid \\xff")
         self.assertIn("invalid \\xff", result.log.read_text())
-        self.assertTrue(rpm.exists())
+        self.assertFalse(rpm.exists())
 
 
-class ArtifactRetentionTests(RunnerTestCase):
+class ArtifactCleanupTests(RunnerTestCase):
     def test_passing_test_removes_readonly_payload_directories(self):
         rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
         rpm.parent.mkdir(parents=True)
@@ -1994,57 +1840,40 @@ class ArtifactRetentionTests(RunnerTestCase):
         self.assertEqual(outside.stat().st_mode & 0o777, 0o555)
         self.assertEqual((outside / "keep").read_text(), "external data")
 
-    def test_persistent_cleanup_failure_retains_rpm_log_and_test_timings(self):
-        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
-        rpm.parent.mkdir(parents=True)
-        rpm.write_text("original rpm")
-
+    def test_persistent_cleanup_failure_preserves_log_and_timings(self):
         def command(cmd, cwd=None, **kwargs):
             if cmd[1] == "download-build":
-                (cwd / rpm.name).write_bytes(b"downloaded RPM")
+                (cwd / "demo-1-1.noarch.rpm").write_bytes(b"downloaded RPM")
             return 0, "listing\n"
 
-        for mode in ([], ["--test-only"]):
-            work = rpm.parent / ".tarpm-demo-1-1.noarch"
-            if work.exists():
-                shutil.rmtree(work)
-            with self.subTest(mode=mode), \
-                    patch.object(mod.shutil, "which", return_value="/fake/tool"), \
-                    patch.object(mod, "run", side_effect=command), \
-                    patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")):
-                # Each attempt starts without an old work dir so the failure
-                # occurs after all tarpm commands, during final cleanup.
-                path = self.root / "cleanup.json"
-                self.assertEqual(self.run_main(*mode, "--json", str(path)), 1)
-                result = json.loads(path.read_text())["test"][0]
-                self.assertEqual(result["stage"], "cleanup")
-                self.assertEqual(len(result["stage_seconds"]), 5)
-                self.assertIn("cannot remove test work directory", result["signature"])
-                self.assertTrue(rpm.exists())
-                self.assertIn("denied", Path(result["log"]).read_text())
-                if not mode:
-                    record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
-                    self.assertEqual(record["status"], "test-fail")
-                    self.assertEqual(record["stage"], "cleanup")
+        path = self.root / "cleanup.json"
+        with patch.object(mod, "run", side_effect=command), \
+                patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")):
+            self.assertEqual(self.run_main("--json", str(path)), 1)
+        result = json.loads(path.read_text())["test"][0]
+        self.assertEqual(result["stage"], "cleanup")
+        self.assertEqual(len(result["stage_seconds"]), 5)
+        self.assertIn("cannot clean up files", result["signature"])
+        self.assertIn("denied", Path(result["log"]).read_text())
+        record = mod.read_journal(self.downloads / "journal.jsonl")["demo-1-1"]
+        self.assertEqual(record["status"], "test-fail")
+        self.assertEqual(record["stage"], "cleanup")
 
-    def test_warning_retains_only_log_unless_keep(self):
-        for keep in (False, True):
-            with self.subTest(keep=keep):
-                args = mod.parse_args(self.argv + (["--keep"] if keep else []))
-                rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
-                rpm.parent.mkdir(parents=True, exist_ok=True)
-                rpm.write_text("original rpm")
-                (self.downloads / "logs").mkdir(exist_ok=True)
-                outputs = [(0, ""), (0, ""), (0, ""),
-                           (0, "original list\n"), (0, "changed list\n")]
-                with patch.object(mod, "run", side_effect=outputs), \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    result = mod.test_one(rpm, args)
-                self.assertTrue(result.ok)
-                self.assertEqual(result.warning, "content-diff")
-                self.assertIn("changed list", result.log.read_text())
-                self.assertEqual(rpm.exists(), keep)
-                self.assertEqual((rpm.parent / ".tarpm-demo-1-1.noarch").exists(), keep)
+    def test_warning_retains_log_after_cleaning_artifacts(self):
+        args = mod.parse_args(self.argv)
+        rpm = self.downloads / "demo-1-1/demo-1-1.noarch.rpm"
+        rpm.parent.mkdir()
+        rpm.write_text("original rpm")
+        outputs = [(0, ""), (0, ""), (0, ""),
+                   (0, "original list\n"), (0, "changed list\n")]
+        with patch.object(mod, "run", side_effect=outputs), \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = mod.test_one(rpm, args)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.warning, "content-diff")
+        self.assertIn("changed list", result.log.read_text())
+        self.assertFalse(rpm.exists())
+        self.assertFalse((rpm.parent / ".tarpm-demo-1-1.noarch").exists())
 
     def test_retry_failed_does_not_select_unfinished_build(self):
         bdir = self.downloads / "demo-1-1"
@@ -2250,11 +2079,11 @@ class JournalInterruptTests(unittest.TestCase):
 
     def test_interrupted_run_keeps_finished_records(self):
         d = tempfile.mkdtemp(prefix="ttr-journal-")
-        listf = os.path.join(d, "nvrs.txt")
+        listf = os.path.join(d, "tag-f44.txt")
         nvrs = ["aaa-1-1.fc44", "bbb-1-1.fc44", "ccc-1-1.fc44",
                 "ddd-1-1.fc44"]
         with open(listf, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(nvrs) + "\n")
+            fh.write(mod.RPM_TAG_CACHE_HEADER + "\n".join(nvrs) + "\n")
 
         real_process_build = mod.process_build
         real_run_pool = mod.run_pool
@@ -2277,8 +2106,7 @@ class JournalInterruptTests(unittest.TestCase):
         mod.shutil.which = lambda name: "/usr/bin/fake"  # tarpm gate
         try:
             with self.assertRaises(KeyboardInterrupt):
-                mod.main(argv=["--from-file", listf, "-d", d,
-                               "--no-run-log"])
+                mod.main(argv=["-d", d, "--no-run-log"])
         finally:
             mod.process_build = real_process_build
             mod.run_pool = real_run_pool

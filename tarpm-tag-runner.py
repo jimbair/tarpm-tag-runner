@@ -2,19 +2,13 @@
 """tarpm-tag-runner — list builds in a Koji tag, fetch their RPMs, and
 run each RPM through a tarpm unpack/repack/unpack test.
 
-The default run pipelines each build — fetch, test, clean up — with -j
-builds in flight, so disk use stays bounded (passed RPMs are removed
-after their test; failures are kept).
-
-The tarpm test runs by default on every fetched RPM, including the
-source RPM (maximum coverage by default):
-  --no-test    fetch only, skip the test
-  --test-only  skip fetching, test the RPMs already downloaded
-  --no-src     skip .src.rpm; discard any sources fetched by Koji
+The runner pipelines each build — fetch, test, clean up — with -j builds
+in flight. Each build uses a fresh workspace for downloads and test files.
+The tarpm test includes source RPMs by default. Use --no-src to skip them.
 
 Only RPM builds are queried from the tag; image-only builds are excluded.
 The tag list is cached as <dir>/tag-<TAG>.txt and reused on later runs
-(--refresh re-fetches from Koji; --from-file reads an explicit list).
+unless --refresh re-fetches it from Koji. --resume uses the saved run.
 Structured results, optional JSON report, threaded fetch/test.
 
 External commands (system level, matching the CLI workflow):
@@ -29,21 +23,17 @@ Test cycle per RPM (.src.rpm included by default; --no-src to skip):
   4. tarpm -t on both + compare                      content check (warning;
      a listing that fails to generate is a failed stage)
 
-After a clean pass the work dir, the original RPM, and the test log are
-removed. A failure keeps the RPM, work dir, and log for inspection; a pass
-with a warning keeps the log (the only copy of the content diff). --keep
-retains everything for passing RPMs as well.
+Downloads and test work files are discarded when a build finishes, including
+after a failure. The journal records the outcome and tarpm version, and logs
+are kept for failures and listing warnings.
 
 Ctrl+C stops gracefully: queued work is dropped, in-flight work
 finishes, the partial results are written to the report, and the exit
 status is 130 (which takes precedence over 1). External commands run in
 their own session, so they survive Ctrl+C and finish; a second Ctrl+C
-while waiting force-quits immediately and orphans the in-flight
-koji/tarpm — observed behavior is that they die on their next write to
-the now-closed output pipe, possibly leaving a truncated RPM, so do not
-trust files from a force-quit run (continue with --resume, which also
-re-downloads builds with no journal record, or delete their DIR/<NVR>/
-directories before re-running).
+while waiting force-quits immediately and can leave in-flight commands and
+their workspaces behind. --resume retries unfinished builds in fresh
+workspaces.
 
 Exit status: 0 all ok, 1 some fetches/tests failed or stdout pipe closed,
 2 usage/environment,
@@ -500,17 +490,6 @@ def validate_nvr(nvr: str) -> None:
                          "(expected name-version-release, without paths)")
 
 
-def build_dir(directory: str, nvr: str) -> Path:
-    """Return a build path confined to a direct child of the download root."""
-    validate_nvr(nvr)
-    root = Path(directory)
-    path = root / nvr
-    if path.is_symlink() or path.resolve().parent != root.resolve():
-        raise UsageError(f"unsafe build directory: {path} "
-                         "(must be a direct child, not a symlink)")
-    return path
-
-
 def write_tag_cache(path: Path, text: str) -> None:
     """Replace a tag snapshot only after its complete contents reach disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -534,53 +513,42 @@ def read_nvrs(args) -> tuple:
 
     Query only RPM builds using Koji's build types, not NVR patterns.
     Cache the output with a marker so old, unfiltered caches are refreshed
-    once. Explicit --from-file lists are used as supplied.
+    once.
     """
-    cache = None
-    saved = None
-    if args.from_file:
+    cache = Path(args.dir) / f"tag-{args.tag}.txt"
+    text = None
+    if cache.is_file() and not args.refresh:
         try:
-            text = Path(args.from_file).read_text()
-        except OSError as exc:
-            raise UsageError(f"cannot read --from-file input: {exc}")
-        source = f"from file ({args.from_file})"
-    else:
-        cache = Path(args.dir) / f"tag-{args.tag}.txt"
-        text = None
-        if cache.is_file() and not args.refresh:
+            text = cache.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise UsageError(f"cannot read cached tag list: {exc}") from exc
+        if text.startswith(RPM_TAG_CACHE_HEADER):
             try:
-                text = cache.read_text()
-            except OSError as exc:
-                raise UsageError(f"cannot read cached tag list: {exc}")
-            if text.startswith(RPM_TAG_CACHE_HEADER):
-                try:
-                    saved = datetime.fromtimestamp(
-                        cache.stat().st_mtime, timezone.utc).strftime(
+                saved = datetime.fromtimestamp(
+                    cache.stat().st_mtime, timezone.utc).strftime(
                         "%Y-%m-%d %H:%M:%S UTC")
-                except OSError:
-                    saved = "date unknown"
-                source = f"cached ({cache}, saved {saved})"
-            else:
-                log(f"{PROG}: refreshing cached tag list {cache}: "
-                    "RPM build-type filter missing", err=args.list)
-                text = None
-        if text is None:
-            if shutil.which("koji") is None:
-                raise UsageError("koji client not found in PATH")
-            log(f"{PROG}: fetching koji tag {args.tag}", err=args.list)
-            t0 = time.monotonic()
-            cmd = ["koji", "latest-pkg", "--all", "--type=rpm", args.tag]
-            rc, out = run(cmd,
-                          label=f"fetching koji tag {args.tag}",
-                          heartbeat=args.heartbeat, log_err=args.list)
-            elapsed = time.monotonic() - t0
-            if rc != 0:
-                log(f"{PROG}: tag {args.tag}: failed (after {elapsed:.1f}s)",
-                    err=True)
-                raise UsageError(
-                    f"'{shlex.join(cmd)}' failed (exit {rc}):\n{out}")
-            source = f"fetched from Koji ({elapsed:.1f}s)"
-            text = out
+            except OSError:
+                saved = "date unknown"
+            source = f"cached ({cache}, saved {saved})"
+        else:
+            log(f"{PROG}: refreshing cached tag list {cache}: "
+                "RPM build-type filter missing", err=args.list)
+            text = None
+    queried = text is None
+    if queried:
+        if shutil.which("koji") is None:
+            raise UsageError("koji client not found in PATH")
+        log(f"{PROG}: fetching koji tag {args.tag}", err=args.list)
+        t0 = time.monotonic()
+        cmd = ["koji", "latest-pkg", "--all", "--type=rpm", args.tag]
+        rc, text = run(cmd, label=f"fetching koji tag {args.tag}",
+                       heartbeat=args.heartbeat, log_err=args.list)
+        elapsed = time.monotonic() - t0
+        if rc != 0:
+            log(f"{PROG}: tag {args.tag}: failed (after {elapsed:.1f}s)",
+                err=True)
+            raise UsageError(f"'{shlex.join(cmd)}' failed (exit {rc}):\n{text}")
+        source = f"fetched from Koji ({elapsed:.1f}s)"
     nvrs = []
     for line in text.splitlines():
         parts = line.split()
@@ -592,26 +560,21 @@ def read_nvrs(args) -> tuple:
             continue
         validate_nvr(nvr)
         nvrs.append(nvr)
-    # Input files can repeat NVRs. Each build must have exactly one worker:
-    # duplicate workers share and delete the same RPMs and work directories.
+    # A build has one outcome per invocation even if listed more than once.
     nvrs = list(dict.fromkeys(nvrs))
-    if source.startswith("fetched"):
+    if queried:
         # Validate every NVR before replacing a usable snapshot. A failed
         # write or interrupt must never leave a trusted partial cache.
         try:
             write_tag_cache(cache, text)
         except OSError as exc:
             raise UsageError(f"cannot save cached tag list {cache}: {exc}") from exc
-    if source.startswith("cached"):
-        log(f"{PROG}: tag {args.tag}: using cached list ({len(nvrs)} packages, "
-            f"saved {saved})", err=args.list)
-    elif source.startswith("fetched"):
         log(f"{PROG}: tag {args.tag}: success ({len(nvrs)} packages "
             f"in {elapsed:.1f}s)", err=args.list)
         log(f"{PROG}: saved tag list to {cache}", err=args.list)
     else:
-        log(f"{PROG}: tag {args.tag}: list from {args.from_file} "
-            f"({len(nvrs)} packages)", err=args.list)
+        log(f"{PROG}: tag {args.tag}: using cached list ({len(nvrs)} packages, "
+            f"saved {saved})", err=args.list)
     return nvrs, source
 
 
@@ -824,7 +787,7 @@ def sort_nvrs_by_size(nvrs: list, args) -> list:
         verb = "updating" if cache else "generating"
         start = time.monotonic()
         with size_progress(args, verb, len(missing)) as done:
-            if not args.from_file and len(missing) >= SIZE_BULK_MIN:
+            if len(missing) >= SIZE_BULK_MIN:
                 builds, totals = fetch_size_metadata(
                     "listTaggedRPMS", args.tag, inherit=True, latest=True,
                     type="rpm", extra=False)
@@ -832,8 +795,8 @@ def sort_nvrs_by_size(nvrs: list, args) -> list:
                               for nvr, build_id in builds.items() if build_id in totals})
                 write_size_cache(path, cache, args.tag)
                 done[0] = sum(nvr in cache for nvr in missing)
-            # Cached snapshots and explicit files may include builds no
-            # longer latest in the tag. Resolve those exact NVRs directly.
+            # A saved selection may include builds no longer latest in the
+            # tag. Resolve those exact NVRs directly.
             pending = [nvr for nvr in missing if nvr not in cache]
             for offset in range(0, len(pending), SIZE_BATCH):
                 batch = pending[offset:offset + SIZE_BATCH]
@@ -941,10 +904,8 @@ def fetch_progress(nvr: str, pdir: Path, output: bytes | str | None,
 
 
 def fetch_one(nvr: str, args, counter: "Counter | None" = None,
-              *, download_dir: Path | None = None) -> FetchResult:
-    bdir = build_dir(args.dir, nvr)
-    pdir = download_dir if download_dir is not None else bdir
-    pdir.mkdir(parents=True, exist_ok=True)
+              *, download_dir: Path) -> FetchResult:
+    download_dir.mkdir()
     cmd = ["koji", "download-build"]
     if args.arch:
         # koji matches the requested arch exactly, which would drop the
@@ -957,7 +918,7 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None,
             cmd += ["--arch", arch]
     cmd.append(nvr)
     if args.verbose:
-        log(f"+ (cd {pdir} && {' '.join(cmd)})")
+        log(f"+ (cd {download_dir} && {' '.join(cmd)})")
     if counter is not None:
         idx = counter.next()
         counter_suffix = _progress((idx, counter.total))
@@ -966,37 +927,21 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None,
         counter_suffix = ""
         log(f"{PROG}: fetching {nvr}")
     t0 = time.monotonic()
-    rc, out = run(cmd, cwd=pdir,
+    rc, out = run(cmd, cwd=download_dir,
                   label=f"fetching {nvr}",
                   heartbeat=args.heartbeat,
                   counter_suffix=(f" (build {idx}/{counter.total})" if counter else ""),
                   progress_fn=lambda output, pid, elapsed:
-                  fetch_progress(nvr, pdir, output, elapsed))
+                  fetch_progress(nvr, download_dir, output, elapsed))
     elapsed = time.monotonic() - t0
     logfile = diagnostic_log(args, nvr, f"{nvr}.fetch.log")
-    if rc != 0 or args.keep:
-        write_diagnostic_log(logfile, out)
     if rc == 0:
-        # Koji has no exclude-source switch. Without an explicit arch
-        # filter it downloads src along with all binary arches; discard
-        # those skipped RPMs now so --no-src cannot accumulate them.
-        if args.no_src:
-            for rpm in pdir.glob("*.src.rpm"):
-                rpm.unlink()
-        n_rpms = sum(1 for p in pdir.glob("*.rpm") if p.is_file())
-        log(f"[fetch]  {nvr} ok ({n_rpms} RPMs, {human(_dir_bytes(pdir))}, "
+        n_rpms = sum(1 for p in download_dir.glob("*.rpm") if p.is_file())
+        log(f"[fetch]  {nvr} ok ({n_rpms} RPMs, {human(_dir_bytes(download_dir))}, "
             f"{fmt_duration(elapsed)})")
-        if not args.keep:
-            logfile.unlink(missing_ok=True)
     else:
+        write_diagnostic_log(logfile, out)
         log(f"[fetch]  {nvr} FAIL (exit {rc}; log: {logfile})")
-        if not args.keep:
-            try:
-                # rmdir preserves all partial downloads, hidden files,
-                # and subdirectories. Cleanup must not mask the failure.
-                pdir.rmdir()
-            except OSError:
-                pass
     return FetchResult(nvr=nvr, ok=(rc == 0), exit_code=rc, log=logfile,
                        signature="" if rc == 0 else error_signature(out),
                        duration_seconds=elapsed)
@@ -1016,10 +961,8 @@ def arch_selected(arch: str, archs: list) -> bool:
 
 
 def build_units(bdir: Path, args) -> list:
-    """RPMs in one build dir (DIR/<NVR>/), per the arch/src filters."""
+    """Downloaded RPMs matching the architecture and source filters."""
     units = []
-    if not bdir.is_dir():
-        return units
     for rpm in sorted(bdir.glob("*.rpm"), key=lambda p: p.name):
         if not rpm.is_file():
             continue
@@ -1029,46 +972,6 @@ def build_units(bdir: Path, args) -> list:
         if arch_selected(arch, args.arch):
             units.append(rpm)
     return units
-
-
-def collect_test_units(args) -> list:
-    """Build RPMs under the download dir, per the pkg/limit/arch/src filters.
-
-    The -p and -n filters apply to the build dirs (NVRs) already under
-    DIR, the same way they apply to the tag list in a fetch run.
-    """
-    root = Path(args.dir)
-    if not root.is_dir():
-        return []
-
-    def eligible_builds():
-        directories = root.iterdir()
-        if not args.sort:
-            directories = sorted(directories, key=lambda path: path.name)
-        for directory in directories:
-            if not directory.is_dir() or directory.name == "logs":
-                continue
-            if args.pkg and not select_nvrs([directory.name], args.pkg):
-                continue
-            rpms = build_units(build_dir(args.dir, directory.name), args)
-            if rpms:
-                yield directory.name, rpms
-
-    builds = eligible_builds()
-    if args.sort:
-        direction = -1 if args.sort == "desc" else 1
-
-        def size_key(build):
-            nvr, rpms = build
-            return direction * sum(rpm.stat().st_size for rpm in rpms), nvr
-
-        try:
-            builds = sorted(builds, key=size_key)
-        except OSError as exc:
-            raise UsageError(f"cannot measure local build sizes: {exc}") from exc
-    if args.limit:
-        builds = itertools.islice(builds, min(args.limit, sys.maxsize))
-    return [rpm for _, rpms in builds for rpm in rpms]
 
 
 def remove_tree(path: Path) -> None:
@@ -1105,9 +1008,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     nvr = rpm.parent.name
     arch = base.rsplit(".", 1)[-1]
     work = rpm.parent / f".tarpm-{base}"
-    if work.exists():
-        remove_tree(work)
-    work.mkdir(parents=True)
+    work.mkdir()
     test_t0 = time.monotonic()
 
     # Key the log name on the RPM basename so subpackages of one build
@@ -1230,22 +1131,20 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     duration = time.monotonic() - test_t0
     buf.append("timings: " + ", ".join(f"{name}={seconds:.3f}s"
                                        for name, seconds in stage_seconds.items()))
-    if not ok or warning or args.keep:
-        write_diagnostic_log(logfile, "\n".join(buf) + "\n")
-
     cleanup_error = None
-    if ok and not args.keep:
-        try:
-            remove_tree(work)
-        except OSError as exc:
-            # Keep the original and its log so recovery can retry cleanup
-            # and the build cannot be journaled as a completed pass.
+    try:
+        remove_tree(work)
+        rpm.unlink(missing_ok=True)
+    except OSError as exc:
+        cleanup_error = repr(exc)
+        message = f"cannot clean up files for {rpm}: {exc}"
+        buf.append(message)
+        if ok:
             ok = False
             failed_stage = "cleanup"
-            failed_out = f"cannot remove test work directory {work}: {exc}"
-            cleanup_error = repr(exc)
-            buf.append(failed_out)
-            write_diagnostic_log(logfile, "\n".join(buf) + "\n")
+            failed_out = message
+    if not ok or warning:
+        write_diagnostic_log(logfile, "\n".join(buf) + "\n")
 
     res = TestResult(rpm=str(rpm), nvr=nvr, arch=arch, ok=ok,
                      stage=failed_stage, exit_code=failed_rc,
@@ -1262,80 +1161,53 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     else:
         log(f"[test]   {base} ok{tail}")
 
-    # On success drop the work dir and the original RPM unless --keep was
-    # requested. The test log goes with them on a clean pass; it is kept
-    # when it records something to investigate — a failure (commands and
-    # output) or a warning (the only copy of the content diff).
-    if ok and not args.keep:
-        rpm.unlink(missing_ok=True)
-        if not warning:
-            logfile.unlink(missing_ok=True)
     return res
 
 
 def process_build(nvr: str, args, fetch_counter=None) -> tuple:
-    """One build, start to finish: fetch, tarpm-test its RPMs, clean up.
-
-    Keeps disk use bounded: each build's RPMs are present only from the
-    download until its tests finish. Passing RPMs are removed (unless
-    --keep); a build whose RPMs all passed is removed entirely. Failures
-    keep their RPMs and work dirs.
-    """
-    bdir = build_dir(args.dir, nvr)
-    staging = None
-    if any(bdir.glob("*.rpm")):
-        # Koji leaves unrelated files in its working directory. Isolate the
-        # download before identifying its RPMs or replacing a retained copy.
-        staging = Path(tempfile.mkdtemp(prefix=".download-", dir=bdir))
-    fetch = fetch_one(nvr, args, fetch_counter, download_dir=staging)
-    if not fetch.ok:
-        # A failed or partial download is not valid test input; the RPMs
-        # and the fetch log are kept for inspection and can be tested
-        # later with --test-only.
-        return fetch, []
-    units = build_units(staging if staging is not None else bdir, args)
-    if staging is not None:
-        for rpm in staging.glob("*.rpm"):
-            if rpm.is_file():
-                rpm.replace(bdir / rpm.name)
-        if not any(staging.iterdir()):
-            staging.rmdir()
-        units = [bdir / rpm.name for rpm in units]
-    total = len(units)
-    tests = []
-    for i, rpm in enumerate(units, start=1):
+    """Fetch and test one build in a workspace unique to this attempt."""
+    validate_nvr(nvr)
+    scratch = Path(tempfile.mkdtemp(prefix=".build-", dir=args.dir))
+    try:
+        download_dir = scratch / nvr
+        fetch = fetch_one(nvr, args, fetch_counter, download_dir=download_dir)
+        if not fetch.ok:
+            return fetch, []
+        units = build_units(download_dir, args)
+        if not units:
+            message = "download contains no RPMs matching the selected filters"
+            log(f"{PROG}: {nvr}: {message}", err=True)
+            return FetchResult(nvr, False, error=message, signature=message,
+                               duration_seconds=fetch.duration_seconds), []
+        total = len(units)
+        tests = []
+        for index, rpm in enumerate(units, start=1):
+            try:
+                tests.append(test_one(rpm, args, progress=(index, total)))
+            except Exception as exc:
+                # Keep testing the build's other RPMs after a local error.
+                log(f"{PROG}: error testing {rpm}: {exc}{_progress((index, total))}",
+                    err=True)
+                tests.append(TestResult(
+                    rpm=str(rpm), nvr=nvr, arch=rpm.stem.rsplit(".", 1)[-1],
+                    ok=False, stage="exception", error=repr(exc)))
+        return fetch, tests
+    finally:
         try:
-            tests.append(test_one(rpm, args, progress=(i, total)))
-        except Exception as exc:
-            # A runner-side exception (e.g. disk full) is a failure for
-            # this RPM only: the fetch itself succeeded, so record it as
-            # a test failure and keep testing the rest.
-            base = rpm.name[:-4] if rpm.name.endswith(".rpm") else rpm.name
-            log(f"{PROG}: error testing {rpm}: {exc}{_progress((i, total))}",
+            remove_tree(scratch)
+        except OSError as exc:
+            log(f"{PROG}: warning: could not remove build workspace {scratch}: {exc}",
                 err=True)
-            tests.append(TestResult(
-                rpm=str(rpm), nvr=nvr,
-                arch=base.rsplit(".", 1)[-1],
-                ok=False, stage="exception", error=repr(exc)))
-    if not args.keep and bdir.is_dir() and not any(bdir.iterdir()):
-        bdir.rmdir()
-    return fetch, tests
 
 
 def _force_quit(signum, frame) -> None:
     """Second Ctrl+C: die immediately, no cleanup (os._exit).
 
-    In-flight external commands (koji/tarpm) run in their own sessions,
-    so they are orphaned: observed behavior is that they die on their
-    next write to the now-closed output pipe (BrokenPipeError), which
-    can leave a truncated RPM — do not trust files from a force-quit.
+    External commands run in their own sessions and may outlive the runner.
     """
-    msg = (f"{PROG}: force-quit; in-flight koji/tarpm are orphaned and "
-           f"typically die on their next write to the closed pipe, "
-           f"possibly leaving a truncated RPM. Do not trust files from "
-           f"a force-quit run: continue with --resume (which re-downloads "
-           f"unfinished builds too), or delete their DIR/<NVR>/ directories "
-           f"before re-running")
+    msg = (f"{PROG}: force-quit; in-flight commands and temporary build "
+           f"workspaces may remain. Use --resume to retry unfinished builds "
+           f"in fresh workspaces")
     # A signal may interrupt a log write while its lock is held. Never use
     # RUNLOG or buffered stderr here; even a full stderr pipe must not
     # prevent the second Ctrl+C from terminating the process.
@@ -1677,7 +1549,7 @@ def write_report(args, fetch: list | None, test: list | None,
         A(f"arches:    {', '.join(args.arch) if args.arch else 'all'} "
           f"(includes noarch; source RPMs {'excluded' if args.no_src else 'included'})")
         A(f"filters:   packages={', '.join(args.pkg) or 'all'}; limit={args.limit or 'none'}; "
-          f"resume={args.resume}; retry-failed={args.retry_failed}; keep={args.keep}")
+          f"resume={args.resume}; retry-failed={args.retry_failed}")
         if args.sort:
             A(f"sort:      {args.sort} (selected RPM bytes per build)")
         system = session['system']
@@ -1685,8 +1557,7 @@ def write_report(args, fetch: list | None, test: list | None,
           f"Python {system['python']}")
         info = session['tarpm']
         if info is None:
-            A("tarpm:     not used (" +
-              ("fetch only)" if args.no_test else "no tests this invocation)"))
+            A("tarpm:     not used (no tests this invocation)")
         else:
             A(f"tarpm:     {package_label(info)} (RPM package" +
               ("; this invocation)" if run else ")"))
@@ -1723,13 +1594,6 @@ def write_report(args, fetch: list | None, test: list | None,
         A(f"warnings: {len(test_warn)}")
         if test:
             A(f"failure rate: {100 * len(test_failed) / len(test):.1f}% of tested RPMs")
-        if session and 'selected_rpms' in session:
-            A(f"selected: {session['selected_rpms']} RPM(s); completed: {len(test)}")
-        if not args.keep:
-            removed = (session['summary']['test']['ok'] if run and session
-                       else len(test) - len(test_failed))
-            A(f"removed:  {removed} passed RPM(s) "
-              f"({'this invocation; ' if run else ''}failures kept)")
     A(f"downloads: {args.dir}")
     A(f"run log:   {args.run_log if args.run_log else '- (disabled)'}")
 
@@ -2069,8 +1933,8 @@ def read_journal(path: str, run_id: str | None = None) -> dict:
 def build_outcome(fetch: FetchResult, tests: list) -> dict:
     """Summarize a build from its fetch and RPM results."""
     outcome = {
-        # Fetch-only runs (and builds with no selected test RPMs) must
-        # remain eligible for testing by a subsequent --resume.
+        # Current-format records from earlier fetch-only runs remain
+        # eligible for testing by a subsequent --resume.
         "status": "pass" if tests else "fetched",
         "stage": "",
         "exit_code": None,
@@ -2208,7 +2072,7 @@ def cumulative_results(manifest: dict, previous: dict, current: list,
 
 
 # ---------------------------------------------------------------------------
-# failure lists (plain NVR files under DIR/logs, feedable to --from-file)
+# failure lists (plain NVR files under DIR/logs)
 # ---------------------------------------------------------------------------
 
 FAILURE_LIST_STAGES = frozenset({
@@ -2257,8 +2121,7 @@ def write_failure_lists(args, fetch: list | None, test: list | None) -> None:
 
     Called whenever the report is written. Each list is one build NVR
     per line — sorted, deduplicated, no header lines, each optionally
-    followed by '  # detail' — so a list can be fed straight back to
-    --from-file. Files:
+    followed by '  # detail'. Files:
       failed-all.txt           every build with a fetch or test failure
       failed-fetch.txt         the fetch failures
       failed-<stage>.txt       one per failing stage (e.g. failed-repack.txt)
@@ -2386,10 +2249,9 @@ def parse_args(argv) -> argparse.Namespace:
                     "tarpm-test each one.",
         epilog="examples:\n"
                "  %(prog)s --list -t f44 -p 7zip              # list the NVRs that would be fetched\n"
-               "  %(prog)s -t f44 -j 4 -p 7zip -p 389-ds-base # test runs by default\n"
-               "  %(prog)s -t f44 -j 4 -p 7zip --no-test      # fetch only\n"
+               "  %(prog)s -t f44 -j 4                      # test the tag\n"
                "  %(prog)s -t f44 -j 4 -p 7zip --no-src       # skip .src.rpm\n"
-               "  %(prog)s --test-only -a x86_64 -j 8\n",
+               "  %(prog)s -t f44 -j 4 --resume             # retry unfinished builds\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # fetch
@@ -2409,34 +2271,19 @@ def parse_args(argv) -> argparse.Namespace:
                          "asc for smallest first, desc for largest first")
     ap.add_argument("--list", action="store_true",
                     help="print the NVRs that would be fetched and exit "
-                         "without downloading (incompatible with --test-only)")
-    ap.add_argument("--from-file", metavar="FILE",
-                    help="read the NVR list from FILE (same format as "
-                         "'koji latest-pkg --all --type=rpm TAG'; blank "
-                         "lines and '#' comments ignored) instead of the "
-                         "cached list or Koji; used as supplied without "
-                         "build-type filtering")
+                         "without downloading")
     ap.add_argument("--refresh", action="store_true",
                     help="re-fetch the tag list from Koji, even if a "
                          "cached copy (DIR/tag-<TAG>.txt) exists")
     # test
-    ap.add_argument("--no-test", dest="no_test", action="store_true",
-                    help="fetch only; skip the tarpm test phase")
-    ap.add_argument("--test-only", action="store_true",
-                    help="skip fetching; test the RPMs already in DIR")
     ap.add_argument("--no-src", dest="no_src", action="store_true",
-                    help="skip testing .src.rpm files and discard sources "
-                         "after a successful fetch (tested by default)")
-    ap.add_argument("--keep", action="store_true",
-                    help="keep per-RPM work dirs, logs, and original RPMs "
-                         "even for passing RPMs (default: passing RPMs and "
-                         "work dirs removed; warning logs retained)")
+                    help="skip testing .src.rpm files (tested by default)")
     # common
     ap.add_argument("-u", "--update", action="store_true",
                     help="replace this script with the latest version from "
                          "GitHub main and exit; use on its own")
     ap.add_argument("-d", "--dir", default="rpms",
-                    help="download directory (default: ./rpms)")
+                    help="run state and temporary workspace directory (default: ./rpms)")
     ap.add_argument("-r", "--report",
                     help="report file (default: ./report.txt)")
     ap.add_argument("--run-log", metavar="FILE",
@@ -2456,8 +2303,7 @@ def parse_args(argv) -> argparse.Namespace:
                          "passes/warnings and rebuilding cumulative reports")
     ap.add_argument("--retry-failed", action="store_true",
                     help="re-run only the builds whose latest journal "
-                         "record is fetch-fail or test-fail; each starts "
-                         "from a clean DIR/<NVR>/. Default report: "
+                         "record is fetch-fail or test-fail. Default report: "
                          "report-retry-YYYYmmdd-HHMMSS.txt")
     ap.add_argument("--json", metavar="FILE",
                     help="also write the results as JSON to FILE")
@@ -2480,26 +2326,12 @@ def parse_args(argv) -> argparse.Namespace:
         ap.error("-n/--limit expects a non-negative integer")
     if args.heartbeat < 0:
         ap.error("--heartbeat expects a non-negative integer")
-    if args.no_test and args.test_only:
-        ap.error("--no-test is incompatible with --test-only")
     if args.compare and args.list:
         ap.error("--compare is incompatible with --list")
-    if args.list and args.test_only:
-        ap.error("--list is incompatible with --test-only")
-    if args.refresh and args.from_file:
-        ap.error("--refresh is incompatible with --from-file")
     if args.resume and args.retry_failed:
         ap.error("--resume and --retry-failed are mutually exclusive")
-    if args.resume or args.retry_failed:
-        if args.test_only:
-            ap.error("--resume/--retry-failed cannot be combined with "
-                     "--test-only")
-        if args.refresh:
-            ap.error("--resume/--retry-failed cannot be combined with "
-                     "--refresh")
-        if args.no_test:
-            ap.error("--resume/--retry-failed cannot be combined with "
-                     "--no-test")
+    if (args.resume or args.retry_failed) and args.refresh:
+        ap.error("--resume/--retry-failed cannot be combined with --refresh")
     if args.report is None:
         args.report = (f"report-retry-"
                        f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.txt"
@@ -2535,8 +2367,6 @@ def validate_output_paths(args) -> None:
     logdir = root / "logs"
     protected = [root, logdir, root / "run.json", root / "journal.jsonl",
                  root / "build-sizes.json", root / f"tag-{args.tag}.txt"]
-    if args.from_file:
-        protected.append(Path(args.from_file))
     used = {key: path for path in protected for key in path_keys(path)}
     canonical_logdir = path_keys(logdir)[0]
     for option, path in outputs:
@@ -2589,306 +2419,172 @@ def main(argv=None) -> int:
         return 2
     if args.run_log:
         RUNLOG.open(args.run_log)
-    # One header per invocation (a no-op when the run log is disabled);
-    # argv identifies exactly which command produced the following lines.
     RUNLOG.write(f"=== {PROG} start {now_utc()}: {' '.join(sys.argv)} ===")
-    do_fetch = not args.test_only
-    # The tarpm test is the default; opt out with --no-test.
-    do_test = args.test_only or (not args.no_test)
-    if args.test_only and not Path(args.dir).is_dir():
-        log(f"{PROG}: error: --test-only: no download directory to test: "
-              f"{args.dir}", err=True)
+
+    root = Path(args.dir)
+    manifest_path = root / "run.json"
+    journal_path = str(root / "journal.jsonl")
+    manifest = None
+    latest = {}
+    previous_results = {}
+    try:
+        if args.resume:
+            manifest = read_run_manifest(manifest_path)
+            context = manifest["context"]
+            settings = context["settings"]
+            if (context["tag"] != args.tag
+                    or sorted(settings["architectures"]) != sorted(args.arch)
+                    or settings["include_source"] != (not args.no_src)):
+                raise UsageError("resume requires the original tag, architecture, "
+                                 "and source settings; start a fresh run to change them")
+            nvrs = list(dict.fromkeys(manifest["nvrs"]))
+            tag_source = f"saved run ({manifest_path})"
+            latest = read_journal(journal_path, run_id=manifest["run_id"])
+            previous_results = {nvr: (rec, *saved_build_results(rec))
+                                for nvr, rec in latest.items()}
+        else:
+            nvrs, tag_source = read_nvrs(args)
+            if args.retry_failed:
+                latest = read_journal(journal_path)
+    except UsageError as exc:
+        log(f"{PROG}: error: {exc}", err=True)
+        return 2
+    if not nvrs:
+        log(f"{PROG}: error: no builds found (empty package list for tag {args.tag})",
+            err=True)
+        return 2
+    selected = select_nvrs(nvrs, args.pkg)
+    if not selected:
+        log(f"{PROG}: error: no builds matched the -p filters: "
+            f"{' '.join(args.pkg)}", err=True)
         return 2
 
-    if args.test_only and shutil.which("tarpm") is None:
-        log(f"{PROG}: error: tarpm not found in PATH (needed for the "
-              f"test phase; use --no-test to fetch only)", err=True)
-        return 2
+    passed = {nvr for nvr, rec in latest.items() if rec["status"] in ("pass", "warn")}
+    failed = {nvr for nvr, rec in latest.items() if rec["status"] in ("fetch-fail", "test-fail")}
+    eligible = selected
+    if args.resume:
+        eligible = [nvr for nvr in selected if nvr not in passed]
+    elif args.retry_failed:
+        eligible = [nvr for nvr in selected if nvr in failed]
+    # Sorting precedes -n and journal filtering. A no-op recovery needs no sizes.
+    if args.sort and eligible:
+        if not (args.list or args.resume or args.retry_failed) and shutil.which("koji") is None:
+            log(f"{PROG}: error: koji client not found in PATH", err=True)
+            return 2
+        try:
+            selected = sort_nvrs_by_size(selected, args)
+        except UsageError as exc:
+            log(f"{PROG}: error: {exc}", err=True)
+            return 2
+    if args.limit > 0:
+        selected = selected[:args.limit]
+    if args.retry_failed:
+        selected = [nvr for nvr in selected if nvr in failed]
+        if not selected:
+            log(f"{PROG}: nothing to do: no failed builds in {journal_path}", err=args.list)
+            return 0
+        try:
+            for nvr in selected:
+                saved_build_results(latest[nvr])
+        except UsageError as exc:
+            log(f"{PROG}: error: {exc}", err=True)
+            return 2
+    if args.resume:
+        before = len(selected)
+        selected = [nvr for nvr in selected if nvr not in passed]
+        log(f"{PROG}: resume: skipping {before - len(selected)} of "
+            f"{before} build(s) already passed (journal: {journal_path})", err=args.list)
+        if not selected:
+            log(f"{PROG}: nothing to do: no pending builds in this selection "
+                f"(journal: {journal_path})", err=args.list)
+
+    if args.list:
+        for nvr in selected:
+            print(nvr)
+        log(f"{PROG}: {len(selected)} build(s) selected from tag {args.tag}", err=True)
+        return 0
+
+    if selected:
+        for command, description in (("koji", "koji client"), ("tarpm", "tarpm")):
+            if shutil.which(command) is None:
+                log(f"{PROG}: error: {description} not found in PATH", err=True)
+                return 2
+        try:
+            (root / "logs").mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log(f"{PROG}: error: cannot prepare diagnostic directory: {exc}", err=True)
+            return 2
 
     session = {
         "id": uuid.uuid4().hex,
         "started": started,
         "command": [sys.executable, str(Path(__file__).resolve()),
                     *(argv if argv is not None else sys.argv[1:])],
-        "mode": "test-only" if args.test_only else "fetch-and-test" if do_test else "fetch-only",
+        "mode": "fetch-and-test",
         "settings": {"jobs": args.jobs, "architectures": args.arch,
                      "include_source": not args.no_src, "packages": args.pkg,
                      "limit": args.limit, "sort": args.sort,
-                     "keep": args.keep, "resume": args.resume,
-                     "retry_failed": args.retry_failed},
+                     "resume": args.resume, "retry_failed": args.retry_failed},
         "system": {"system": platform.system(), "release": platform.release(),
                    "machine": platform.machine(), "python": platform.python_version()},
-        "tarpm": None,
+        "tarpm": tarpm_package_info() if selected else None,
     }
     args.attempt_id = session["id"]
+    total_selected = len(selected)
+    attempt = {'id': session['id'], 'started': session['started'],
+               'tarpm': package_label(session['tarpm']) if session['tarpm'] else None,
+               'selected_builds': total_selected, 'tag': args.tag,
+               'settings': {'architectures': args.arch, 'include_source': not args.no_src}}
 
-    tag_source = None
-    fetch_results: list = []
-    test_results: list = []
-    interrupted = False
-    total_selected = 0
-    manifest = None
-    run_id = None
-    latest = {}
-    current_records = []
-    previous_results = {}
-    run = None
-    if do_fetch:
-        manifest_path = Path(args.dir) / "run.json"
-        journal_path = str(Path(args.dir) / "journal.jsonl")
+    if manifest is None:
         try:
-            if args.resume:
-                manifest = read_run_manifest(manifest_path)
-                run_id = manifest["run_id"]
-                context = manifest["context"]
-                settings = context["settings"]
-                if (context["tag"] != args.tag
-                        or sorted(settings["architectures"]) != sorted(args.arch)
-                        or settings["include_source"] != (not args.no_src)):
-                    raise UsageError("resume requires the original tag, architecture, "
-                                     "and source settings; start a fresh run to change them")
-            if manifest is not None and not args.from_file:
-                nvrs = list(dict.fromkeys(manifest["nvrs"]))
-                tag_source = f"saved run ({manifest_path})"
-            else:
-                nvrs, tag_source = read_nvrs(args)
-        except UsageError as exc:
-            log(f"{PROG}: error: {exc}", err=True)
+            manifest = write_run_manifest(manifest_path, selected, uuid.uuid4().hex,
+                                          context={**session, 'tag': args.tag})
+        except OSError as exc:
+            log(f"{PROG}: error: cannot save run manifest: {exc}", err=True)
             return 2
-        if not nvrs:
-            log(f"{PROG}: error: no builds found (empty package list for "
-                  f"tag {args.tag})", err=True)
-            return 2
-        selected = select_nvrs(nvrs, args.pkg)
-        if not selected:
-            log(f"{PROG}: error: no builds matched the -p filters: "
-                  f"{' '.join(args.pkg)}", err=True)
-            return 2
-        if manifest is not None and args.from_file:
-            active = set(manifest["nvrs"])
-            selected = [nvr for nvr in selected if nvr in active]
-        if args.resume:
-            latest = read_journal(journal_path, run_id=run_id)
-            try:
-                previous_results = {nvr: (rec, *saved_build_results(rec))
-                                    for nvr, rec in latest.items()}
-            except UsageError as exc:
-                log(f"{PROG}: error: {exc}", err=True)
-                return 2
-        elif args.retry_failed:
-            latest = read_journal(journal_path)
+    run_id = manifest["run_id"]
 
-        # Avoid all size-cache/network work when recovery has nothing left.
-        # Sorting otherwise precedes -n, which still precedes journal filters.
-        eligible = selected
-        if args.resume:
-            eligible = [n for n in selected
-                        if latest.get(n, {}).get("status") not in ("pass", "warn")]
-        elif args.retry_failed:
-            eligible = [n for n in selected
-                        if latest.get(n, {}).get("status") in ("fetch-fail", "test-fail")]
-        if args.sort and eligible:
-            # For a fresh run a nonempty sort stays nonempty after -n.
-            # Recovery may become a no-op once we know the sorted prefix.
-            if not (args.list or args.resume or args.retry_failed) and shutil.which("koji") is None:
-                log(f"{PROG}: error: koji client not found in PATH", err=True)
-                return 2
-            try:
-                selected = sort_nvrs_by_size(selected, args)
-            except UsageError as exc:
-                log(f"{PROG}: error: {exc}", err=True)
-                return 2
-        if args.limit > 0:
-            selected = selected[:args.limit]
-        if args.retry_failed:
-            # Select the builds whose latest journal record is a failure;
-            # -p and -n above have already shaped the candidate list.
-            failed = {n for n, r in latest.items()
-                      if r.get("status") in ("fetch-fail", "test-fail")}
-            selected = [n for n in selected if n in failed]
-            if not selected:
-                log(f"{PROG}: nothing to do: no failed builds in "
-                      f"{journal_path}", err=args.list)
-                return 0
-            try:
-                for nvr in selected:
-                    saved_build_results(latest[nvr])
-            except UsageError as exc:
-                log(f"{PROG}: error: {exc}", err=True)
-                return 2
-
-        if args.resume:
-            # Only passes from this run can satisfy its selection. Older
-            # successes must not hide unfinished or queued re-test attempts.
-            before = len(selected)
-            selected = [n for n in selected
-                        if latest.get(n, {}).get("status")
-                        not in ("pass", "warn")]
-            log(f"{PROG}: resume: skipping {before - len(selected)} of "
-                  f"{before} build(s) already passed (journal: "
-                  f"{journal_path})", err=args.list)
-            if not selected:
-                log(f"{PROG}: nothing to do: no pending builds in this selection "
-                      f"(journal: {journal_path})", err=args.list)
-
-        if args.list:
-            for nvr in selected:
-                print(nvr)
-            log(f"{PROG}: {len(selected)} build(s) selected from tag "
-                  f"{args.tag}", err=True)
-            return 0
-
-        # Cached and explicit build lists bypass read_nvrs' query-time
-        # executable check. Fail once before changing the active run or
-        # journal, while still allowing offline lists and empty recovery.
-        if selected and shutil.which("koji") is None:
-            log(f"{PROG}: error: koji client not found in PATH", err=True)
-            return 2
-        if selected and do_test:
-            if shutil.which('tarpm') is None:
-                log(f"{PROG}: error: tarpm not found in PATH (needed for the "
-                    "test phase; use --no-test to fetch only)", err=True)
-                return 2
-            session['tarpm'] = tarpm_package_info()
-
-        attempt = {'id': session['id'], 'started': session['started'],
-                   'tarpm': package_label(session['tarpm']) if session['tarpm'] else None,
-                   'selected_builds': len(selected), 'tag': args.tag,
-                   'settings': {'architectures': args.arch, 'include_source': not args.no_src}}
-
-        if manifest is None:
-            run_id = uuid.uuid4().hex
-            try:
-                manifest = write_run_manifest(
-                    manifest_path, selected, run_id,
-                    context={**session, 'tag': args.tag})
-            except OSError as exc:
-                log(f"{PROG}: error: cannot save run manifest: {exc}", err=True)
-                return 2
-
-        if selected:
-            (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
-            # One detailed record per finished build; --test-only records nothing.
-            JOURNAL.open(journal_path)
-        total_selected = len(selected)
+    results = []
+    interrupted = False
+    if selected:
+        JOURNAL.open(journal_path)
+        log(f"{PROG}: fetching and testing {total_selected} build(s) "
+            f"from tag {args.tag} (parallelism: {args.jobs})")
+        fetch_counter = Counter(total_selected)
 
         def record(fetch, tests):
-            rec = journal_record(fetch.nvr, fetch, tests, run_id=run_id, attempt=attempt)
-            JOURNAL.append(rec)
-            return rec
+            result = journal_record(fetch.nvr, fetch, tests, run_id, attempt)
+            JOURNAL.append(result)
+            return fetch, tests, result
+
+        def work(nvr):
+            fetch, tests = process_build(nvr, args, fetch_counter)
+            return record(fetch, tests)
 
         def fail(nvr, exc):
-            # A worker exception is journaled like a fetch failure so
-            # --retry-failed can pick the build up again.
-            fetch = FetchResult(nvr=nvr, ok=False, error=repr(exc),
-                                signature=error_signature(repr(exc)))
-            record(fetch, [])
-            return fetch
+            error = repr(exc)
+            return record(FetchResult(nvr, False, error=error,
+                                      signature=error_signature(error)), [])
 
-        if do_test and selected:
-            # Default: pipeline per build — fetch, test, clean up — with
-            # -j builds in flight, so disk use stays bounded to the builds
-            # in flight plus the failures.
-            log(f"{PROG}: fetching and testing {len(selected)} build(s) "
-                  f"from tag {args.tag} (parallelism: {args.jobs})")
-            fetch_counter = Counter(len(selected))
+        results, interrupted = run_pool(work, selected, args.jobs, on_error=fail)
 
-            def work(nvr):
-                # Both recovery modes need a fresh download. If cleanup
-                # fails, fail this build rather than reuse untrusted RPMs.
-                if args.retry_failed or args.resume:
-                    bdir = build_dir(args.dir, nvr)
-                    if bdir.exists():
-                        remove_tree(bdir)
-                fetch, tests = process_build(nvr, args, fetch_counter)
-                # Journal the build as it finishes, so a run that is
-                # interrupted or crashes still records what completed.
-                record(fetch, tests)
-                return fetch, tests
-
-            results, interrupted = run_pool(
-                work, selected, args.jobs,
-                on_error=lambda nvr, exc: (fail(nvr, exc), []))
-            for fetch, tests in results:
-                fetch_results.append(fetch)
-                test_results.extend(tests)
-        elif selected:
-            log(f"{PROG}: fetching {len(selected)} build(s) from tag "
-                  f"{args.tag} (parallelism: {args.jobs})")
-            fetch_counter = Counter(len(selected))
-
-            def fetch_worker(nvr):
-                result = fetch_one(nvr, args, fetch_counter)
-                record(result, [])
-                return result
-
-            results, interrupted = run_pool(
-                fetch_worker, selected, args.jobs, on_error=fail)
-            for r in results:
-                fetch_results.append(r)
-        tests_by_build = {}
-        for tested in test_results:
-            tests_by_build.setdefault(tested.nvr, []).append(tested)
-        current_records.extend(journal_record(
-            fetched.nvr, fetched, tests_by_build.get(fetched.nvr, []),
-            run_id=run_id, attempt=attempt) for fetched in fetch_results)
-    elif do_test:
-        # --test-only: test the RPMs already under DIR.
-        (Path(args.dir) / "logs").mkdir(parents=True, exist_ok=True)
-        try:
-            units = collect_test_units(args)
-        except UsageError as exc:
-            log(f"{PROG}: error: {exc}", err=True)
-            return 2
-        if not units:
-            log(f"{PROG}: error: no RPMs found to test under {args.dir}",
-                  err=True)
-            return 2
-        session['selected_rpms'] = len(units)
-        session['tarpm'] = tarpm_package_info()
-        log(f"{PROG}: testing {len(units)} RPM(s) with tarpm "
-              f"(parallelism: {args.jobs})")
-        test_counter = Counter(len(units))
-        results, interrupted = run_pool(
-            lambda rpm: test_one(rpm, args,
-                                 progress=(test_counter.next(),
-                                           test_counter.total)),
-            units, args.jobs,
-            on_error=lambda rpm, exc: TestResult(
-                rpm=str(rpm), nvr=rpm.parent.name,
-                arch=(rpm.name[:-4] if rpm.name.endswith(".rpm")
-                      else rpm.name).rsplit(".", 1)[-1],
-                ok=False, stage="exception", error=repr(exc)))
-        test_results.extend(results)
-
-        # Remove build dirs whose RPMs all passed and were removed above.
-        if not args.keep:
-            for d in sorted(Path(args.dir).iterdir(), key=lambda p: p.name):
-                if (d.is_dir() and not d.is_symlink() and d.name != "logs"
-                        and not any(d.iterdir())):
-                    d.rmdir()
-
-    fetch_for_report = fetch_results if do_fetch else None
-    test_for_report = test_results if do_test else None
-    if do_fetch:
-        fetch_for_report, saved_tests, run = cumulative_results(
-            manifest, previous_results, current_records, journal_records(journal_path))
-        test_for_report = saved_tests if do_test else None
-    comparison = (compare_results(baseline, fetch_results if do_fetch else None,
-                                  test_results if do_test else None)
-                  if baseline is not None else None)
+    fetch_results = [fetch for fetch, _, _ in results]
+    test_results = [test for _, tests, _ in results for test in tests]
+    current_records = [record for _, _, record in results]
+    fetch_for_report, test_for_report, run = cumulative_results(
+        manifest, previous_results, current_records, journal_records(journal_path))
+    comparison = compare_results(baseline, fetch_results, test_results) if baseline else None
     any_failed = any(not r.ok for r in fetch_results + test_results)
     session.update(finished=datetime.now(timezone.utc).isoformat(),
                    runtime_seconds=time.monotonic() - t0,
-                   interrupted=interrupted, selected_builds=total_selected if do_fetch else None,
-                   summary=result_summary(fetch_results if do_fetch else None,
-                                          test_results if do_test else None),
+                   interrupted=interrupted, selected_builds=total_selected,
+                   summary=result_summary(fetch_results, test_results),
                    tag_source=tag_source,
                    status="interrupted" if interrupted else "failed" if any_failed else "passed")
     report = write_report(args, fetch_for_report, test_for_report,
                           session['runtime_seconds'], tag_source,
-                          interrupted=interrupted,
-                          total_selected=run['selected_builds'] if run else total_selected,
+                          interrupted=interrupted, total_selected=run['selected_builds'],
                           session=session, comparison=comparison, run=run)
     write_failure_lists(args, fetch_for_report, test_for_report)
     if args.json:
@@ -2903,34 +2599,27 @@ def main(argv=None) -> int:
                 f"{len(changes['first_seen_failures'])} first-seen failures; "
                 f"{changes['not_rechecked']} not rechecked")
 
-    if do_fetch:
-        nf = sum(1 for r in fetch_results if not r.ok)
-        if interrupted:
-            log(f"{PROG}: fetch: {len(fetch_results)} of "
-                  f"{total_selected} build(s) completed, "
-                  f"{len(fetch_results) - nf} ok, {nf} failed "
-                  f"(interrupted).")
-        else:
-            log(f"{PROG}: fetch: {len(fetch_results)} build(s) selected, "
-                  f"{len(fetch_results) - nf} ok, {nf} failed.")
-    if do_test:
-        nt = sum(1 for r in test_results if not r.ok)
-        nw = sum(1 for r in test_results if r.ok and r.warning)
-        log(f"{PROG}: test:  {len(test_results)} RPM(s), "
-              f"{len(test_results) - nt} ok, {nt} failed, {nw} warning(s).")
-        if not args.keep and len(test_results) - nt:
-            log(f"{PROG}: removed {len(test_results) - nt} passed RPM(s) "
-                  f"from {args.dir} (failures kept)")
+    nf = sum(1 for r in fetch_results if not r.ok)
+    if interrupted:
+        log(f"{PROG}: fetch: {len(fetch_results)} of "
+            f"{total_selected} build(s) completed, "
+            f"{len(fetch_results) - nf} ok, {nf} failed (interrupted).")
+    else:
+        log(f"{PROG}: fetch: {total_selected} build(s) selected, "
+            f"{len(fetch_results) - nf} ok, {nf} failed.")
+    nt = sum(1 for r in test_results if not r.ok)
+    nw = sum(1 for r in test_results if r.ok and r.warning)
+    log(f"{PROG}: test:  {len(test_results)} RPM(s), "
+        f"{len(test_results) - nt} ok, {nt} failed, {nw} warning(s).")
     log(f"{PROG}: report: {report}")
-    if run:
-        log(f"{PROG}: cumulative run: {run['selected_builds']} build(s), "
-            f"{run['pending_builds']} pending; status: {run['status']}")
+    log(f"{PROG}: cumulative run: {run['selected_builds']} build(s), "
+        f"{run['pending_builds']} pending; status: {run['status']}")
 
     if any_failed:
-        for r in fetch_for_report or []:
+        for r in fetch_for_report:
             if not r.ok:
                 log(f"{PROG}: fetch failure: {r.nvr}")
-        for r in test_for_report or []:
+        for r in test_for_report:
             if not r.ok:
                 log(f"{PROG}: test failure:  {r.rpm}")
         top = failure_types(fetch_for_report, test_for_report)[:5]
@@ -2939,11 +2628,8 @@ def main(argv=None) -> int:
             for stage, rc, sig, count, _ in top:
                 log(f"{PROG}:   {count}x stage {stage}, exit {rc}: {sig}")
     if interrupted:
-        # An interrupted run exits 130 even if it also had failures.
         return 130
-    if any_failed:
-        return 1
-    return 0
+    return 1 if any_failed else 0
 
 
 if __name__ == "__main__":
