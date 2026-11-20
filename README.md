@@ -18,17 +18,17 @@ sudo dnf install tarpm
 Run the examples from the directory containing
 [tarpm-tag-runner.py](tarpm-tag-runner.py).
 
-## Select and test builds
+## Select and test builds in the default tag
 
 ```bash
-# Preview the hello builds without downloading RPMs.
-python3 tarpm-tag-runner.py -t f45 -p hello --list
+# Preview the hello build without downloading RPMs.
+python3 tarpm-tag-runner.py -p hello --list
 
 # Test hello for x86_64 and save a JSON report.
-python3 tarpm-tag-runner.py -t f45 -p hello -a x86_64 --json results.json
+python3 tarpm-tag-runner.py -p hello -a x86_64 --json results.json
 
 # Preview the ten smallest builds for x86_64.
-python3 tarpm-tag-runner.py -t f45 -a x86_64 --sort asc -n 10 --list
+python3 tarpm-tag-runner.py -a x86_64 --sort asc -n 10 --list
 ```
 
 By default, the runner tests the latest RPM builds from `f45` with one
@@ -44,11 +44,11 @@ their selected RPMs before `-n` limits the selection. The runner reuses
 the cached tag list until you pass `--refresh`. Run
 `python3 tarpm-tag-runner.py --help` for all options.
 
-## Run a tag and resume
+## Run the default tag and resume
 
 ```bash
-python3 tarpm-tag-runner.py -t f45 -j 2
-python3 tarpm-tag-runner.py -t f45 -j 2 --resume
+python3 tarpm-tag-runner.py -j 2
+python3 tarpm-tag-runner.py -j 2 --resume
 ```
 
 `-j` controls how many builds run in parallel. Each build gets a temporary
@@ -76,7 +76,7 @@ check outcomes against a saved JSON report. Comparisons cover work
 performed in the current invocation.
 
 ```bash
-python3 tarpm-tag-runner.py -t f45 -p hello -a x86_64 \
+python3 tarpm-tag-runner.py -p hello -a x86_64 \
     --compare results.json --json current.json
 ```
 
