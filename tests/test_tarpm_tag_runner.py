@@ -1000,6 +1000,38 @@ class ReportContentTests(RunnerTestCase):
 
 
 class ReportPathTests(RunnerTestCase):
+    def test_failed_report_publish_preserves_old_text_and_json(self):
+        args = mod.parse_args(self.argv)
+        text_report = Path(args.report)
+        json_report = self.root / "report.json"
+        outputs = [
+            (text_report, lambda: mod.write_report(args, [], [], 0)),
+            (json_report, lambda: mod.write_json(json_report, args, [], [])),
+        ]
+        for path, write in outputs:
+            previous = b"previous report\n"
+            path.write_bytes(previous)
+            for operation in ("fsync", "replace"):
+                with self.subTest(path=path, operation=operation), \
+                        patch.object(mod.os, operation, side_effect=OSError("disk full")), \
+                        self.assertRaises(OSError):
+                    write()
+                self.assertEqual(path.read_bytes(), previous)
+                self.assertEqual(list(self.root.glob(".report-*")), [])
+
+    def test_report_preserves_symlink_and_existing_mode(self):
+        args = mod.parse_args(self.argv)
+        destination = self.root / "existing-report.txt"
+        destination.write_text("old report\n")
+        destination.chmod(0o640)
+        report = Path(args.report)
+        report.symlink_to(destination.name)
+
+        self.assertEqual(mod.write_report(args, [], [], 0), report)
+        self.assertTrue(report.is_symlink())
+        self.assertIn("report ===", destination.read_text())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o640)
+
     def test_retry_default_matches_cli_and_explicit_argv(self):
         fixed = datetime(2026, 10, 21, 12, 30, 45, tzinfo=timezone.utc)
         with patch.object(mod, "datetime") as clock:
@@ -1881,7 +1913,7 @@ class ArtifactCleanupTests(RunnerTestCase):
 
         path = self.root / "cleanup.json"
         with patch.object(mod, "run", side_effect=command), \
-                patch.object(mod.shutil, "rmtree", side_effect=PermissionError("denied")):
+                patch.object(mod, "remove_tree", side_effect=PermissionError("denied")):
             self.assertEqual(self.run_main("--json", str(path)), 1)
         result = json.loads(path.read_text())["test"][0]
         self.assertEqual(result["stage"], "cleanup")

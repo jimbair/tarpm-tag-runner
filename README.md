@@ -321,7 +321,10 @@ retries unfinished builds in fresh workspaces.
 The text report defaults to `./report.txt`, **outside** the download
 directory. Create custom report directories in advance. The runner checks
 report destinations before starting work and rejects paths that overlap
-run state, other outputs, or the build-list input.
+run state, other outputs, or generated failure lists.
+
+The runner replaces each regular text or JSON report atomically after
+writing it in full. If a write fails, the previous file stays readable.
 
 Fetch runs and their resumes rebuild the report from the latest
 completed attempt for each build in the active run. A successful retry

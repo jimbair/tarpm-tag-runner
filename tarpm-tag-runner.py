@@ -1542,6 +1542,29 @@ def compare_results(baseline: dict, fetch: list | None, test: list | None) -> di
     return comparison
 
 
+def write_report_file(path: Path, text: str) -> None:
+    """Publish a complete report without truncating the previous file."""
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        # A pipe or device needs a write to that destination.
+        path.write_text(text, encoding="utf-8")
+        return
+
+    target = path.resolve() if path.is_symlink() else path
+    with tempfile.TemporaryDirectory(prefix=".report-", dir=target.parent) as directory:
+        temporary = Path(directory) / "report"
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            if mode is not None:
+                os.fchmod(stream.fileno(), stat.S_IMODE(mode))
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+
+
 def write_report(args, fetch: list | None, test: list | None,
                  runtime: float, tag_source: str | None = None,
                  interrupted: bool = False, total_selected: int = 0,
@@ -1739,7 +1762,7 @@ def write_report(args, fetch: list | None, test: list | None,
         A("=== TARPM RPM METADATA (rpm -qi --file <binary>, captured before testing) ===")
         A(session['tarpm']['rpm_info'])
 
-    report.write_text("\n".join(L) + "\n")
+    write_report_file(report, "\n".join(L) + "\n")
     return report
 
 
@@ -1763,7 +1786,7 @@ def write_json(path: Path, args, fetch: list | None, test: list | None,
         "comparison": comparison,
         "run": run,
     }
-    path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+    write_report_file(path, json.dumps(payload, indent=2, default=str) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2418,6 +2441,8 @@ def validate_output_paths(args) -> None:
                         else os.access(parent, os.W_OK | os.X_OK))
             if not writable:
                 raise UsageError(f"{option} destination is not writable: {path}")
+            if target.is_file() and not os.access(parent, os.W_OK | os.X_OK):
+                raise UsageError(f"{option} directory is not writable: {parent}")
         except (OSError, RuntimeError) as exc:
             raise UsageError(f"cannot use {option} destination {path}: {exc}") from exc
 
