@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit and regression tests for tarpm-tag-runner.py.
 
-No koji, tarpm, or network needed: external commands are mocked. Run with:
+The suite runs without Koji, tarpm, or network access.
 
     python3 -m unittest discover -s tests -v
 """
@@ -29,8 +29,8 @@ def load_module():
     path = _ROOT / "tarpm-tag-runner.py"
     spec = importlib.util.spec_from_file_location("tarpm_tag_runner", path)
     mod = importlib.util.module_from_spec(spec)
-    # dataclasses resolves string annotations against sys.modules, so the
-    # module must be registered before exec_module.
+    # Register the module before executing it so dataclasses can resolve its
+    # string annotations through sys.modules.
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
@@ -227,12 +227,12 @@ class RunnerTestCase(unittest.TestCase):
         self.enter_patch.start()
         self.addCleanup(self.enter_patch.stop)
         self.addCleanup(lambda: journal._fh.close() if journal._fh else None)
-        # Main-loop command stubs must not depend on installed clients.
+        # Let tests exercise main() without installed clients.
         which_patch = patch.object(mod.shutil, "which",
                                    side_effect=lambda name: f"/fake/{name}")
         which_patch.start()
         self.addCleanup(which_patch.stop)
-        # Main-loop tests must not query the host's RPM database.
+        # Supply package metadata without querying the host's RPM database.
         package_patch = patch.object(mod, "tarpm_package_info", return_value={
             "executable": "/fake/tarpm", "package": {}, "rpm_info": None,
             "error": "RPM metadata unavailable in unit tests"})
@@ -1397,7 +1397,7 @@ class FetchProgressTests(RunnerTestCase):
         output = output.replace(" / 1.46 GiB", "")
         self.assertEqual(mod.fetch_progress("demo-1-1", self.downloads, output, 60),
                          ("fetching demo.rpm", "1m 00s, 913.00 MiB so far"))
-        # Batch position is available even when the RPM's byte progress isn't.
+        # The download heading can still supply the RPM's batch position.
         output = output.replace("Downloading:", "Downloading [2/3]:")
         self.assertEqual(mod.fetch_progress("demo-1-1", self.downloads, output, 60),
                          ("fetching demo.rpm (RPM 2/3, 66.7%)", "1m 00s, 913.00 MiB so far"))
@@ -1698,8 +1698,8 @@ class TestProgressTests(RunnerTestCase):
         self.assertIn("; unpacked 4/4 KiB; RPM 1.5 KiB)", beats[3])
         self.assertIn("(list-original, ", beats[4])
         self.assertIn("(list-repacked, ", beats[5])
-        # The completed input is measured once after unpacking, not repeatedly
-        # during repack (the earlier scan is the unpack heartbeat).
+        # One scan measures partial extraction during unpack. A second
+        # measures the completed tree for all later heartbeats.
         self.assertEqual(sum(call.args == (work / "ext",)
                              for call in tree_bytes.call_args_list), 2)
 
@@ -1985,14 +1985,12 @@ class ArtifactCleanupTests(RunnerTestCase):
 
 class ErrorSignatureTests(unittest.TestCase):
     def test_create_payload_line(self):
-        # The "tarpm: " line is used, with the prefix stripped.
         out = ("Downloading [1/21]: 7zip-25.01-5.fc44.src.rpm\n"
                "tarpm: create_payload: unable to write payload data\n")
         self.assertEqual(mod.error_signature(out),
                          "create_payload: unable to write payload data")
 
     def test_last_tarpm_line_wins(self):
-        # The LAST "tarpm: " line wins, even if other lines follow.
         out = ("tarpm: first error\n"
                "koji: some noise line\n"
                "tarpm: unable to construct RPM header\n")
@@ -2000,15 +1998,12 @@ class ErrorSignatureTests(unittest.TestCase):
                          "unable to construct RPM header")
 
     def test_fallback_last_nonempty_line(self):
-        # Without a "tarpm: " line, the last non-empty line is used
-        # verbatim (only the "tarpm: " prefix gets stripped).
         out = ("koji: warning: something odd\n"
                "unable to construct RPM header\n")
         self.assertEqual(mod.error_signature(out),
                          "unable to construct RPM header")
 
     def test_fallback_keeps_other_prefixes(self):
-        # A 'tarpm: ' line is never assumed for other tools' prefixes.
         out = "error: unable to construct RPM header from /tmp/x/y/rpm\n"
         self.assertEqual(mod.error_signature(out),
                          "error: unable to construct RPM header from <path>")
@@ -2021,8 +2016,7 @@ class ErrorSignatureTests(unittest.TestCase):
                          "failed to read payload from <path>")
 
     def test_hex_and_digit_runs(self):
-        # Hex addresses and 4+ digit runs collapse to N (shorter runs
-        # such as '42' are left alone).
+        # Normalize the address and long digit run while preserving 42.
         out = "tarpm: assertion failed at 0x7f8a12345678 in loop 42 123456\n"
         self.assertEqual(mod.error_signature(out),
                          "assertion failed at N in loop 42 N")
@@ -2173,7 +2167,7 @@ class PoolInterruptTests(RunnerTestCase):
 
 
 class JournalInterruptTests(unittest.TestCase):
-    """A Ctrl+C mid-run must keep the records of the builds that finished."""
+    """Keep finished build records after an interrupted run."""
 
     def test_interrupted_run_keeps_finished_records(self):
         d = tempfile.mkdtemp(prefix="ttr-journal-")
@@ -2201,7 +2195,7 @@ class JournalInterruptTests(unittest.TestCase):
 
         mod.process_build = fake_process_build
         mod.run_pool = fake_run_pool
-        mod.shutil.which = lambda name: "/usr/bin/fake"  # tarpm gate
+        mod.shutil.which = lambda name: "/usr/bin/fake"  # Satisfy tool checks.
         try:
             with self.assertRaises(KeyboardInterrupt):
                 mod.main(argv=["-t", "f44", "-d", d, "--no-run-log"])
@@ -2213,8 +2207,7 @@ class JournalInterruptTests(unittest.TestCase):
                 mod.JOURNAL._fh.close()
                 mod.JOURNAL._fh = None
 
-        # The records were written as each build finished (one os.write
-        # per line), so they are on disk despite the interrupt.
+        # Each completed build appends its record before the interrupt.
         with open(os.path.join(d, "journal.jsonl"), "r",
                   encoding="utf-8") as fh:
             records = [json.loads(line) for line in fh if line.strip()]

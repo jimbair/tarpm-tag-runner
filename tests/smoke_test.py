@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise failure recovery and the real Fedora hello RPM round-trip.
+"""Exercise real hello RPM downloads, tarpm round-trips, and failure recovery.
 
-Requires installed koji/tarpm clients and network access. Reports and logs
-remain under --output, including after failures.
+Requires Koji, tarpm, and network access. Reports and logs remain under
+--output, including after failures.
 """
 import argparse
 import json

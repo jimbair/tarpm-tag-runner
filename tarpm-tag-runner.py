@@ -1,44 +1,34 @@
 #!/usr/bin/env python3
-"""tarpm-tag-runner — list builds in a Koji tag, fetch their RPMs, and
-run each RPM through a tarpm unpack/repack/unpack test.
+"""Fetch builds from a Fedora Koji tag and round-trip their RPMs with tarpm.
 
-The runner pipelines each build — fetch, test, clean up — with -j builds
-in flight. Each build uses a fresh workspace for downloads and test files.
-The tarpm test includes source RPMs by default. Use --no-src to skip them.
+The runner uses koji latest-pkg --all --type=rpm to query RPM builds and
+koji download-build to fetch them. It caches the tag list in
+DIR/tag-<TAG>.txt until --refresh. With --resume, it uses the saved run
+selection.
 
-Only RPM builds are queried from the tag; image-only builds are excluded.
-The tag list is cached as <dir>/tag-<TAG>.txt and reused on later runs
-unless --refresh re-fetches it from Koji. --resume uses the saved run.
-Structured results, optional JSON report, threaded fetch/test.
+Each build gets a fresh workspace. Use -j to process builds in parallel
+and --no-src to skip source RPM tests. For each selected RPM, the runner
+unpacks it with tarpm -x, repacks it with tarpm -c, and unpacks the result.
+It compares stdout from tarpm -t on the original and repacked RPMs.
+Listing differences produce warnings. A failed command fails its stage.
 
-External commands (system level, matching the CLI workflow):
-  koji latest-pkg --all --type=rpm <tag>   list latest RPM builds in a tag
-  koji download-build <nvr>     fetch a build (all arches + src by default)
-  tarpm -x / -c / -t            test round-trip per RPM
+The runner removes each tested RPM and its work files after testing,
+then cleans up the workspace when the build finishes. Reports and the
+journal retain results and tarpm version metadata. Failure and warning
+logs are kept for diagnosis.
 
-Test cycle per RPM (.src.rpm included by default; --no-src to skip):
-  1. tarpm -x -f in.rpm -O <work>/ext                unpack
-  2. tarpm -c -f <work>/<base>-repacked.rpm <work>/ext   repack
-  3. tarpm -x -f <repacked.rpm> -O <work>/ext2       unpack the repacked RPM
-  4. tarpm -t on both + compare                      content check (warning;
-     a listing that fails to generate is a failed stage)
+The first Ctrl+C during build processing drops queued work, lets active
+builds finish, and writes a partial report. A second Ctrl+C while waiting
+force-quits immediately. External commands run in their own sessions and
+may outlive the runner. --resume retries failed or unfinished builds in
+fresh workspaces.
 
-Downloads and test work files are discarded when a build finishes, including
-after a failure. The journal records the outcome and tarpm version, and logs
-are kept for failures and listing warnings.
+Exit statuses
 
-Ctrl+C stops gracefully: queued work is dropped, in-flight work
-finishes, the partial results are written to the report, and the exit
-status is 130 (which takes precedence over 1). External commands run in
-their own session, so they survive Ctrl+C and finish; a second Ctrl+C
-while waiting force-quits immediately and can leave in-flight commands and
-their workspaces behind. --resume retries unfinished builds in fresh
-workspaces.
-
-Exit status: 0 all ok, 1 some fetches/tests failed or stdout pipe closed,
-2 usage/environment,
-130 interrupted by Ctrl+C (partial results reported; takes precedence
-over 1).
+    0    Success, including tests with warnings.
+    1    A fetch or test failed, or stdout closed early.
+    2    Invalid arguments or setup error.
+    130  Interrupted by Ctrl+C. Takes precedence over build failures.
 
 Python 3.9+ (standard library only).
 """
@@ -88,7 +78,7 @@ SIZE_BULK_MIN = 1000
 
 
 class UsageError(Exception):
-    """Fatal setup/usage problem; leads to exit status 2."""
+    """A setup or usage error reported with exit status 2."""
 
 
 def now_utc() -> str:
@@ -96,7 +86,7 @@ def now_utc() -> str:
 
 
 def fmt_duration(seconds: float) -> str:
-    """Human-friendly duration: '42.3s', '2m 05s', '1h 04m 05s'."""
+    """Format a duration such as '42.3s', '2m 05s', or '1h 04m 05s'."""
     if seconds < 60:
         return f"{seconds:.1f}s"
     total = int(seconds)
@@ -108,12 +98,12 @@ def fmt_duration(seconds: float) -> str:
 
 
 def fmt_command_duration(seconds: float) -> str:
-    """Keep fast command measurements visible instead of rounding them to 0.0s."""
+    """Display subsecond command times in milliseconds."""
     return f"{seconds * 1000:.1f}ms" if seconds < 1 else fmt_duration(seconds)
 
 
 def human(n: int) -> str:
-    """Binary (1024) human size: '950 KiB', '838 MiB', '2.9 GiB'."""
+    """Format a byte count in binary units such as '950 KiB' or '2.9 GiB'."""
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
     v = float(n)
     i = 0
@@ -129,7 +119,7 @@ def human(n: int) -> str:
 
 
 def _dir_bytes(pdir: Path) -> int:
-    """Sum of top-level file sizes in a dir (a fetch's 'size so far')."""
+    """Sum top-level file sizes for the download progress estimate."""
     total = 0
     try:
         for p in pdir.iterdir():
@@ -150,7 +140,7 @@ def _file_bytes(path: Path) -> int | None:
 
 
 def _tree_bytes(root: Path) -> int:
-    """Sum regular file sizes without following symlinks or counting hardlinks twice."""
+    """Sum regular file sizes, skipping symlinks and duplicate hard links."""
     total = 0
     seen = set()
     for directory, _, files in os.walk(root, followlinks=False):
@@ -182,19 +172,19 @@ def _tarpm_payload_bytes(pid: int | None) -> int | None:
                 continue  # File descriptors can close between these calls.
     except OSError:
         pass  # No procfs, restricted access, or the child has already exited.
-    # Duplicated descriptors refer to the same payload; do not sum them.
+    # Multiple descriptors can refer to the same payload.
     return max(sizes) if sizes else None
 
 
 def _estimated_percent(current: int | None, expected: int | None) -> str:
-    """Stage byte estimate; allow overruns rather than implying completion."""
+    """Estimate stage progress by bytes, allowing values over 100%."""
     if current is None or expected is None or expected <= 0:
         return ""
     return f" ~{100 * current / expected:.1f}%"
 
 
 def _size_pair(current: int, expected: int | None) -> str:
-    """Compact byte counts, sharing a unit when possible: '11.1/18.4 MiB'."""
+    """Share the unit in a size pair such as '11.1/18.4 MiB'."""
     amount = human(current)
     if expected is None:
         return amount
@@ -225,14 +215,12 @@ def repack_progress(repacked: Path, pid: int | None,
 
 
 def error_signature(text: str) -> str:
-    """A short, stable key identifying a failure, for grouping.
+    """Normalize a command diagnostic for failure grouping.
 
-    Takes the last line starting with "tarpm: " from the failing
-    command's output (the prefix stripped); if there is no such line,
-    the last non-empty line. Absolute paths are replaced with <path>,
-    hex addresses and 4+ digit runs with N, and the result is truncated
-    to 120 characters, so the same failure groups together across
-    RPMs, paths, and runs.
+    Prefer the last line beginning with "tarpm: " and strip that prefix.
+    Fall back to the last nonempty line. Replace matching absolute paths
+    with <path> and replace hexadecimal literals and runs of four or more
+    digits with N. Keep the first 120 characters.
     """
     lines = text.splitlines()
     msg = None
@@ -253,12 +241,11 @@ def error_signature(text: str) -> str:
 
 
 class RunLog:
-    """Tee every log line to a file, appended across invocations.
+    """Append runner logs across invocations.
 
-    Each line is one write() + flush() under a lock, so lines from
-    concurrent worker threads never interleave. An open or write failure
-    must never abort the run: if the file cannot be used, the run simply
-    proceeds without it.
+    Hold a lock while writing and flushing each line to keep messages
+    from different worker threads intact. Treat file I/O errors as
+    nonfatal.
     """
 
     def __init__(self) -> None:
@@ -301,9 +288,9 @@ RUNLOG = RunLog()
 
 
 def log(msg: str, err: bool = False) -> None:
-    """Emit a UTC-timestamped log line; err=True routes it to stderr.
+    """Print a UTC-timestamped line to stdout, or to stderr when err=True.
 
-    The line is also tee'd to the run log (RUNLOG) when one is enabled.
+    Append the line to the run log when enabled.
     """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts} UTC] {msg}"
@@ -312,7 +299,7 @@ def log(msg: str, err: bool = False) -> None:
 
 
 def _progress(progress) -> str:
-    """' (7/20)' suffix for the fetch/heartbeat progress lines."""
+    """Format the build position for a fetch log line, as in ' (7/20)'."""
     if not progress:
         return ""
     n, total = progress
@@ -320,7 +307,7 @@ def _progress(progress) -> str:
 
 
 def _test_tail(progress, elapsed: float) -> str:
-    """'(n/total, DURATION)' or '(DURATION)' suffix for a test line."""
+    """Format the test duration with a position when available."""
     parts = []
     if progress:
         n, total = progress
@@ -330,11 +317,7 @@ def _test_tail(progress, elapsed: float) -> str:
 
 
 class Counter:
-    """Thread-safe monotonic counter shared across worker threads.
-
-    next() returns 1, 2, ... as it is called; the lock keeps it correct
-    when -j runs items on several threads.
-    """
+    """Assign sequential positions starting at 1 across worker threads."""
     def __init__(self, total: int):
         self.total = total
         self.n = 0
@@ -353,31 +336,23 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
         *, separate_stderr: bool = False) -> tuple:
     """Run an external command and return (exit_code, output).
 
-    By default, output includes both streams. With separate_stderr enabled,
-    successful commands return stdout and log stderr as diagnostics. Failed
-    commands include both streams in their returned diagnostic output.
+    By default, stderr is merged into stdout. With `separate_stderr` enabled,
+    successful commands return stdout and log stderr. Failed commands
+    return both streams, with stderr appended to stdout in separate mode.
+    Text output escapes invalid UTF-8 bytes. `binary_output` preserves the
+    original bytes for listing comparisons.
 
-    The child runs in a new session so a Ctrl+C (SIGINT to the terminal's
-    foreground process group) reaches only this process; a force-quit may
-    orphan the child. A KeyboardInterrupt while waiting kills and reaps the
-    child before re-raising (so an interrupted main-thread command does not
-    leave the child running).
+    A new session keeps terminal Ctrl+C from signaling the child directly.
+    If waiting raises an exception, kill and reap the child before
+    re-raising. A force-quit may leave the child running.
 
-    If `heartbeat` > 0 and `label` is set, a line is logged every
-    `heartbeat` seconds while the command is still running, so a slow
-    command does not look stuck:
-        still <label><counter_suffix> (<detail>)
-    `counter_suffix` is the '(n/total)' fetch progress. `start` (a monotonic
-    timestamp) is the reference for the elapsed time (e.g. the start of a
-    multi-stage test); it defaults to now.
-    `log_err` routes heartbeat diagnostics to stderr for machine-readable
-    stdout, such as --list output. `progress_fn(output, pid, elapsed)` returns
-    (label, detail) together so both share one parsed output snapshot.
-    Output is cumulative partial output (bytes, str, or None).
-    `detail_fn(output, pid, elapsed)` can replace the parenthesized elapsed
-    time and suffix with stage-specific progress details.
-    Text output uses UTF-8 with undecodable bytes escaped for diagnostics.
-    `binary_output` preserves the original bytes for listing comparisons.
+    A positive `heartbeat` interval logs progress while the command runs.
+    The format is "still <label><counter_suffix> (<detail>)". Elapsed time
+    uses the monotonic `start` timestamp, defaulting to the start of the
+    wait. `log_err` sends heartbeats to stderr to keep --list stdout clean.
+    `progress_fn(output, pid, elapsed)` supplies both label and detail from
+    cumulative partial output. `detail_fn` with the same arguments supplies
+    only the parenthesized detail.
     """
     try:
         executable = None
@@ -406,12 +381,9 @@ def run(cmd: list, cwd: Path | None = None, label: str | None = None,
     try:
         while True:
             try:
-                # communicate(timeout) has a hard deadline, so the heartbeat
-                # fires even for a silent command; on TimeoutExpired it does
-                # not kill the child, and the retry continues where it left
-                # off. Only the final call's output is used: each
-                # TimeoutExpired carries the cumulative partial output, so
-                # accumulating would duplicate lines.
+                # A timeout lets us log progress even for a silent command.
+                # Retrying communicate keeps the child running and returns
+                # cumulative output, so the final call gives the full result.
                 out, diagnostics = (proc.communicate(timeout=heartbeat)
                                     if heartbeat > 0 else proc.communicate())
                 break
@@ -473,7 +445,7 @@ class TestResult:
 
 
 def result_record(result) -> dict:
-    """JSON-safe result, retained even when successful RPMs/logs are removed."""
+    """Serialize a result with an absolute path to any diagnostic log."""
     row = dataclasses.asdict(result)
     if result.log is not None:
         row['log'] = str(result.log.resolve())
@@ -494,11 +466,11 @@ def write_diagnostic_log(path: Path, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# fetch phase
+# Build selection and downloads
 # ---------------------------------------------------------------------------
 
 def validate_nvr(nvr: str) -> None:
-    """Require a plain RPM name-version-release, never a filesystem path."""
+    """Require a plain name-version-release before using it in a path."""
     if not re.fullmatch(
             r"[A-Za-z0-9_+][A-Za-z0-9_+.-]*-[A-Za-z0-9_+.~^]+-[A-Za-z0-9_+.~^]+",
             nvr):
@@ -507,7 +479,7 @@ def validate_nvr(nvr: str) -> None:
 
 
 def write_tag_cache(path: Path, text: str) -> None:
-    """Replace a tag snapshot only after its complete contents reach disk."""
+    """Atomically replace the tag snapshot after syncing the new file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -527,9 +499,8 @@ def write_tag_cache(path: Path, text: str) -> None:
 def read_nvrs(args) -> tuple:
     """Return (NVR list, tag-list source) for the run.
 
-    Query only RPM builds using Koji's build types, not NVR patterns.
-    Cache the output with a marker so old, unfiltered caches are refreshed
-    once.
+    Query Koji's RPM build type and mark snapshots that used that filter.
+    Refresh a snapshot without the marker before selecting builds from it.
     """
     cache = Path(args.dir) / f"tag-{args.tag}.txt"
     text = None
@@ -572,7 +543,7 @@ def read_nvrs(args) -> tuple:
         if not parts:
             continue
         nvr = parts[0]
-        # skip comment lines, and the table header lines (title row + dashes)
+        # Skip cache comments and Koji's header and separator rows.
         if nvr.startswith("#") or nvr.startswith("-") or nvr == "Build":
             continue
         validate_nvr(nvr)
@@ -580,8 +551,7 @@ def read_nvrs(args) -> tuple:
     # A build has one outcome per invocation even if listed more than once.
     nvrs = list(dict.fromkeys(nvrs))
     if queried:
-        # Validate every NVR before replacing a usable snapshot. A failed
-        # write or interrupt must never leave a trusted partial cache.
+        # Publish the snapshot only after all NVRs pass validation.
         try:
             write_tag_cache(cache, text)
         except OSError as exc:
@@ -596,7 +566,7 @@ def read_nvrs(args) -> tuple:
 
 
 def select_nvrs(nvrs: list, pkgs: list) -> list:
-    """Filter NVRs by package names (name or name- prefix; exact NVR match)."""
+    """Select NVRs that equal a filter or start with it followed by a hyphen."""
     if not pkgs:
         return list(nvrs)
     out = []
@@ -609,7 +579,7 @@ def select_nvrs(nvrs: list, pkgs: list) -> list:
 
 
 def read_size_cache(path: Path, args) -> dict:
-    """Load usable exact-NVR totals; incompatible snapshots are rebuilt."""
+    """Load compatible size totals keyed by exact build NVR."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -667,8 +637,8 @@ def write_size_cache(path: Path, builds: dict, tag: str) -> None:
 def _size_records(stream):
     """Stream XML-RPC record structs, including records inside multicalls.
 
-    Discard completed records from the parent tree: a full tag response can
-    be hundreds of megabytes. Decode only fields needed for size totals.
+    A full tag response can be hundreds of megabytes. Discard completed
+    records from the parent tree and decode only fields needed for totals.
     """
     fields = {"name", "nvr", "arch", "size", "id", "build_id", "state",
               "faultCode", "faultString"}
@@ -721,8 +691,8 @@ def fetch_size_metadata(method: str, *params, **kwargs) -> tuple:
                                           allow_none=True).encode("utf-8"),
         headers={"Content-Type": "text/xml", "User-Agent": "tarpm-tag-runner"})
     for attempt in range(3):
-        # Each retry starts with fresh totals; partial responses cannot
-        # double-count RPMs or become a complete cached build.
+        # Start each retry with fresh totals to avoid counting a partial
+        # response twice.
         builds, totals = {}, {}
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -796,7 +766,7 @@ def size_progress(args, verb: str, total: int):
 
 
 def sort_nvrs_by_size(nvrs: list, args) -> list:
-    """Enrich the existing selection; never replace it with current tag membership."""
+    """Order builds by the compressed size of their selected RPMs."""
     path = Path(args.dir) / "build-sizes.json"
     cache = read_size_cache(path, args)
     missing = [nvr for nvr in nvrs if nvr not in cache]
@@ -812,8 +782,8 @@ def sort_nvrs_by_size(nvrs: list, args) -> list:
                               for nvr, build_id in builds.items() if build_id in totals})
                 write_size_cache(path, cache, args.tag)
                 done[0] = sum(nvr in cache for nvr in missing)
-            # A saved selection may include builds no longer latest in the
-            # tag. Resolve those exact NVRs directly.
+            # Look up remaining sizes by exact NVR. A saved selection may
+            # include builds omitted from the latest tag query.
             pending = [nvr for nvr in missing if nvr not in cache]
             for offset in range(0, len(pending), SIZE_BATCH):
                 batch = pending[offset:offset + SIZE_BATCH]
@@ -878,8 +848,8 @@ def koji_download_progress(output: bytes | str | None) -> KojiDownloadProgress |
         position = (int(heading.group(1)), int(heading.group(2)))
         if not 1 <= position[0] <= position[1]:
             return None
-    # A new Downloading heading resets progress: the preceding RPM's 100%
-    # must not appear while waiting for the next RPM's first progress bar.
+    # Read bars after the latest Downloading heading. Each RPM starts
+    # with fresh progress when its heading appears.
     latest = None
     for bar in re.finditer(r"(?:^|[\r\n])\[[= ]+\][ \t]*(\d{1,3}|\?{3})%([^\r\n]*)",
                            output[start:]):
@@ -925,9 +895,8 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None,
     download_dir.mkdir()
     cmd = ["koji", "download-build"]
     if args.arch:
-        # koji matches the requested arch exactly, which would drop the
-        # noarch and src RPMs; add them back (src unless --no-src) so the
-        # fetch matches what the test phase covers.
+        # Koji matches each architecture exactly. Request noarch and, when
+        # source tests are enabled, src in addition to the requested arches.
         wanted = list(args.arch) + ["noarch"]
         if not args.no_src:
             wanted.append("src")
@@ -965,7 +934,7 @@ def fetch_one(nvr: str, args, counter: "Counter | None" = None,
 
 
 # ---------------------------------------------------------------------------
-# test phase (tarpm round-trip)
+# RPM tests and build cleanup
 # ---------------------------------------------------------------------------
 
 def arch_selected(arch: str, archs: list) -> bool:
@@ -973,7 +942,7 @@ def arch_selected(arch: str, archs: list) -> bool:
         return True
     if arch in archs:
         return True
-    # noarch (and src) are not real arches
+    # Include noarch and src with any explicit architecture selection.
     return arch in ("noarch", "src")
 
 
@@ -992,12 +961,11 @@ def build_units(bdir: Path, args) -> list:
 
 
 def remove_tree(path: Path) -> None:
-    """Remove an owned artifact tree, repairing read-only directories once.
+    """Remove an artifact tree created by the runner.
 
-    Keep the usual cleanup fast. If permissions prevent it, make only
-    directories within the remaining tree accessible to their owner,
-    without chmodding symlink targets, then retry. Persistent errors reach
-    the caller instead of silently leaving large extracted payloads.
+    On a permission error, restore owner access to directories within
+    the tree and retry once. Skip symlinks when changing permissions.
+    Propagate any remaining error to the caller.
     """
     try:
         shutil.rmtree(path)
@@ -1029,11 +997,11 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
     cleanup_errors = []
     try:
         work.mkdir()
+        # Clean up the work directory here only if this test created it.
         cleanup.insert(0, (work, remove_tree))
         test_t0 = time.monotonic()
 
-        # Key the log name on the RPM basename so subpackages of one build
-        # (7zip, 7zip-reduced, ...) get separate logs.
+        # Use the RPM basename so each subpackage has its own test log.
         logfile = diagnostic_log(args, nvr, f"{base}.test.log")
         buf = [
             f"rpm:     {rpm}",
@@ -1060,7 +1028,7 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
 
         def input_tree_size() -> int:
             nonlocal unpacked_size
-            # Scan completed input once, and only when a heartbeat needs it.
+            # Measure the unpacked input on demand and reuse its size.
             if unpacked_size is None:
                 unpacked_size = _tree_bytes(work / "ext")
             return unpacked_size
@@ -1115,9 +1083,9 @@ def test_one(rpm: Path, args, progress=None) -> TestResult:
                        progress_fn=lambda output, pid: unpack_progress(
                            work / "ext2", repacked_size, input_tree_size()))
 
-        # Extra check: file list of original vs repacked (warning only, in case
-        # tarpm -t output is noisy). A listing that fails to generate is a
-        # failed stage, not a diff to compare.
+        # Compare the original and repacked listings byte for byte.
+        # A listing command failure fails its stage. When both commands
+        # succeed, a difference produces a warning.
         warning = None
         if ok:
             rc, list_orig = timed_run("list-original", ["tarpm", "-t", "-f", str(rpm)],
@@ -1230,16 +1198,15 @@ def process_build(nvr: str, args, fetch_counter=None) -> tuple:
 
 
 def _force_quit(signum, frame) -> None:
-    """Second Ctrl+C: die immediately, no cleanup (os._exit).
+    """Exit immediately on a second Ctrl+C while active builds finish.
 
-    External commands run in their own sessions and may outlive the runner.
+    os._exit bypasses cleanup. External commands may outlive the runner.
     """
     msg = (f"{PROG}: force-quit; in-flight commands and temporary build "
            f"workspaces may remain. Use --resume to retry unfinished builds "
            f"in fresh workspaces")
-    # A signal may interrupt a log write while its lock is held. Never use
-    # RUNLOG or buffered stderr here; even a full stderr pipe must not
-    # prevent the second Ctrl+C from terminating the process.
+    # Write directly to stderr in nonblocking mode. The signal may have
+    # interrupted a log write holding a lock, or stderr may be full.
     try:
         blocking = os.get_blocking(2)
         os.set_blocking(2, False)
@@ -1254,25 +1221,22 @@ def _force_quit(signum, frame) -> None:
 
 
 def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
-    """Run worker(item) on a pool of `jobs` workers, collecting results.
+    """Run items on a pool of `jobs` workers and return (results, interrupted).
 
-    Returns (results, interrupted). Ctrl+C drops the queued items and
-    lets the in-flight one(s) finish; a second Ctrl+C while waiting
-    force-quits immediately (no report; in-flight children are
-    orphaned and typically die on their next write to the closed pipe,
-    possibly leaving partial files).
+    The first Ctrl+C drops queued items and waits for active workers.
+    A second Ctrl+C exits immediately and may leave commands and
+    temporary workspaces behind.
 
-    If worker(item) raises and on_error is given, on_error(item, exc)
-    is called and its return value is used as that item's result, so a
-    single bad item cannot abort the whole run.
+    If worker(item) raises an exception, use on_error(item, exc) as its
+    result when a handler is provided.
     """
     results = []
     result_lock = threading.Lock()
     stopping = threading.Event()
 
     def call(item):
-        # A worker can dequeue before the main thread cancels its future.
-        # Do not start more build work once an interrupt has been observed.
+        # A worker may take a queued item before the main thread cancels
+        # its future. Check for interruption before starting the item.
         if stopping.is_set():
             return
         try:
@@ -1282,8 +1246,8 @@ def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
                 raise
             log(f"{PROG}: error processing {item}: {exc}", err=True)
             result = on_error(item, exc)
-        # Collect in the worker so a signal between submit() and tracking
-        # its returned future cannot lose a finished build from the report.
+        # Collect results in the worker. A signal can interrupt submit()
+        # before the main thread records the future.
         with result_lock:
             results.append(result)
 
@@ -1310,8 +1274,8 @@ def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
                 for fut in futures:
                     if not fut.cancelled():
                         fut.result()
-            # The executor also joins a submitted future that a signal
-            # interrupted before it could be added to futures above.
+            # Exiting the executor waits for active workers, including
+            # any future submitted before an interrupt prevented tracking.
     finally:
         if previous_sigint is not None:
             signal.signal(signal.SIGINT, previous_sigint)
@@ -1319,14 +1283,14 @@ def run_pool(worker, items, jobs: int, on_error=None) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# report
+# Reports
 # ---------------------------------------------------------------------------
 
 def tarpm_package_info() -> dict:
-    """Identify the executable being tested using its owning RPM, once per session.
+    """Collect package metadata for the tarpm executable selected from PATH.
 
-    Keep the full rpm -qi output for COPR build provenance. An unavailable
-    RPM database or a locally built executable must not prevent testing.
+    Keep the full rpm -qi output to identify the build. Report query errors
+    in the returned metadata so testing can continue.
     """
     executable = shutil.which("tarpm")
     info = {"executable": executable, "package": {}, "rpm_info": None,
@@ -1371,7 +1335,7 @@ def package_label(info: dict) -> str:
 
 
 def result_signature(result) -> str:
-    """Retain captured signatures, with useful fallbacks for worker exceptions."""
+    """Use a stored signature, normalized exception, or missing-output label."""
     return result.signature or error_signature(result.error or "") or "(no diagnostic output)"
 
 
@@ -1383,20 +1347,19 @@ def tail(text: str, n: int) -> str:
 
 
 def rpm_label(rpm: str) -> str:
-    """Display name for an RPM result: filename without the .rpm suffix."""
+    """Return the RPM filename without its .rpm suffix."""
     name = Path(rpm).name
     return name[:-4] if name.endswith(".rpm") else name
 
 
 def failure_types(fetch: list | None, test: list | None,
                   phase: str | None = None) -> list:
-    """Group the failures of a run into (stage, exit code, signature) rows.
+    """Group failures by stage, exit code, and signature.
 
-    Each row is (stage, exit_code, signature, count, examples) with up
-    to 3 example NVRs (fetch) or RPM basenames (test). Rows are sorted
-    by count descending, then stage, exit code, and signature, so the
-    order is stable. `phase` restricts the grouping to "fetch" or
-    "test"; None covers both.
+    Each row is (stage, exit_code, signature, count, examples) with up to
+    three example NVRs for fetch failures or RPM labels for test failures.
+    Sort by descending count, then by stage, exit code, and signature.
+    Use `phase` to select "fetch" or "test". None includes both.
     """
     groups: dict = {}
 
@@ -1444,7 +1407,7 @@ def result_summary(fetch: list | None, test: list | None) -> dict:
 
 
 def timing_summary(fetch: list | None, test: list | None) -> dict:
-    """Aggregate measured command times; parallel worker time is not session time."""
+    """Aggregate measured command times across workers by stage."""
     samples = {}
     for result in fetch or []:
         if result.duration_seconds is not None:
@@ -1524,7 +1487,7 @@ def read_comparison_report(path: Path) -> dict:
 
 
 def compare_results(baseline: dict, fetch: list | None, test: list | None) -> dict:
-    """Only overlapping identities can regress or resolve; omissions remain unverified."""
+    """Compare rechecked build and RPM outcomes and count omitted cases."""
     comparison = {key: baseline[key] for key in ("source", "generated", "tag", "tarpm")}
     for phase, results in (("fetch", fetch), ("test", test)):
         previous = baseline['cases'][phase]
@@ -1555,13 +1518,13 @@ def compare_results(baseline: dict, fetch: list | None, test: list | None) -> di
 
 
 def write_report_file(path: Path, text: str) -> None:
-    """Publish a complete report without truncating the previous file."""
+    """Replace a regular report atomically after writing it in full."""
     try:
         mode = path.stat().st_mode
     except FileNotFoundError:
         mode = None
     if mode is not None and not stat.S_ISREG(mode):
-        # A pipe or device needs a write to that destination.
+        # Special files such as pipes and devices receive direct writes.
         path.write_text(text, encoding="utf-8")
         return
 
@@ -1802,8 +1765,7 @@ def write_json(path: Path, args, fetch: list | None, test: list | None,
 
 
 # ---------------------------------------------------------------------------
-# journal (one JSON line per finished build; basis for --resume and
-# --retry-failed)
+# Run state for --resume and --retry-failed
 # ---------------------------------------------------------------------------
 
 def read_run_manifest(path: Path) -> dict:
@@ -1860,9 +1822,9 @@ def write_run_manifest(path: Path, nvrs: list, run_id: str, context: dict) -> di
 class Journal:
     """Append-only journal of finished builds (one JSON line each).
 
-    Each complete line is written under a lock, retrying short writes.
-    A failed append rolls back to its starting offset. If rollback fails,
-    further appends are disabled so they cannot join a partial record.
+    Hold a lock while writing each line and retry any short writes.
+    If an append fails, truncate back to the recorded offset. Disable
+    further appends if the offset is unavailable or rollback fails.
     """
 
     def __init__(self) -> None:
@@ -1875,10 +1837,9 @@ class Journal:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             self._fh = open(path, "a+b", buffering=0)
-            # A crash can leave a partial final line. Separate it from the
-            # next record so the reader can discard it without also losing
-            # the first completed build of the new run. Preserve a valid
-            # final record that merely lacks its newline, too.
+            # Terminate an incomplete tail before the next append. The
+            # reader can then skip a torn line or keep a valid record that
+            # was missing its newline.
             if self._fh.seek(0, os.SEEK_END):
                 self._fh.seek(-1, os.SEEK_END)
                 if self._fh.read(1) != b"\n":
@@ -1935,7 +1896,7 @@ JOURNAL = Journal()
 
 
 def is_current_journal_record(rec) -> bool:
-    """Recognize the envelope written for a completed build."""
+    """Recognize the current journal schema before decoding result details."""
     if (not isinstance(rec, dict) or not isinstance(rec.get("nvr"), str)
             or not rec["nvr"] or not isinstance(rec.get("run_id"), str)
             or not rec["run_id"]
@@ -1985,8 +1946,8 @@ def read_journal(path: str, run_id: str | None = None) -> dict:
 def build_outcome(fetch: FetchResult, tests: list) -> dict:
     """Summarize a build from its fetch and RPM results."""
     outcome = {
-        # Current-format records from earlier fetch-only runs remain
-        # eligible for testing by a subsequent --resume.
+        # Keep the fetched status when decoding saved results without tests.
+        # New builds with no matching RPMs are recorded as fetch failures.
         "status": "pass" if tests else "fetched",
         "stage": "",
         "exit_code": None,
@@ -2058,7 +2019,7 @@ def saved_build_results(rec: dict) -> tuple[FetchResult, list]:
                     raise ValueError("expected an RPM architecture")
                 decoded.append(cls(**row))
             results.append(decoded)
-        # Do not let a stale details block contradict the journal's outcome.
+        # Verify that the detailed results support the stored status.
         fetched, tested = results[0][0], results[1]
         if build_outcome(fetched, tested)['status'] != rec['status']:
             raise ValueError("detailed results do not match the recorded status")
@@ -2124,7 +2085,7 @@ def cumulative_results(manifest: dict, previous: dict, current: list,
 
 
 # ---------------------------------------------------------------------------
-# failure lists (plain NVR files under DIR/logs)
+# Failure lists and index under DIR/logs
 # ---------------------------------------------------------------------------
 
 FAILURE_LIST_STAGES = frozenset({
@@ -2142,9 +2103,7 @@ def is_failure_list_name(name: str) -> bool:
 
 
 def _sig_slug(signature: str) -> str:
-    """Filename slug for a signature: sanitized lowercase alnum/hyphens
-    (capped at 32 chars) plus 6 hex chars of its SHA-256, so distinct
-    signatures never map to the same file."""
+    """Shorten a signature for filenames and append six SHA-256 hex digits."""
     base = re.sub(r"[^a-z0-9]+", "-", signature.lower()).strip("-")
     base = base[:32].rstrip("-") or "sig"
     digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:6]
@@ -2152,10 +2111,10 @@ def _sig_slug(signature: str) -> str:
 
 
 def failure_rows(fetch: list | None, test: list | None) -> list:
-    """One row per failure in the run: (stage, signature, nvr, rpm, exit).
+    """Return (stage, signature, nvr, rpm, exit_code) for each failure.
 
-    `rpm` is the failing RPM's basename for test failures and "" for
-    fetch failures (a fetch has no single RPM).
+    The rpm field holds the RPM label for a test failure or an empty
+    string for a fetch failure.
     """
     rows = []
     for r in fetch or []:
@@ -2169,19 +2128,12 @@ def failure_rows(fetch: list | None, test: list | None) -> list:
 
 
 def write_failure_lists(args, fetch: list | None, test: list | None) -> None:
-    """Write the run's failure lists to DIR/logs (or remove stale ones).
+    """Refresh the generated failure lists after writing the text report.
 
-    Called whenever the report is written. Each list is one build NVR
-    per line — sorted, deduplicated, no header lines, each optionally
-    followed by '  # detail'. Files:
-      failed-all.txt           every build with a fetch or test failure
-      failed-fetch.txt         the fetch failures
-      failed-<stage>.txt       one per failing stage (e.g. failed-repack.txt)
-      failed-sig-<slug>.txt    one per signature, top 20 by failure count
-      failed-index.tsv         stage<TAB>signature<TAB>nvr<TAB>rpm per failure
-                               (fetch rows leave the rpm column empty)
-    A run without failures removes any lists left by an earlier run, so
-    the files never describe a stale run.
+    Text lists contain sorted, deduplicated build NVRs with detail
+    comments. The TSV index records the stage, signature, NVR, and RPM
+    for each failure. Remove generated files from the previous report
+    and preserve other files in DIR/logs.
     """
     logdir = Path(args.dir) / "logs"
     try:
@@ -2240,7 +2192,7 @@ def write_failure_lists(args, fetch: list | None, test: list | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# main
+# Command-line entry point
 # ---------------------------------------------------------------------------
 
 def update_self() -> int:
@@ -2300,22 +2252,21 @@ def parse_args(argv) -> argparse.Namespace:
         description="List builds in a Koji tag, fetch their RPMs, and "
                     "tarpm-test each one.",
         epilog="Examples\n"
-               "  %(prog)s --list -p 7zip             # list the selected builds\n"
-               "  %(prog)s -j 4                       # test the default tag\n"
-               "  %(prog)s -j 4 -p 7zip --no-src      # skip source RPMs\n"
-               "  %(prog)s -j 4 --resume              # retry unfinished builds\n",
+               "  %(prog)s --list -p 7zip         # List selected builds\n"
+               "  %(prog)s -j 4                   # Test the default tag\n"
+               "  %(prog)s -j 4 -p 7zip --no-src  # Skip source RPM tests\n"
+               "  %(prog)s -j 4 --resume          # Resume the saved run\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # fetch
+    # Build and RPM selection
     ap.add_argument("-t", "--tag", default="f45",
                     help="Koji tag to query for RPM builds (default: %(default)s)")
     ap.add_argument("-p", "--pkg", action="append", metavar="PKG",
                     help="include builds whose NVR equals PKG or starts with "
                          "PKG- (repeatable; default: every package)")
     ap.add_argument("-a", "--arch", action="append", metavar="ARCH",
-                    help="fetch: download ARCH plus noarch and the source "
-                         "RPM (src unless --no-src); test: only test RPMs "
-                         "for ARCH (plus noarch and src). Repeatable.")
+                    help="select ARCH and noarch RPMs. Include source RPMs "
+                         "unless --no-src is set. Repeatable.")
     ap.add_argument("-n", "--limit", type=int, default=0,
                     help="only process the first N builds (smoke test)")
     ap.add_argument("--sort", choices=("asc", "desc"),
@@ -2327,10 +2278,9 @@ def parse_args(argv) -> argparse.Namespace:
     ap.add_argument("--refresh", action="store_true",
                     help="re-fetch the tag list from Koji, even if a "
                          "cached copy (DIR/tag-<TAG>.txt) exists")
-    # test
     ap.add_argument("--no-src", dest="no_src", action="store_true",
-                    help="skip testing .src.rpm files (tested by default)")
-    # common
+                    help="skip source RPM tests (included by default)")
+    # Run control and output
     ap.add_argument("-u", "--update", action="store_true",
                     help="replace this script with the latest version from "
                          "GitHub main and exit; use on its own")
@@ -2345,7 +2295,7 @@ def parse_args(argv) -> argparse.Namespace:
     ap.add_argument("--no-run-log", action="store_true",
                     help="do not write a run log")
     ap.add_argument("-j", "--jobs", type=int, default=1,
-                    help="number of parallel fetches/tests (default: 1)")
+                    help="number of builds to process in parallel (default: 1)")
     ap.add_argument("--heartbeat", type=int,
                     help="while a command runs longer than this, log a "
                          "progress line every N seconds (0 disables; "
@@ -2423,7 +2373,7 @@ def validate_output_paths(args) -> None:
     canonical_logdir = path_keys(logdir)[0]
     for option, path in outputs:
         keys = path_keys(path)
-        # Check both a named output in logs/ and an alias to a generated list.
+        # Check the supplied and resolved paths for reserved list names.
         for candidate in (path, keys[0]):
             if (is_failure_list_name(candidate.name)
                     and path_keys(candidate.parent)[0] == canonical_logdir):
@@ -2441,7 +2391,7 @@ def validate_output_paths(args) -> None:
             target = path.resolve()
             parent = target.parent
             if not parent.is_dir():
-                # These directories were already created during run setup.
+                # Create missing parents when they belong to managed outputs.
                 if any(parent == d.resolve() or parent in d.resolve().parents
                        for d in managed_dirs):
                     parent.mkdir(parents=True, exist_ok=True)
@@ -2520,7 +2470,8 @@ def main(argv=None) -> int:
         eligible = [nvr for nvr in selected if nvr not in passed]
     elif args.retry_failed:
         eligible = [nvr for nvr in selected if nvr in failed]
-    # Sorting precedes -n and journal filtering. A no-op recovery needs no sizes.
+    # Sort before applying the limit and journal filters. Skip sorting when
+    # the journal already leaves no eligible builds.
     if args.sort and eligible:
         if not (args.list or args.resume or args.retry_failed) and shutil.which("koji") is None:
             log(f"{PROG}: error: koji client not found in PATH", err=True)
@@ -2689,7 +2640,7 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         exit_code = main()
-        # Catch buffered output failures here rather than during shutdown.
+        # Flush here so the handler below can catch a closed stdout pipe.
         sys.stdout.flush()
         sys.exit(exit_code)
     except BrokenPipeError:
@@ -2702,7 +2653,7 @@ if __name__ == "__main__":
         log(f"{PROG}: interrupted (Ctrl+C)", err=True)
         sys.exit(130)
     except Exception:
-        # Uncaught: record the traceback in the run log, then re-raise.
+        # Record the uncaught exception in the run log before re-raising.
         for line in traceback.format_exc().splitlines():
             RUNLOG.write(line)
         raise

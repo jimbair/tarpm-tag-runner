@@ -71,7 +71,7 @@ class SizeSortingTests(RunnerTestCase):
                 for direction in ("asc", "desc"):
                     with self.subTest(filters=filters, direction=direction):
                         status, nvrs, stderr = self.listed("--sort", direction, *filters)
-                        # Equal-size builds always use ascending NVR ties.
+                        # Use ascending NVR to break ties in either direction.
                         if direction == "desc":
                             expected_desc = list(reversed(expected))
                             if "--no-src" in filters:

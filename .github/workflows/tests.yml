@@ -21,6 +21,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # The runner's default Koji tag controls the smoke-test selection.
     container: registry.fedoraproject.org/fedora:44
     timeout-minutes: 20
     env:

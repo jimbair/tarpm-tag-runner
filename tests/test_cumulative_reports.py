@@ -273,7 +273,7 @@ class CumulativeReportTests(RunnerTestCase):
             self.attempt({nvr: self.build(nvr) for nvr in self.nvrs[1:]}, '--resume')
         self.assertEqual(self.data()['summary']['fetch']['failed'], 0)
         self.assertEqual(self.data()['run']['status'], 'passed')
-        # The stored journal still correctly requires another retry.
+        # The journal retains the earlier failure because the append failed.
         latest = mod.read_journal(str(self.downloads / 'journal.jsonl'), self.data()['run']['id'])
         self.assertEqual(latest[self.nvrs[1]]['status'], 'test-fail')
 

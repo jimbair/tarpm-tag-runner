@@ -1,14 +1,15 @@
 # tarpm-tag-runner
 
-Fetch the latest builds from a Fedora Koji tag and test each downloaded RPM
-with **tarpm**: unpack → repack → unpack again → compare file listings.
-Tests include source RPMs by default. Failures go into one report; listing
-differences are non-fatal warnings.
+Fetch the latest builds from a Fedora Koji tag and test the selected RPMs
+with **tarpm**. The runner unpacks, repacks, and unpacks again before
+comparing file listings. Tests include source RPMs by default. The report
+records failures and flags listing differences as warnings.
 
-The runner processes up to `-j` builds at once. Each build uses a temporary
-workspace for downloads and test files, which is removed when the build
-finishes. The journal, reports, and failure and warning logs preserve the
-results. A single 1.5 GiB RPM can need over 10 GiB during its round-trip.
+Use `-j` to choose how many builds run in parallel. Each build uses a
+temporary workspace for downloads and test files. The runner removes it
+when the build finishes. The journal, reports, and diagnostic logs
+preserve the results. A single 1.5 GiB RPM can need over 10 GiB during
+its round-trip.
 
 ## Setup and quick start
 
@@ -29,19 +30,19 @@ sudo dnf install tarpm
 `dnf5-plugins` provides the `dnf copr` command used above.
 
 ```bash
-# Preview a small selection without downloading RPMs:
+# Preview the hello selection without downloading RPMs.
 python tarpm-tag-runner.py -t f45 -p hello --list
 
-# Preview the ten smallest builds for x86_64, including noarch and src:
+# Preview the ten smallest builds for x86_64, including noarch and src.
 python tarpm-tag-runner.py -t f45 -a x86_64 --sort asc -n 10 --list
 
-# Fetch and test hello, including its source RPM:
+# Fetch and test hello, including its source RPM.
 python tarpm-tag-runner.py -t f45 -p hello -a x86_64
 
-# Test two source-package selections, four builds at once:
+# Test two package selections with up to four builds in parallel.
 python tarpm-tag-runner.py -t f45 -p 7zip -p 389-ds-base -j 4 --json results.json
 
-# Test the whole tag, then resume failed or unfinished builds:
+# Test the whole tag, then resume failed or unfinished builds.
 python tarpm-tag-runner.py -t f45 -j 2 --json results.json
 python tarpm-tag-runner.py -t f45 -j 2 --resume --json results.json
 ```
@@ -49,18 +50,17 @@ python tarpm-tag-runner.py -t f45 -j 2 --resume --json results.json
 To update the runner in place from this repository's latest `main` branch:
 
 ```bash
-# Equivalent: python tarpm-tag-runner.py --update
+# --update is the long form of -u.
 python tarpm-tag-runner.py -u
 ```
 
 Use the update option on its own. It requires network access and write
 access to the script's directory, but no Koji or tarpm installation. The
-download is checked for valid Python and expected runner functions before
-atomically replacing the script, preserving its permissions. If launched
-through a symlink, the target script is updated. Updates overwrite local
-edits to the script; other repository files are not updated. The command
-exits after updating, and the next invocation uses the new version. An
-identical download reports that the runner is already up to date.
+runner checks the download for valid Python and expected runner functions,
+then replaces the script atomically and preserves its permission bits. If
+you launch the runner through a symlink, it updates the target script.
+Updates overwrite local edits to the script. The next invocation uses the
+new version. An identical download reports that the runner is up to date.
 
 ## Options and build selection
 
@@ -98,16 +98,16 @@ For example, `-p 7zip` selects `7zip` and source packages named `7zip-*`;
 `7zip-reduced` binaries within the selected build are included automatically.
 A full NVR such as `7zip-25.01-5.fc44` can select that exact build.
 
-Tag lists are cached as `DIR/tag-<TAG>.txt`, containing
-`koji latest-pkg --all --type=rpm TAG` output with a comment marking the RPM
-build-type filter. Later runs reuse that snapshot until `--refresh`. Older
-caches without the marker are refreshed automatically once when used as a
-build list, including for `--retry-failed`. This removes image entries before
-package, limit, and journal filtering. The refresh requires Koji access.
-On failure, the runner preserves the old cache and stops.
-The runner validates the query's stdout and replaces the cache atomically.
-Warnings on stderr go to diagnostics. Interrupted or failed cache writes
-preserve the previous snapshot.
+The runner caches stdout from `koji latest-pkg --all --type=rpm TAG` in
+`DIR/tag-<TAG>.txt` with a header marking the RPM build-type filter. Later
+runs reuse that snapshot until `--refresh`. The runner also refreshes
+caches missing the marker before using them for build selection, including
+for `--retry-failed`.
+
+A refresh requires Koji access. The runner logs stderr as diagnostics and
+validates the build identifiers in stdout before replacing the cache
+atomically. Errors and interruptions before replacement leave the
+previous snapshot available.
 
 Before downloads start, the runner checks for Koji and tarpm. A missing
 client exits `2` before replacing the run manifest or writing the journal.
@@ -127,11 +127,10 @@ excluding Koji's default debuginfo/debugsource packages. Equal sizes use
 ascending NVR order. These are input sizes, not estimates of unpacked disk
 space or test duration. Parallel workers may finish in a different order.
 
-Size sorting augments the existing tag/file selection. Without `--sort`,
-the runner does not read the size cache or query size metadata. `--list`
-prints the chosen NVR order with diagnostics on stderr. Sorting precedes
-`-n`; resume/retry journal filters still follow `-n`, so a limited selection
-whose builds already passed may have nothing pending.
+Size sorting orders builds from the tag or saved run. The runner reads
+size metadata only when you request `--sort`. Sorting precedes `-n` and
+the resume or retry filters, so a limited selection whose builds already
+passed may have nothing pending.
 
 Metadata is cached as `DIR/build-sizes.json`: a JSON snapshot containing
 the Fedora hub URL, schema version, debug-exclusion policy, generation
@@ -141,12 +140,11 @@ new lookup. Tag membership remains in the existing tag snapshot; the size
 cache can contain builds from several tags and retained older builds.
 It is a lookup snapshot, separate from the append-only JSONL journal.
 
-Large uncached tag selections use Fedora's `listTaggedRPMS` API. Small
-selections, explicit files, and missing older NVRs use bounded batches of
-exact-build lookups. The standard-library metadata reader queries
-`https://koji.fedoraproject.org/kojihub` directly and streams the XML
-response, retaining totals rather than all RPM records in memory.
-These queries do not download RPMs or change which builds were selected.
+When many sizes are missing, the runner queries Fedora's `listTaggedRPMS`
+API for the latest tag builds. It uses bounded batches of exact-NVR lookups
+for smaller selections and builds that the bulk response omits. The
+reader streams XML from `https://koji.fedoraproject.org/kojihub` and keeps
+only the data needed for size totals.
 
 The runner logs `Generating build sizes` for a new cache, `Updating build
 sizes` for missing entries, or `using cached build sizes` when all entries
@@ -222,25 +220,25 @@ count logical file bytes, without following symlinks or counting hardlinks
 twice; the completed input tree is measured once, on the first heartbeat
 that needs it. Fast tests do not scan the tree for progress.
 
-The two listing commands' stdout streams are compared with Python's
-`difflib`. Stderr is logged separately. A difference
-is a `content-diff` warning, not a failure; failure to generate a listing
-is a failed stage. This compares listings, not file bytes or all metadata.
-Listings are saved and compared as raw bytes, including non-UTF-8 filenames.
-Diagnostic logs and displayed diffs escape invalid UTF-8 bytes as `\xff`
-instead of failing to decode command output.
+The runner compares raw stdout from the two `tarpm -t` commands and logs
+stderr separately for successful listings. A failed command fails its
+listing stage. When both commands succeed, a difference produces a
+`content-diff` warning and a diff in the test log. Comparing raw bytes
+preserves non-UTF-8 filenames. Diagnostic text escapes invalid UTF-8
+bytes, such as `\xff`.
 
-Each attempt downloads into a unique workspace under `DIR/.build-*/`.
-It removes RPMs and extracted files after each test, including tests that
-raise a runner exception. The remaining workspace is removed when the
-build finishes. This includes partial
-downloads after a failed fetch and RPMs excluded from testing. Diagnostic
-logs for failures and listing warnings have separate paths for each
-invocation and build so cumulative reports can reference them.
+Each download attempt gets a unique workspace under `DIR/.build-*/`.
+The runner removes each RPM and its work files when its test finishes
+or raises an exception. At the end of the build, the runner removes
+the workspace along with any partial downloads and skipped RPMs.
+Failure and warning logs have separate paths for each invocation and
+build so cumulative reports can refer to them after a retry.
 
-Cleanup retries read-only artifact directories with owner access restored,
-without following symlinks. If a passed test's work directory still cannot
-be removed, the result fails at stage `cleanup` and retains its log.
+If directory permissions block cleanup, the runner restores owner access
+to the remaining directories in the workspace and retries. A cleanup
+error after a successful RPM test changes its result to a `cleanup`
+failure and retains the test log. If the runner cannot remove the build
+workspace, it logs a warning.
 
 ```text
 rpms/
@@ -249,24 +247,22 @@ rpms/
 ├── journal.jsonl                    # finished-build records
 ├── run.json                         # active run ID and full build selection
 ├── run.log                          # append-only runner log
-├── .build-*/                       # temporary workspace while a build is active
-│   └── <NVR>/                     # downloaded RPMs and test work files
+├── .build-*/                        # temporary build workspace
+│   └── <NVR>/                       # downloads and test files
 └── logs/
     ├── <invocation ID>/<NVR>/
     │   ├── <NVR>.fetch.log          # kept on fetch failure
     │   └── <base>.test.log          # kept on failure or warning
-    └── failed-*                     # failure lists described below
+    └── failed-*                     # failure lists and index
 ```
 
 ## Resume, retry, and interrupts
 
-Before workers start, a fresh run atomically saves its run ID,
-full build selection, and original invocation context in `DIR/run.json`.
-Resume reuses that manifest and skips only passes/warnings recorded for
-its run ID. Older successes cannot
-hide unfinished or queued re-tests. A new normal or retry run replaces the
-manifest. Use separate directories for simultaneous runs. `--list` leaves
-the active run intact.
+Before workers start, a fresh run atomically saves its run ID, full build
+selection, and original invocation context in `DIR/run.json`. Resume
+reuses that manifest and skips builds with a pass or warning for its run
+ID. A new normal or retry run replaces the manifest. Use separate
+directories for simultaneous runs. `--list` leaves the active run intact.
 
 Finished builds append records to `DIR/journal.jsonl` immediately, so a
 process crash preserves completed work. Records contain `run_id`, `nvr`,
@@ -283,19 +279,19 @@ An incomplete tail is separated before new records are appended.
 Short writes are retried; failed appends are rolled back with a warning.
 If rollback fails, further journal writes are disabled to prevent corruption.
 
-New outcomes are `pass`, `warn`, `fetch-fail`, and `test-fail`.
-An existing `fetched` record is eligible for testing on resume. Resume
-requires a current manifest and the original tag,
-architecture, and source settings. Start a fresh run if the manifest
-is missing or uses an older format. Resume can use a different tarpm
-version. Passed builds keep their earlier results and version attribution.
-Retry selects the latest failures across all run IDs.
+New outcomes are `pass`, `warn`, `fetch-fail`, and `test-fail`. Resume
+treats an existing `fetched` record as pending. Resume requires a current
+manifest and the original tag, architecture, and source settings. Start a
+fresh run if the manifest is missing or uses an older format. You can
+resume with a different tarpm version. Passed builds keep their earlier
+results and version attribution. Retry selects the latest failures across
+all run IDs.
 
 ```bash
-# Continue a run by retrying failed and unfinished builds:
+# Continue a run by retrying failed and unfinished builds.
 python tarpm-tag-runner.py -t f45 -j 2 --resume
 
-# Re-run recorded failures after a tarpm update:
+# Start a new run for recorded failures after updating tarpm.
 python tarpm-tag-runner.py -t f45 -j 2 --retry-failed
 ```
 
@@ -325,8 +321,10 @@ directory. Create custom report directories in advance. The runner checks
 report destinations before starting work and rejects paths that overlap
 run state, other outputs, or generated failure lists.
 
-The runner replaces each regular text or JSON report atomically after
-writing it in full. If a write fails, the previous file stays readable.
+The runner writes each regular text or JSON report in full before replacing
+the destination atomically. If writing fails, the previous report remains
+available. It preserves existing permission bits and follows symlinks to
+their targets. Pipes and devices receive direct writes.
 
 Fetch runs and their resumes rebuild the report from the latest
 completed attempt for each build in the active run. A successful retry
@@ -353,14 +351,13 @@ and tarpm version in the download directory, including earlier fresh runs.
 Download failures and test failures are listed separately. Past failures
 remain in this history after they have been fixed in the cumulative totals.
 
-Before testing, the runner identifies the `tarpm` executable selected from
-`PATH` and queries its owning RPM with `rpm -qi --file <resolved-binary>`.
-The summary shows its package name, version, release, and architecture
-(including a nonzero epoch). The full RPM metadata is included at the end
-of the report, preserving COPR build details such as build date and source
-RPM. It does not use `tarpm --version`. A missing `rpm` command, unowned
-executable, failed query, or five-second query timeout is reported without
-preventing tests. Fetch-only runs skip the query.
+Before starting the selected builds, the runner queries the owning RPM
+for the `tarpm` executable on `PATH` with `rpm -qi --file <resolved-binary>`.
+The summary shows its name, version, release, architecture, and any
+nonzero epoch. The full RPM metadata at the end of the report records
+COPR build details such as build date and source RPM. If the query fails
+or times out after five seconds, the report includes the error and testing
+continues. A resume with no selected builds skips the query.
 
 Failure rollups appear **before individual failure logs**, sorted by count,
 and group by stage, exit code, and error signature. Each group shows its
@@ -375,7 +372,7 @@ run-log path, and retained warning logs.
 
 | Field | Contents |
 | --- | --- |
-| `session` | Current invocation ID, start/end, numeric `runtime_seconds`, status, counts in `summary`, interruption flag, command argument list, settings, system details, and `tarpm` package fields/full `rpm_info`/query error (`tarpm` is null when the invocation runs no tests). |
+| `session` | Current invocation ID, start/end, numeric `runtime_seconds`, status, counts in `summary`, interruption flag, command argument list, settings, system details, and `tarpm` package fields, full `rpm_info`, and query error. `tarpm` is null when no builds are selected. |
 | `run` | Active run ID, original start/command/settings, build statuses, pending count, cumulative status, versions used, and per-invocation `attempts` history. |
 | `summary` | Counts for each enabled phase; test counts include `clean_passed` and `warnings` (`ok` includes warnings). |
 | `failure_types` | Ranked `fetch` and `test` groups with stage, exit code, signature, count, `percent_of_failures`, and examples. |
@@ -401,7 +398,7 @@ tarpm:
 
 ```bash
 python tarpm-tag-runner.py -t f45 -p hello -a x86_64 --json baseline.json
-# After updating tarpm, repeat the same selection:
+# Repeat the same selection after updating tarpm.
 python tarpm-tag-runner.py -t f45 -p hello -a x86_64 \
     --compare baseline.json --json current.json
 ```
@@ -497,24 +494,24 @@ Run the unit and regression suite without external tools or network access:
 python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs independent jobs on native x86-64 and ARM64 Ubuntu VMs,
-each using a Fedora 44 container with Koji and tarpm. Both run that suite
-and smoke-test Fedora's `hello` build from the runner's default Koji tag
-on their native RPM architecture (`x86_64` or `aarch64`). They check failure
-recovery with `--resume`, cleanup after failed and successful tests, tarpm
-version metadata, and `--no-src` without an architecture filter. Reports
-and logs are uploaded as
-`hello-smoke-x86_64` and `hello-smoke-aarch64` for seven days, including on
-failure. To run the same smoke tests locally after installing the tools:
+GitHub Actions runs the unit suite and real RPM smoke tests on x86-64 and
+ARM64 Ubuntu VMs. Each job runs Koji and tarpm inside a Fedora 44 container
+and tests the `hello` build from the runner's default Koji tag. The smoke
+tests check recovery with `--resume`, cleanup after failures and successes,
+tarpm version metadata, and `--no-src` without an architecture filter.
+
+Each job uploads reports and logs as `hello-smoke-x86_64` or
+`hello-smoke-aarch64`, including on failure. Artifacts are retained for
+seven days. Install Koji and tarpm before running the smoke tests locally.
 
 ```bash
 python tests/smoke_test.py --output /tmp/hello-smoke
 ```
 
-The output directory must be new. The binary architecture defaults to the
-host architecture; use `--arch ARCH` to override it. Smoke tests require
-network access; listing-difference warnings remain non-fatal, as in normal
-runs.
+Use a new output directory and run with network access. The smoke tests
+default to the host's binary architecture and the runner's Koji tag. Use
+`--arch ARCH` or `--tag TAG` to override those settings. Listing differences
+produce warnings, as in normal runs.
 
 Future checks may make content differences fatal or compare headers;
 CentOS Stream/AlmaLinux backends are also planned.
